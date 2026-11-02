@@ -9,6 +9,8 @@
 歷史（HISTORY）：
   - 0.1.0  FEAT-001 初版，建立六個子類（檔案/解析/驗證/參照/建圖/
            路徑查找）。
+  - 0.2.0  FEAT-005 Phase 2 新增 4 個分配/持久化錯誤子類
+           （硬衝突/VLAN 耗盡/session 不存在/ledger 儲存）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -72,4 +74,41 @@ class PathLookupError(TopologyError):
     觸發條件：來源或目的節點不存在、兩端之間無連通路徑、generator
     裸名解析不唯一、或 DUT 端點未以 ``dev:port`` 形式指定。訊息應含
     查詢端點與候選清單或失敗原因。
+    """
+
+
+class HardConflictError(TopologyError):
+    """新路徑的 access port 已被其他使用中 session 佔用時觸發（FR-4）。
+
+    硬衝突僅以 access port（實體路徑扣除所有 trunk 端節點後的集合）判定；
+    trunk 端 port 可被多個 session 共用，不視為衝突。訊息應列出所有發生
+    衝突的 access port 與其當前擁有者 session_id，供使用者釋放後重試。
+    此檢查在任何狀態變更之前完成，確保分配失敗時不留副作用。
+    """
+
+
+class VlanPoolExhaustedError(TopologyError):
+    """封閉 VLAN 池內所有值皆已被佔用、無法再分配時觸發（FR-3）。
+
+    觸發條件：``range(vlan_min, vlan_max + 1)`` 內找不到任何未使用的 VLAN。
+    訊息應含 VLAN 池範圍與目前已使用數量，供使用者擴充池或釋放既有
+    session。
+    """
+
+
+class SessionNotFoundError(TopologyError):
+    """釋放（release）時指定的 session_id 不存在時觸發（FR-4）。
+
+    訊息應含查無的 session_id，供使用者確認輸入或改以 list 查詢現有
+    session。
+    """
+
+
+class SessionStoreError(TopologyError):
+    """ledger 持久化檔讀寫或還原一致性失敗時觸發（FR-5）。
+
+    觸發條件：ledger 檔非合法 JSON、未通過 schema 驗證、版本不支援、或
+    還原時偵測到一致性問題（同一 access port 被兩個 session 佔用、或
+    VLAN 重複）。訊息應含檔案路徑與底層原因，供使用者修正或改用
+    ``--state`` 指定正確的狀態檔。
     """
