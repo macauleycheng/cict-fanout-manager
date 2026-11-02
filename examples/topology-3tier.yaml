@@ -1,0 +1,137 @@
+# 三層範例拓樸（設計 §8.2）：Spine → Agg → Leaf → DUT
+#
+# racks/duts 與兩層範例完全相同（2 rack × 4 DUT × 2 tg_port，dut-A1..A4 /
+# dut-B1..B4），只是在 core 與 leaf 之間多一層 agg。遵守 §8 同一組不變量：
+# 嚴格分層樹、無同層直連；每台 leaf/agg 單一上行、上層對每台下層單一下行、
+# 每 DUT tg_port 只接一個 leaf port、各 generator port 接不同 spine port。
+#
+# spine port 配置：1..6 接 generator、7 下行 agg-1、8 下行 agg-2。
+# agg port 配置：1 上行 spine、2 下行其 leaf。
+# leaf port 配置：1 上行 agg、11..18 接該 rack 8 個 DUT tg_port。
+
+version: 1
+site: lab-a
+
+generators:
+  - name: ixia-1
+    type: ixia
+    ports:
+      - ixia-1/1
+      - ixia-1/2
+  - name: trex-1
+    type: trex
+    ports:
+      - trex-1/0
+      - trex-1/1
+      - trex-1/2
+      - trex-1/3
+
+fanouts:
+  - name: spine-1
+    role: spine
+    port_count: 24
+  - name: agg-1
+    role: agg
+    port_count: 24
+  - name: agg-2
+    role: agg
+    port_count: 24
+  - name: leaf-1-1
+    role: leaf
+    port_count: 24
+  - name: leaf-2-1
+    role: leaf
+    port_count: 24
+
+racks:
+  - name: rack-1
+    duts:
+      - name: dut-A1
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+      - name: dut-A2
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+      - name: dut-A3
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+      - name: dut-A4
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+  - name: rack-2
+    duts:
+      - name: dut-B1
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+      - name: dut-B2
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+      - name: dut-B3
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+      - name: dut-B4
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+
+links:
+  # generator → spine（6 條，各佔一個獨立 spine port 1..6）
+  - a: {dev: ixia-1, port: ixia-1/1}
+    b: {dev: spine-1, port: 1}
+  - a: {dev: ixia-1, port: ixia-1/2}
+    b: {dev: spine-1, port: 2}
+  - a: {dev: trex-1, port: trex-1/0}
+    b: {dev: spine-1, port: 3}
+  - a: {dev: trex-1, port: trex-1/1}
+    b: {dev: spine-1, port: 4}
+  - a: {dev: trex-1, port: trex-1/2}
+    b: {dev: spine-1, port: 5}
+  - a: {dev: trex-1, port: trex-1/3}
+    b: {dev: spine-1, port: 6}
+
+  # agg → spine（各一條上行 trunk；spine 對每台 agg 單一下行）
+  - a: {dev: agg-1, port: 1}
+    b: {dev: spine-1, port: 7}
+  - a: {dev: agg-2, port: 1}
+    b: {dev: spine-1, port: 8}
+
+  # leaf → agg（各一條上行 trunk；agg 對其 leaf 單一下行）
+  - a: {dev: leaf-1-1, port: 1}
+    b: {dev: agg-1, port: 2}
+  - a: {dev: leaf-2-1, port: 1}
+    b: {dev: agg-2, port: 2}
+
+  # rack-1 DUT tg_port → leaf-1-1（8 條，leaf port 11..18）
+  - a: {dev: dut-A1, port: Eth0}
+    b: {dev: leaf-1-1, port: 11}
+  - a: {dev: dut-A1, port: Eth1}
+    b: {dev: leaf-1-1, port: 12}
+  - a: {dev: dut-A2, port: Eth0}
+    b: {dev: leaf-1-1, port: 13}
+  - a: {dev: dut-A2, port: Eth1}
+    b: {dev: leaf-1-1, port: 14}
+  - a: {dev: dut-A3, port: Eth0}
+    b: {dev: leaf-1-1, port: 15}
+  - a: {dev: dut-A3, port: Eth1}
+    b: {dev: leaf-1-1, port: 16}
+  - a: {dev: dut-A4, port: Eth0}
+    b: {dev: leaf-1-1, port: 17}
+  - a: {dev: dut-A4, port: Eth1}
+    b: {dev: leaf-1-1, port: 18}
+
+  # rack-2 DUT tg_port → leaf-2-1（8 條，leaf port 11..18）
+  - a: {dev: dut-B1, port: Eth0}
+    b: {dev: leaf-2-1, port: 11}
+  - a: {dev: dut-B1, port: Eth1}
+    b: {dev: leaf-2-1, port: 12}
+  - a: {dev: dut-B2, port: Eth0}
+    b: {dev: leaf-2-1, port: 13}
+  - a: {dev: dut-B2, port: Eth1}
+    b: {dev: leaf-2-1, port: 14}
+  - a: {dev: dut-B3, port: Eth0}
+    b: {dev: leaf-2-1, port: 15}
+  - a: {dev: dut-B3, port: Eth1}
+    b: {dev: leaf-2-1, port: 16}
+  - a: {dev: dut-B4, port: Eth0}
+    b: {dev: leaf-2-1, port: 17}
+  - a: {dev: dut-B4, port: Eth1}
+    b: {dev: leaf-2-1, port: 18}

@@ -1,0 +1,115 @@
+# 故意錯誤的拓樸（設計 §8.3、FR-6.1）：以兩層範例為底，把其中一條 link 的
+# b.dev 改成不存在的裝置 leaf-9-9，用以觸發 §4.3 參照完整性檢查。
+# 預期 load_topology 丟 TopologyReferenceError 且訊息含 'leaf-9-9'。
+
+version: 1
+site: lab-a
+
+generators:
+  - name: ixia-1
+    type: ixia
+    ports:
+      - ixia-1/1
+      - ixia-1/2
+  - name: trex-1
+    type: trex
+    ports:
+      - trex-1/0
+      - trex-1/1
+      - trex-1/2
+      - trex-1/3
+
+fanouts:
+  - name: core-1
+    role: core
+    port_count: 24
+  - name: leaf-1-1
+    role: leaf
+    port_count: 24
+  - name: leaf-2-1
+    role: leaf
+    port_count: 24
+
+racks:
+  - name: rack-1
+    duts:
+      - name: dut-A1
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+      - name: dut-A2
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+      - name: dut-A3
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+      - name: dut-A4
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+  - name: rack-2
+    duts:
+      - name: dut-B1
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+      - name: dut-B2
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+      - name: dut-B3
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+      - name: dut-B4
+        model: modelB
+        tg_ports: [Eth0, Eth1]
+
+links:
+  - a: {dev: ixia-1, port: ixia-1/1}
+    b: {dev: core-1, port: 1}
+  - a: {dev: ixia-1, port: ixia-1/2}
+    b: {dev: core-1, port: 2}
+  - a: {dev: trex-1, port: trex-1/0}
+    b: {dev: core-1, port: 3}
+  - a: {dev: trex-1, port: trex-1/1}
+    b: {dev: core-1, port: 4}
+  - a: {dev: trex-1, port: trex-1/2}
+    b: {dev: core-1, port: 5}
+  - a: {dev: trex-1, port: trex-1/3}
+    b: {dev: core-1, port: 6}
+
+  - a: {dev: leaf-1-1, port: 1}
+    b: {dev: core-1, port: 7}
+  - a: {dev: leaf-2-1, port: 1}
+    b: {dev: core-1, port: 8}
+
+  # 這一條故意把 b.dev 指向不存在的 leaf-9-9（觸發參照完整性錯誤）
+  - a: {dev: dut-A1, port: Eth0}
+    b: {dev: leaf-9-9, port: 11}
+  - a: {dev: dut-A1, port: Eth1}
+    b: {dev: leaf-1-1, port: 12}
+  - a: {dev: dut-A2, port: Eth0}
+    b: {dev: leaf-1-1, port: 13}
+  - a: {dev: dut-A2, port: Eth1}
+    b: {dev: leaf-1-1, port: 14}
+  - a: {dev: dut-A3, port: Eth0}
+    b: {dev: leaf-1-1, port: 15}
+  - a: {dev: dut-A3, port: Eth1}
+    b: {dev: leaf-1-1, port: 16}
+  - a: {dev: dut-A4, port: Eth0}
+    b: {dev: leaf-1-1, port: 17}
+  - a: {dev: dut-A4, port: Eth1}
+    b: {dev: leaf-1-1, port: 18}
+
+  - a: {dev: dut-B1, port: Eth0}
+    b: {dev: leaf-2-1, port: 11}
+  - a: {dev: dut-B1, port: Eth1}
+    b: {dev: leaf-2-1, port: 12}
+  - a: {dev: dut-B2, port: Eth0}
+    b: {dev: leaf-2-1, port: 13}
+  - a: {dev: dut-B2, port: Eth1}
+    b: {dev: leaf-2-1, port: 14}
+  - a: {dev: dut-B3, port: Eth0}
+    b: {dev: leaf-2-1, port: 15}
+  - a: {dev: dut-B3, port: Eth1}
+    b: {dev: leaf-2-1, port: 16}
+  - a: {dev: dut-B4, port: Eth0}
+    b: {dev: leaf-2-1, port: 17}
+  - a: {dev: dut-B4, port: Eth1}
+    b: {dev: leaf-2-1, port: 18}

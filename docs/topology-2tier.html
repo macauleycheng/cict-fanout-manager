@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>Fanout 兩層接線拓樸圖（6 Rack / Packet-Generator 側）</title>
+<style>
+  :root{
+    --gen:#2e7d32; --core:#6a1b9a; --agg:#1565c0; --leaf:#ef6c00;
+    --dut:#37474f; --line:#b0bec5; --active:#e53935; --bg:#fafbfc;
+  }
+  *{box-sizing:border-box;}
+  body{font-family:"Segoe UI",system-ui,"Microsoft JhengHei",sans-serif;
+       margin:0;padding:24px;background:var(--bg);color:#263238;}
+  h1{font-size:20px;margin:0 0 4px;}
+  .sub{color:#607d8b;font-size:13px;margin-bottom:16px;}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:12px 0 20px;font-size:12px;}
+  .legend .item{display:flex;align-items:center;gap:6px;}
+  .swatch{width:16px;height:16px;border-radius:3px;display:inline-block;}
+  .canvas{position:relative;width:1180px;max-width:100%;margin:auto;}
+  svg{width:100%;height:auto;display:block;}
+  .node rect{rx:8;ry:8;stroke-width:1.5;}
+  .label{font-size:12px;font-weight:600;fill:#fff;}
+  .plabel{font-size:9.5px;fill:#fff;opacity:.9;}
+  .cap{font-size:10px;fill:#455a64;}
+  .edge{stroke:var(--line);stroke-width:1.4;fill:none;}
+  .edge.trunk{stroke:#78909c;stroke-width:2.2;}
+  .edge.active{stroke:var(--active);stroke-width:3;stroke-dasharray:6 3;
+               animation:dash 1s linear infinite;}
+  @keyframes dash{to{stroke-dashoffset:-18;}}
+  .edgelabel{font-size:9px;fill:#546e7a;}
+  .note{background:#fff;border:1px solid #e0e0e0;border-radius:10px;
+        padding:14px 18px;margin:18px auto;width:1180px;max-width:100%;font-size:13px;line-height:1.6;}
+  .note b{color:#1565c0;}
+  table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px;}
+  th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left;}
+  th{background:#f5f7fa;}
+  .pill{display:inline-block;padding:1px 7px;border-radius:10px;color:#fff;font-size:11px;}
+  .cmp{background:#fff8e1;border-color:#ffe082;}
+</style>
+</head>
+<body>
+
+<h1>Fanout 兩層接線拓樸圖 — Packet-Generator 側（6 Rack）</h1>
+<div class="sub">核心 fanout 同時扮演 Spine + 第一級匯聚，generator 直接接核心。左側 Rack-1 完整展開；Rack-2~6 收合。紅色虛線為活躍路徑：ixia-1/1 ↔ DUT-A1:Eth0。</div>
+
+<div class="legend">
+  <div class="item"><span class="swatch" style="background:var(--gen)"></span>Packet Generator (IXIA 4 + Trex 8)</div>
+  <div class="item"><span class="swatch" style="background:var(--core)"></span>Core Fanout（Spine+Agg 合一 ×1）</div>
+  <div class="item"><span class="swatch" style="background:var(--leaf)"></span>Leaf Fanout（每 rack ×5）</div>
+  <div class="item"><span class="swatch" style="background:var(--dut)"></span>DUT（每 rack 24 台）</div>
+  <div class="item"><span class="swatch" style="background:var(--active)"></span>活躍邏輯路徑（VLAN 隔離）</div>
+</div>
+
+<div class="canvas">
+<svg viewBox="0 0 1180 700" xmlns="http://www.w3.org/2000/svg">
+
+  <!-- ========== EDGES ========== -->
+  <!-- Generator -> Core (12 上行) -->
+  <path class="edge trunk active" d="M 470,70 C 520,100 540,105 560,128"/>
+  <path class="edge trunk" d="M 510,70 C 545,100 558,105 578,128"/>
+  <path class="edge trunk" d="M 560,70 C 582,100 588,105 598,128"/>
+  <path class="edge trunk" d="M 640,70 C 640,100 628,105 620,128"/>
+  <path class="edge trunk" d="M 710,70 C 690,100 660,105 636,128"/>
+
+  <!-- Core -> Leaf groups (6 racks). Rack-1 group expanded -->
+  <!-- Core -> rack-1 leaves -->
+  <path class="edge trunk active" d="M 575,188 C 400,240 150,300 110,358"/>
+  <path class="edge" d="M 580,188 C 420,245 240,300 200,358"/>
+  <path class="edge" d="M 588,188 C 450,245 320,300 290,358"/>
+  <path class="edge" d="M 596,188 C 500,245 410,300 395,358"/>
+  <path class="edge" d="M 602,188 C 540,245 500,300 480,358"/>
+  <!-- Core -> other racks (collapsed) -->
+  <path class="edge trunk" d="M 615,188 C 700,240 780,290 760,330"/>
+  <path class="edge trunk" d="M 620,188 C 780,240 900,290 900,330"/>
+  <path class="edge trunk" d="M 625,188 C 860,240 1000,290 1030,330"/>
+
+  <!-- Leaf-1-1 -> DUT (fan) -->
+  <path class="edge active" d="M 95,410 C 80,460 75,480 70,500"/>
+  <path class="edge" d="M 110,410 C 110,460 110,480 110,500"/>
+  <path class="edge" d="M 125,410 C 140,460 150,480 160,500"/>
+  <path class="edge" d="M 140,410 C 170,460 190,480 210,500"/>
+
+  <!-- ========== NODES ========== -->
+
+  <!-- Generator -->
+  <g class="node">
+    <rect x="410" y="30" width="330" height="40" fill="var(--gen)" stroke="#1b5e20"/>
+    <text class="label" x="575" y="48" text-anchor="middle">Packet Generator</text>
+    <text class="plabel" x="575" y="62" text-anchor="middle">IXIA ixia-1/1~4  ·  Trex trex-1/0~7   （共 12 port）</text>
+  </g>
+
+  <!-- Core -->
+  <g class="node">
+    <rect x="520" y="128" width="160" height="60" fill="var(--core)" stroke="#4a148c"/>
+    <text class="label" x="600" y="150" text-anchor="middle">Core Fanout</text>
+    <text class="plabel" x="600" y="165" text-anchor="middle">48p ×1（Spine+Agg 合一）</text>
+    <text class="plabel" x="600" y="179" text-anchor="middle">上行12→Gen / 下行30→Leaf</text>
+  </g>
+
+  <!-- Leaf row (rack-1) -->
+  <g class="node">
+    <rect x="70" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="100" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="100" y="392" text-anchor="middle">1-1</text>
+    <text class="plabel" x="100" y="404" text-anchor="middle">40↓/8↑</text>
+  </g>
+  <g class="node">
+    <rect x="160" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="190" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="190" y="392" text-anchor="middle">1-2</text>
+  </g>
+  <g class="node">
+    <rect x="250" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="280" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="280" y="392" text-anchor="middle">1-3</text>
+  </g>
+  <g class="node">
+    <rect x="365" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="395" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="395" y="392" text-anchor="middle">1-4</text>
+  </g>
+  <g class="node">
+    <rect x="450" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="480" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="480" y="392" text-anchor="middle">1-5</text>
+  </g>
+
+  <!-- collapsed leaf groups for other racks -->
+  <g class="node">
+    <rect x="700" y="330" width="120" height="44" fill="var(--leaf)" stroke="#e65100" opacity=".55"/>
+    <text class="label" x="760" y="350" text-anchor="middle">rack-2 Leaf×5</text>
+    <text class="plabel" x="760" y="365" text-anchor="middle">（收合）</text>
+  </g>
+  <g class="node">
+    <rect x="840" y="330" width="120" height="44" fill="var(--leaf)" stroke="#e65100" opacity=".55"/>
+    <text class="label" x="900" y="350" text-anchor="middle">rack-3 Leaf×5</text>
+    <text class="plabel" x="900" y="365" text-anchor="middle">（收合）</text>
+  </g>
+  <g class="node">
+    <rect x="980" y="330" width="120" height="44" fill="var(--leaf)" stroke="#e65100" opacity=".55"/>
+    <text class="label" x="1040" y="350" text-anchor="middle">rack-4~6 Leaf</text>
+    <text class="plabel" x="1040" y="365" text-anchor="middle">（收合）</text>
+  </g>
+
+  <!-- DUT row -->
+  <g class="node">
+    <rect x="45" y="500" width="54" height="46" fill="var(--dut)" stroke="#263238"/>
+    <text class="label" x="72" y="520" text-anchor="middle">DUT</text>
+    <text class="plabel" x="72" y="534" text-anchor="middle">A1</text>
+  </g>
+  <g class="node">
+    <rect x="105" y="500" width="54" height="46" fill="var(--dut)" stroke="#263238"/>
+    <text class="label" x="132" y="520" text-anchor="middle">DUT</text>
+    <text class="plabel" x="132" y="534" text-anchor="middle">A2</text>
+  </g>
+  <g class="node">
+    <rect x="165" y="500" width="54" height="46" fill="var(--dut)" stroke="#263238"/>
+    <text class="label" x="192" y="520" text-anchor="middle">DUT</text>
+    <text class="plabel" x="192" y="534" text-anchor="middle">A3</text>
+  </g>
+  <text class="cap" x="235" y="528">… rack-1 共 24 台 DUT，分接 5 台 Leaf，每台 DUT 8 打流 port</text>
+
+  <!-- rack grouping box -->
+  <rect x="30" y="345" width="500" height="215" fill="none" stroke="#90a4ae" stroke-dasharray="5 4" rx="12"/>
+  <text class="cap" x="40" y="363" font-weight="700" fill="#455a64">RACK-1（完整展開：5 Leaf + 24 DUT）</text>
+
+  <!-- edge labels -->
+  <text class="edgelabel" x="470" y="100">12 上行 → Gen</text>
+  <text class="edgelabel" x="250" y="280">Core→Leaf trunk（VLAN）</text>
+  <text class="edgelabel" x="30" y="470">Leaf→DUT 固定接線</text>
+
+</svg>
+</div>
+
+<div class="note">
+  <b>紅色活躍路徑讀法（由上而下）：</b>
+  <code>ixia-1/1 → Core:p37 → Core:p1 → Leaf-1-1:up → Leaf-1-1:p5 → DUT-A1:Eth0</code><br>
+  比三層版少一跳（沒有獨立 Spine↔Agg 段）。路徑經過的 <b>Core↔Leaf</b> trunk 配同一 VLAN；
+  硬衝突（同實體 port）禁止，軟衝突（共用 trunk）以不同 VLAN 隔離。
+</div>
+
+<div class="note">
+  <b>Port 分配總表（兩層版，6 Rack）</b>
+  <table>
+    <tr><th>層</th><th>角色</th><th>每台 port 分配</th><th>台數</th><th>備註</th></tr>
+    <tr>
+      <td><span class="pill" style="background:var(--leaf)">Leaf</span></td>
+      <td>直接接 DUT 打流 port</td><td>40 下行(DUT) + 8 上行(Core)</td>
+      <td>每 rack 5 → <b>30</b></td><td>每 rack 192 DUT port，固定接線一次到位</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--core)">Core</span></td>
+      <td>Spine+Agg 合一 / 接 generator</td><td>12 上行(Gen) + 30 下行(Leaf) = 42</td>
+      <td><b>1</b></td><td>42 &lt; 48，剛好塞下；無餘裕擴 rack</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--gen)">Generator</span></td>
+      <td>打流來源</td><td>—</td>
+      <td>IXIA 4 + Trex 8 = <b>12 port</b></td><td>同時最多 12 條活躍路徑</td>
+    </tr>
+  </table>
+  合計約 <b>31 台 fanout</b>（30 Leaf + 1 Core）。比三層版少 6 台 Agg。
+</div>
+
+<div class="note cmp">
+  <b>兩層 vs 三層 取捨</b>
+  <table>
+    <tr><th>面向</th><th>兩層（本圖）</th><th>三層</th></tr>
+    <tr><td>設備台數</td><td><b>~31 台</b>（省 6 台 Agg）</td><td>~37 台</td></tr>
+    <tr><td>路徑跳數</td><td>少一跳，延遲略低</td><td>多一跳</td></tr>
+    <tr><td>Core port 使用</td><td>42/48，<b>幾乎接滿，擴 rack 困難</b></td><td>Spine 18/48，餘裕大</td></tr>
+    <tr><td>Rack 隔離 / 排錯</td><td>所有 rack 線集中在 Core 一台</td><td><b>每 rack 經各自 Agg，隔離清楚</b></td></tr>
+    <tr><td>擴充（加第 7 rack）</td><td>Core 需從 30 下行再擠，受 48p 限制</td><td>只需加 1 台 Agg，Core/Spine 不動</td></tr>
+    <tr><td>適合情境</td><td>rack 數固定、重延遲、要省設備</td><td>可能擴充、重穩定好維護</td></tr>
+  </table>
+  <b>建議：</b>若 6 rack 是固定上限且不再擴充，兩層版更精簡；若未來可能加 rack 或在意每 rack 獨立排錯，採三層版。
+</div>
+
+</body>
+</html>

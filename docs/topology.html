@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>Fanout 三層接線拓樸圖（6 Rack / Packet-Generator 側）</title>
+<style>
+  :root{
+    --gen:#2e7d32; --spine:#6a1b9a; --agg:#1565c0; --leaf:#ef6c00;
+    --dut:#37474f; --line:#b0bec5; --active:#e53935; --bg:#fafbfc;
+  }
+  *{box-sizing:border-box;}
+  body{font-family:"Segoe UI",system-ui,"Microsoft JhengHei",sans-serif;
+       margin:0;padding:24px;background:var(--bg);color:#263238;}
+  h1{font-size:20px;margin:0 0 4px;}
+  .sub{color:#607d8b;font-size:13px;margin-bottom:16px;}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:12px 0 20px;font-size:12px;}
+  .legend .item{display:flex;align-items:center;gap:6px;}
+  .swatch{width:16px;height:16px;border-radius:3px;display:inline-block;}
+  .canvas{position:relative;width:1180px;max-width:100%;margin:auto;}
+  svg{width:100%;height:auto;display:block;}
+  .node rect{rx:8;ry:8;stroke-width:1.5;}
+  .label{font-size:12px;font-weight:600;fill:#fff;}
+  .plabel{font-size:9.5px;fill:#fff;opacity:.9;}
+  .cap{font-size:10px;fill:#455a64;}
+  .edge{stroke:var(--line);stroke-width:1.4;fill:none;}
+  .edge.trunk{stroke:#78909c;stroke-width:2.2;}
+  .edge.active{stroke:var(--active);stroke-width:3;stroke-dasharray:6 3;
+               animation:dash 1s linear infinite;}
+  @keyframes dash{to{stroke-dashoffset:-18;}}
+  .edgelabel{font-size:9px;fill:#546e7a;}
+  .note{background:#fff;border:1px solid #e0e0e0;border-radius:10px;
+        padding:14px 18px;margin:18px auto;width:1180px;max-width:100%;font-size:13px;line-height:1.6;}
+  .note b{color:#1565c0;}
+  table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px;}
+  th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left;}
+  th{background:#f5f7fa;}
+  .pill{display:inline-block;padding:1px 7px;border-radius:10px;color:#fff;font-size:11px;}
+</style>
+</head>
+<body>
+
+<h1>Fanout 三層接線拓樸圖 — Packet-Generator 側（6 Rack）</h1>
+<div class="sub">左側 Rack-1 完整展開；Rack-2 ~ Rack-6 收合示意。紅色虛線為「一條活躍邏輯路徑」範例：ixia-1/1 ↔ DUT-A1:Eth0。</div>
+
+<div class="legend">
+  <div class="item"><span class="swatch" style="background:var(--gen)"></span>Packet Generator (IXIA 4 + Trex 8)</div>
+  <div class="item"><span class="swatch" style="background:var(--spine)"></span>Spine Fanout（選路核心 ×1）</div>
+  <div class="item"><span class="swatch" style="background:var(--agg)"></span>Agg Fanout（每 rack ×1）</div>
+  <div class="item"><span class="swatch" style="background:var(--leaf)"></span>Leaf Fanout（每 rack ×5）</div>
+  <div class="item"><span class="swatch" style="background:var(--dut)"></span>DUT（每 rack 24 台）</div>
+  <div class="item"><span class="swatch" style="background:var(--active)"></span>活躍邏輯路徑（VLAN 隔離）</div>
+</div>
+
+<div class="canvas">
+<svg viewBox="0 0 1180 760" xmlns="http://www.w3.org/2000/svg">
+
+  <!-- ========== EDGES (draw first, behind nodes) ========== -->
+  <!-- Generator -> Spine -->
+  <path class="edge trunk active" d="M 470,70 C 520,100 540,100 560,118"/>
+  <path class="edge trunk" d="M 500,70 C 540,100 555,100 575,118"/>
+  <path class="edge trunk" d="M 560,70 C 580,100 585,100 592,118"/>
+  <path class="edge trunk" d="M 650,70 C 640,100 625,100 612,118"/>
+  <path class="edge trunk" d="M 720,70 C 690,100 650,100 628,118"/>
+
+  <!-- Spine -> Agg (6 racks) -->
+  <path class="edge trunk active" d="M 585,172 C 520,210 360,215 300,250"/>
+  <path class="edge trunk" d="M 592,172 C 600,210 640,215 700,250"/>
+  <path class="edge trunk" d="M 598,172 C 700,205 820,215 880,250"/>
+  <path class="edge trunk" d="M 604,172 C 760,205 960,215 1010,250"/>
+  <path class="edge trunk" d="M 600,172 C 540,215 450,230 300,250" opacity=".25"/>
+  <path class="edge trunk" d="M 605,172 C 820,215 940,230 1010,250" opacity=".25"/>
+
+  <!-- Agg-1 -> Leaf-1-1..5 -->
+  <path class="edge active" d="M 270,300 C 180,330 130,340 120,358"/>
+  <path class="edge" d="M 285,300 C 240,330 215,340 205,358"/>
+  <path class="edge" d="M 300,300 L 300,358"/>
+  <path class="edge" d="M 315,300 C 360,330 385,340 395,358"/>
+  <path class="edge" d="M 330,300 C 420,330 470,340 480,358"/>
+
+  <!-- Leaf-1-1 -> DUT (fan) -->
+  <path class="edge active" d="M 95,410 C 80,460 75,480 70,500"/>
+  <path class="edge" d="M 110,410 C 110,460 110,480 110,500"/>
+  <path class="edge" d="M 125,410 C 140,460 150,480 160,500"/>
+  <path class="edge" d="M 140,410 C 170,460 190,480 210,500"/>
+
+  <!-- ========== NODES ========== -->
+
+  <!-- Generator -->
+  <g class="node">
+    <rect x="410" y="30" width="330" height="40" fill="var(--gen)" stroke="#1b5e20"/>
+    <text class="label" x="575" y="48" text-anchor="middle">Packet Generator</text>
+    <text class="plabel" x="575" y="62" text-anchor="middle">IXIA ixia-1/1~4  ·  Trex trex-1/0~7   （共 12 port）</text>
+  </g>
+
+  <!-- Spine -->
+  <g class="node">
+    <rect x="540" y="118" width="120" height="54" fill="var(--spine)" stroke="#4a148c"/>
+    <text class="label" x="600" y="140" text-anchor="middle">Spine Fanout</text>
+    <text class="plabel" x="600" y="156" text-anchor="middle">48p ×1</text>
+    <text class="plabel" x="600" y="168" text-anchor="middle">上行12→Gen / 下行6→Agg</text>
+  </g>
+
+  <!-- Agg row -->
+  <g class="node">
+    <rect x="245" y="250" width="110" height="50" fill="var(--agg)" stroke="#0d47a1"/>
+    <text class="label" x="300" y="270" text-anchor="middle">Agg-1</text>
+    <text class="plabel" x="300" y="285" text-anchor="middle">48p · rack-1 閘門</text>
+  </g>
+  <g class="node">
+    <rect x="645" y="250" width="110" height="50" fill="var(--agg)" stroke="#0d47a1"/>
+    <text class="label" x="700" y="270" text-anchor="middle">Agg-2</text>
+    <text class="plabel" x="700" y="285" text-anchor="middle">48p</text>
+  </g>
+  <g class="node">
+    <rect x="825" y="250" width="110" height="50" fill="var(--agg)" stroke="#0d47a1"/>
+    <text class="label" x="880" y="270" text-anchor="middle">Agg-3</text>
+    <text class="plabel" x="880" y="285" text-anchor="middle">48p</text>
+  </g>
+  <g class="node">
+    <rect x="955" y="250" width="110" height="50" fill="var(--agg)" stroke="#0d47a1"/>
+    <text class="label" x="1010" y="270" text-anchor="middle">Agg-4~6</text>
+    <text class="plabel" x="1010" y="285" text-anchor="middle">48p ×3（收合）</text>
+  </g>
+
+  <!-- Leaf row (rack-1) -->
+  <g class="node">
+    <rect x="70" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="100" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="100" y="392" text-anchor="middle">1-1</text>
+    <text class="plabel" x="100" y="404" text-anchor="middle">40↓/8↑</text>
+  </g>
+  <g class="node">
+    <rect x="160" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="190" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="190" y="392" text-anchor="middle">1-2</text>
+  </g>
+  <g class="node">
+    <rect x="250" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="280" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="280" y="392" text-anchor="middle">1-3</text>
+  </g>
+  <g class="node">
+    <rect x="365" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="395" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="395" y="392" text-anchor="middle">1-4</text>
+  </g>
+  <g class="node">
+    <rect x="450" y="358" width="60" height="52" fill="var(--leaf)" stroke="#e65100"/>
+    <text class="label" x="480" y="378" text-anchor="middle">Leaf</text>
+    <text class="plabel" x="480" y="392" text-anchor="middle">1-5</text>
+  </g>
+
+  <!-- DUT row (under Leaf-1-1) -->
+  <g class="node">
+    <rect x="45" y="500" width="54" height="46" fill="var(--dut)" stroke="#263238"/>
+    <text class="label" x="72" y="520" text-anchor="middle">DUT</text>
+    <text class="plabel" x="72" y="534" text-anchor="middle">A1</text>
+  </g>
+  <g class="node">
+    <rect x="105" y="500" width="54" height="46" fill="var(--dut)" stroke="#263238"/>
+    <text class="label" x="132" y="520" text-anchor="middle">DUT</text>
+    <text class="plabel" x="132" y="534" text-anchor="middle">A2</text>
+  </g>
+  <g class="node">
+    <rect x="165" y="500" width="54" height="46" fill="var(--dut)" stroke="#263238"/>
+    <text class="label" x="192" y="520" text-anchor="middle">DUT</text>
+    <text class="plabel" x="192" y="534" text-anchor="middle">A3</text>
+  </g>
+  <text class="cap" x="235" y="528">… rack-1 共 24 台 DUT，分接 5 台 Leaf，每台 DUT 8 打流 port</text>
+
+  <!-- rack grouping box -->
+  <rect x="30" y="240" width="500" height="320" fill="none" stroke="#90a4ae" stroke-dasharray="5 4" rx="12"/>
+  <text class="cap" x="40" y="258" font-weight="700" fill="#455a64">RACK-1（完整展開）</text>
+
+  <rect x="620" y="240" width="470" height="80" fill="none" stroke="#cfd8dc" stroke-dasharray="4 4" rx="12"/>
+  <text class="cap" x="630" y="335" fill="#90a4ae">RACK-2 ~ RACK-6：結構與 Rack-1 完全相同（各 1 Agg + 5 Leaf + 24 DUT，此處收合）</text>
+
+  <!-- edge labels -->
+  <text class="edgelabel" x="480" y="95">12 上行</text>
+  <text class="edgelabel" x="350" y="230">Spine→Agg trunk（VLAN）</text>
+  <text class="edgelabel" x="150" y="340">Agg→Leaf</text>
+  <text class="edgelabel" x="30" y="470">Leaf→DUT 固定接線</text>
+
+</svg>
+</div>
+
+<div class="note">
+  <b>紅色活躍路徑讀法（由上而下）：</b>
+  <code>ixia-1/1 → Spine:p37 → Spine:p1 → Agg-1:up → Agg-1:p3 → Leaf-1-1:up → Leaf-1-1:p5 → DUT-A1:Eth0</code><br>
+  這條路徑經過的每一段 <b>Spine↔Agg</b>、<b>Agg↔Leaf</b> trunk 都會被配上同一個 VLAN（例如 VLAN 101）；
+  其他同時活躍的路徑若共用某段 trunk，就配不同 VLAN 做軟隔離；若想佔用同一實體 port 則為硬衝突，分配失敗。
+</div>
+
+<div class="note">
+  <b>Port 分配總表（6 Rack，Packet-Generator 側）</b>
+  <table>
+    <tr><th>層</th><th>角色</th><th>每台 port 分配</th><th>台數</th><th>備註</th></tr>
+    <tr>
+      <td><span class="pill" style="background:var(--leaf)">Leaf</span></td>
+      <td>直接接 DUT 打流 port</td><td>40 下行(DUT) + 8 上行(Agg)</td>
+      <td>每 rack 5 → <b>30</b></td><td>每 rack 192 DUT port，固定接線一次到位</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--agg)">Agg</span></td>
+      <td>每 rack 匯聚 / 掛載閘門</td><td>40 下行(Leaf) + 上行(Spine)</td>
+      <td>每 rack 1 → <b>6</b></td><td>rack 掛載與否由 Agg↔Spine VLAN 控制</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--spine)">Spine</span></td>
+      <td>選路核心 / 接 generator</td><td>6 下行(Agg) + 12 上行(Gen) = 18</td>
+      <td><b>1</b></td><td>18 &lt; 48，不會成為瓶頸</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--gen)">Generator</span></td>
+      <td>打流來源</td><td>—</td>
+      <td>IXIA 4 + Trex 8 = <b>12 port</b></td><td>同時最多 12 條活躍路徑</td>
+    </tr>
+  </table>
+  合計約 <b>37 台 fanout</b>（30 Leaf + 6 Agg + 1 Spine）。
+</div>
+
+<div class="note">
+  <b>關鍵設計意圖</b><br>
+  1. <b>Leaf→DUT 線固定</b>：接一次就不動，拓樸檔穩定。<br>
+  2. <b>掛載彈性在 Agg↔Spine 用 VLAN 控制</b>：換 rack 不需重插線，由系統下發 fanout VLAN。<br>
+  3. <b>一次最多 12 條活躍路徑</b>（generator 上限），故上層不會壅塞；衝突管理聚焦在共用 trunk 的 VLAN 隔離。<br>
+  4. <b>重開機偵測</b>：系統須檢查 fanout 是否重啟（設定遺失），若是則重新下發當前活躍 VLAN。
+</div>
+
+</body>
+</html>

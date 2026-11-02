@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "topo-manager"
+version = "0.1.0"
+description = "拓樸管理 CLI 工具（Topology Manager）Phase 1 骨架"
+requires-python = ">=3.8"
+dependencies = [
+    "pydantic>=2.5,<2.11",
+    # 3.2+ 需 Python>=3.9，3.8 僅能用到 3.1
+    "networkx>=3.1,<3.2",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+topo-manager = "topo_manager.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
