@@ -3,5 +3,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# session ledger 預設狀態檔目錄（執行期/測試產物，不進版控）
+.topo-state/
+
 # Workflow pipeline 中間產物（需求/設計草稿/審查/計畫等過程檔，不進版控）
 .agents/

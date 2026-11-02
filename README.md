@@ -1,10 +1,13 @@
-# topo-manager（拓樸管理工具）Phase 1
+# topo-manager（拓樸管理工具）
 
 拓樸管理 CLI 工具。讀取描述打流環境的拓樸 YAML（generator、fanout、rack/DUT
-與實體連線），驗證其正確性後建成有向多層圖，印出摘要，並可查詢任一
-generator port 到任一 DUT port 的實體路徑。
+與實體連線），驗證其正確性後建成有向多層圖，印出摘要，查詢任一 generator port
+到任一 DUT port 的實體路徑，並管理「generator→DUT」的 session 分配（含全域唯一
+VLAN 與 JSON 持久化）。
 
-本階段（Phase 1）為命令列骨架，聚焦「載入 → 驗證 → 建圖 → 摘要 / 路徑查找」。
+Phase 1 聚焦「載入 → 驗證 → 建圖 → 摘要 / 路徑查找」；Phase 2 在其上加入 session
+分配引擎（硬衝突偵測、全域唯一 VLAN、斷電可還原的 JSON ledger）並把 CLI 重構成
+子命令。
 
 ## 安裝
 
@@ -19,24 +22,47 @@ pip install -e ".[dev]"
 
 ## 執行
 
+CLI 採「子命令（subcommand）」介面，每個子命令都吃一個位置參數 `<topology.yaml>`：
+
 ```bash
-python -m topo_manager <topology.yaml> [--from GEN_PORT --to DUT_PORT]
+python -m topo_manager <command> <topology.yaml> [選項]
 ```
 
-- 位置參數 `<topology.yaml>`：拓樸 YAML 檔路徑（必填）。
+| 子命令 | 用途 | 主要選項 |
+| --- | --- | --- |
+| `summary` | 載入拓樸並印人類可讀摘要 | （無） |
+| `path` | 印一條 generator→DUT 實體路徑 | `--from`、`--to`（須成對） |
+| `allocate` | 分配一筆 session（含 VLAN 與路徑）並持久化 | `--from`、`--to`、`--state` |
+| `release` | 釋放一筆既有 session | `--session`、`--state` |
+| `list` | 列出目前所有 active session | `--state` |
+
+選項說明：
+
 - `--from GEN_PORT`：generator 端 port，可裸名（如 `ixia-1/1`）或 `dev:port`。
 - `--to DUT_PORT`：DUT 端點，**一律 `dev:port` 形式**（如 `dut-A1:Eth0`）；
-  因 tg_port 名稱會跨 DUT 重複，裸名無法唯一指定。
-- `--from` 與 `--to` **須成對提供**：兩者皆給才做路徑查找；只給其一會得到參數
-  錯誤；皆不給則只印摘要。
+  因 tg_port 名稱會跨 DUT 重複，裸名無法唯一指定。`path` / `allocate` 兩者皆須提供。
+- `--session SESSION_ID`：`release` 欲釋放的 session 識別碼（如 `s-0001`）。
+- `--state STATE_JSON`：session ledger 狀態檔路徑，預設
+  `.topo-state/allocations.json`（相對於**當前工作目錄**）。跨行程一致性需使用
+  同一 cwd，或一致地以 `--state` 明確指定同一狀態檔。
 
-載入或路徑查找失敗時，會在 stderr 印一行清楚的錯誤訊息並以非零 exit code 結束
-（不會冒出 Python traceback）。
+載入、路徑查找或分配失敗時，會在 stderr 印一行清楚的錯誤訊息並以非零 exit code
+結束（不會冒出 Python traceback）。
+
+### 舊介面對照（Phase 1 → Phase 2）
+
+Phase 1 的扁平介面 `python -m topo_manager <yaml> [--from --to]` 已改為子命令：
+
+| Phase 1（舊） | Phase 2（新） |
+| --- | --- |
+| `python -m topo_manager <yaml>` | `python -m topo_manager summary <yaml>` |
+| `python -m topo_manager <yaml> --from A --to B` | `python -m topo_manager path <yaml> --from A --to B` |
 
 ### 兩層範例（Core → Leaf → DUT）
 
 ```bash
-python -m topo_manager examples/topology-2tier.yaml --from ixia-1/1 --to dut-A1:Eth0
+python -m topo_manager summary examples/topology-2tier.yaml
+python -m topo_manager path examples/topology-2tier.yaml --from ixia-1/1 --to dut-A1:Eth0
 ```
 
 實際輸出：
@@ -55,7 +81,8 @@ python -m topo_manager examples/topology-2tier.yaml --from ixia-1/1 --to dut-A1:
 ### 三層範例（Spine → Agg → Leaf → DUT）
 
 ```bash
-python -m topo_manager examples/topology-3tier.yaml --from ixia-1/1 --to dut-A1:Eth0
+python -m topo_manager summary examples/topology-3tier.yaml
+python -m topo_manager path examples/topology-3tier.yaml --from ixia-1/1 --to dut-A1:Eth0
 ```
 
 實際輸出：
@@ -73,6 +100,50 @@ python -m topo_manager examples/topology-3tier.yaml --from ixia-1/1 --to dut-A1:
 
 兩份範例共用完全相同的 rack/DUT 區塊；三層只是把兩層的 `core` 拆成
 `spine + agg`，模型與演算法完全不變。
+
+### 滿規模三層範例（6 rack × 24 DUT × 8 tg_port）
+
+`examples/topology-fullscale.yaml` 由 `examples/gen_fullscale.py` 產生並 check-in
+（勿手動編輯；重跑該腳本會得到位元組等價的輸出）：
+
+```bash
+python examples/gen_fullscale.py
+```
+
+## session 分配（Phase 2）
+
+`allocate` 依最短路徑建立一筆 session，挑一個全域唯一的 VLAN，並把狀態寫到
+`--state` 指定的 JSON ledger（預設 `.topo-state/allocations.json`）。`list` 讀同一
+ledger 列出現有 session，`release` 釋放指定 session。硬衝突（同一 access port
+被兩筆 session 佔用）會被擋下並列出擁有者；共用 trunk 的多筆 session 合法，各自
+使用不同 VLAN。
+
+```bash
+# 分配一筆 session（印出 session_id、VLAN、路徑與 trunk 段）
+python -m topo_manager allocate examples/topology-3tier.yaml \
+    --from ixia-1/1 --to dut-A1:Eth0 --state .topo-state/allocations.json
+
+# 列出目前所有 active session（讀同一狀態檔）
+python -m topo_manager list examples/topology-3tier.yaml \
+    --state .topo-state/allocations.json
+
+# 釋放指定 session
+python -m topo_manager release examples/topology-3tier.yaml \
+    --session s-0001 --state .topo-state/allocations.json
+```
+
+`allocate` 實際輸出：
+
+```
+已分配：
+session s-0001
+  VLAN：100
+  端點：ixia-1/1 → dut-A1:Eth0
+  路徑：ixia-1:ixia-1/1 → spine-1:1 → spine-1:7 → agg-1:1 → agg-1:2 → leaf-1-1:1 → leaf-1-1:11 → dut-A1:Eth0
+  trunk 段：
+    spine-1:7 → agg-1:1（VLAN 100）
+    agg-1:2 → leaf-1-1:1（VLAN 100）
+```
 
 ## 通用多層約束（設計重點）
 
