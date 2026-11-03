@@ -29,6 +29,10 @@ SessionStoreError，皆為其子類，自動一併攔截），印到 stderr 的�
   - 0.2.0  FEAT-006 重構為子命令（summary/path/allocate/release/list），
            接上 Allocator 與 JsonSessionStore，新增 session 排版輔助與
            --state 選項（設計 §CLI）；移除舊的扁平介面。
+  - 0.3.0  Phase 2 Hardening：list 加 --raw（唯讀 dump，繞過拓樸）且
+           topology 改選填（nargs="?"）；allocate/release/list 加
+           --vlan-min/--vlan-max；_build_allocator 把 ValueError 轉
+           ConfigError 並傳 vlan 範圍；新增 _print_raw_ledger。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -36,14 +40,19 @@ Copyright (c) 2026 topo-manager。
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from typing import Any, Dict, List, Optional
 
 from topo_manager.allocator import Allocator, Session
-from topo_manager.errors import TopologyError
+from topo_manager.errors import ConfigError, TopologyError
 from topo_manager.graph import TopologyGraph
 from topo_manager.loader import load_topology
 from topo_manager.store import JsonSessionStore
+
+# 預設 VLAN pool 端點（CLI --vlan-min/--vlan-max，#13）。
+_DEFAULT_VLAN_MIN = 100
+_DEFAULT_VLAN_MAX = 3000
 
 # --state 預設狀態檔路徑（相對於當前工作目錄，須列入 .gitignore）。
 _DEFAULT_STATE_PATH = ".topo-state/allocations.json"
@@ -76,15 +85,16 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_topology_arg(path_parser)
     _add_from_to_args(path_parser, required=True)
 
-    # allocate <topology.yaml> --from --to [--state]
+    # allocate <topology.yaml> --from --to [--state] [--vlan-min/--vlan-max]
     allocate_parser = subparsers.add_parser(
         "allocate", help="分配一筆 session（含 VLAN 與路徑）並持久化。"
     )
     _add_topology_arg(allocate_parser)
     _add_from_to_args(allocate_parser, required=True)
     _add_state_arg(allocate_parser)
+    _add_vlan_range_args(allocate_parser)
 
-    # release <topology.yaml> --session [--state]
+    # release <topology.yaml> --session [--state] [--vlan-min/--vlan-max]
     release_parser = subparsers.add_parser(
         "release", help="釋放一筆既有 session。"
     )
@@ -97,23 +107,74 @@ def _build_parser() -> argparse.ArgumentParser:
         help="欲釋放的 session 識別碼（如 s-0001）。",
     )
     _add_state_arg(release_parser)
+    _add_vlan_range_args(release_parser)
 
-    # list <topology.yaml> [--state]
+    # list [topology.yaml] [--state] [--raw] [--vlan-min/--vlan-max]
     list_parser = subparsers.add_parser(
-        "list", help="列出目前所有 active session。"
+        "list", help="列出目前所有 active session（--raw 唯讀 dump 原始帳本）。"
     )
-    _add_topology_arg(list_parser)
+    _add_topology_arg(list_parser, required=False)
     _add_state_arg(list_parser)
+    list_parser.add_argument(
+        "--raw",
+        dest="raw",
+        action="store_true",
+        help="唯讀 dump 原始 ledger JSON（繞過拓樸與還原檢查，壞帳本亦可檢視）。",
+    )
+    _add_vlan_range_args(list_parser)
 
     return parser
 
 
-def _add_topology_arg(parser: argparse.ArgumentParser) -> None:
-    """為子命令加上必填位置參數 ``topology.yaml``。"""
+def _add_topology_arg(parser: argparse.ArgumentParser, required: bool = True) -> None:
+    """為子命令加上位置參數 ``topology.yaml``。
+
+    參數：
+      - required：True（預設）時為必填位置參數；False 時以 ``nargs="?"``
+        設為選填（預設 None）——供 ``list --raw`` 可完全不提供拓樸（#12）。
+    """
+    if required:
+        parser.add_argument(
+            "topology",
+            metavar="topology.yaml",
+            help="拓樸 YAML 檔路徑（必填）。",
+        )
+    else:
+        parser.add_argument(
+            "topology",
+            metavar="topology.yaml",
+            nargs="?",
+            default=None,
+            help="拓樸 YAML 檔路徑（--raw 時可省略；非 --raw 時必填）。",
+        )
+
+
+def _add_vlan_range_args(parser: argparse.ArgumentParser) -> None:
+    """為子命令加上 ``--vlan-min`` / ``--vlan-max`` 選項（#13）。
+
+    三個子命令（allocate/release/list）共用同一組選項與預設（100/3000），
+    使對同一 state 的 pool 範圍一致。非法範圍由 ``_build_allocator`` 轉
+    ``ConfigError``（CLI 無 traceback）。
+    """
     parser.add_argument(
-        "topology",
-        metavar="topology.yaml",
-        help="拓樸 YAML 檔路徑（必填）。",
+        "--vlan-min",
+        dest="vlan_min",
+        metavar="VLAN_MIN",
+        type=int,
+        default=_DEFAULT_VLAN_MIN,
+        help="VLAN pool 下界（預設 {0}，須落在 802.1Q 2..4094）。".format(
+            _DEFAULT_VLAN_MIN
+        ),
+    )
+    parser.add_argument(
+        "--vlan-max",
+        dest="vlan_max",
+        metavar="VLAN_MAX",
+        type=int,
+        default=_DEFAULT_VLAN_MAX,
+        help="VLAN pool 上界（預設 {0}，須落在 802.1Q 2..4094）。".format(
+            _DEFAULT_VLAN_MAX
+        ),
     )
 
 
@@ -256,22 +317,38 @@ def _format_session_list(sessions: List[Session]) -> str:
     return "\n\n".join(blocks)
 
 
-def _build_allocator(topology_path: str, state_path: str) -> Allocator:
+def _print_raw_ledger(raw: dict) -> None:
+    """原樣 pretty-dump ledger JSON（不做任何還原/一致性詮釋，#12）。
+
+    UTF-8 友善（``ensure_ascii=False``）、2 空格縮排，印到 stdout。
+    """
+    print(json.dumps(raw, ensure_ascii=False, indent=2))
+
+
+def _build_allocator(
+    topology_path: str, state_path: str, vlan_min: int, vlan_max: int
+) -> Allocator:
     """載入拓樸、建 JsonSessionStore 與 Allocator（allocate/release/list 共用）。
 
     參數：
       - topology_path：拓樸 YAML 檔路徑。
       - state_path：session ledger 狀態檔路徑（``--state``）。
+      - vlan_min / vlan_max：VLAN pool 端點（``--vlan-min``/``--vlan-max``）。
 
     回傳：
       - 已還原既有 ledger 的 ``Allocator``。
 
     例外：
+      - ``ConfigError``：VLAN pool 範圍非法（把 ``Allocator`` 建構期的
+        ``ValueError`` 轉為 ``TopologyError`` 家族，CLI 無 traceback，#13）。
       - ``TopologyError`` 家族：載入 / 建圖 / ledger 還原失敗（由 main 攔截）。
     """
     topology = load_topology(topology_path)
     store = JsonSessionStore(state_path)
-    return Allocator(topology, store)
+    try:
+        return Allocator(topology, store, vlan_min=vlan_min, vlan_max=vlan_max)
+    except ValueError as exc:
+        raise ConfigError("VLAN pool 設定非法：{0}".format(exc)) from exc
 
 
 def _cmd_summary(args: argparse.Namespace) -> int:
@@ -293,7 +370,9 @@ def _cmd_path(args: argparse.Namespace) -> int:
 
 def _cmd_allocate(args: argparse.Namespace) -> int:
     """執行 ``allocate`` 子命令：分配一筆 session 並印其摘要（設計 §CLI）。"""
-    allocator = _build_allocator(args.topology, args.state)
+    allocator = _build_allocator(
+        args.topology, args.state, args.vlan_min, args.vlan_max
+    )
     session = allocator.allocate(args.from_port, args.to_port)
     print("已分配：")
     print(_format_session(session))
@@ -302,7 +381,9 @@ def _cmd_allocate(args: argparse.Namespace) -> int:
 
 def _cmd_release(args: argparse.Namespace) -> int:
     """執行 ``release`` 子命令：釋放一筆 session 並印其摘要（設計 §CLI）。"""
-    allocator = _build_allocator(args.topology, args.state)
+    allocator = _build_allocator(
+        args.topology, args.state, args.vlan_min, args.vlan_max
+    )
     session = allocator.release(args.session_id)
     print("已釋放：")
     print(_format_session(session))
@@ -310,8 +391,21 @@ def _cmd_release(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
-    """執行 ``list`` 子命令：列出目前所有 active session（設計 §CLI）。"""
-    allocator = _build_allocator(args.topology, args.state)
+    """執行 ``list`` 子命令：列出 active session，或 ``--raw`` 唯讀 dump（§CLI、#12）。
+
+    ``--raw`` 分支完全不碰拓樸（不建 Allocator、不呼叫 load_topology），直接讀
+    ledger 原始 JSON 並 dump，確保壞帳本/缺 YAML 時仍可檢視。非 raw 模式需提供
+    topology.yaml，否則丟 ``ConfigError``（無 traceback）。
+    """
+    if args.raw:
+        store = JsonSessionStore(args.state)
+        _print_raw_ledger(store.load_raw())
+        return 0
+    if args.topology is None:
+        raise ConfigError("list（非 --raw 模式）需提供 topology.yaml")
+    allocator = _build_allocator(
+        args.topology, args.state, args.vlan_min, args.vlan_max
+    )
     print(_format_session_list(allocator.list_sessions()))
     return 0
 

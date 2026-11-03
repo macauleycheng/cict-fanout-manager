@@ -32,9 +32,9 @@ python -m topo_manager <command> <topology.yaml> [選項]
 | --- | --- | --- |
 | `summary` | 載入拓樸並印人類可讀摘要 | （無） |
 | `path` | 印一條 generator→DUT 實體路徑 | `--from`、`--to`（須成對） |
-| `allocate` | 分配一筆 session（含 VLAN 與路徑）並持久化 | `--from`、`--to`、`--state` |
-| `release` | 釋放一筆既有 session | `--session`、`--state` |
-| `list` | 列出目前所有 active session | `--state` |
+| `allocate` | 分配一筆 session（含 VLAN 與路徑）並持久化 | `--from`、`--to`、`--state`、`--vlan-min`、`--vlan-max` |
+| `release` | 釋放一筆既有 session | `--session`、`--state`、`--vlan-min`、`--vlan-max` |
+| `list` | 列出目前所有 active session（或 `--raw` 唯讀 dump） | `--state`、`--raw`、`--vlan-min`、`--vlan-max`；`<topology.yaml>` 在 `--raw` 時可省略 |
 
 選項說明：
 
@@ -45,9 +45,17 @@ python -m topo_manager <command> <topology.yaml> [選項]
 - `--state STATE_JSON`：session ledger 狀態檔路徑，預設
   `.topo-state/allocations.json`（相對於**當前工作目錄**）。跨行程一致性需使用
   同一 cwd，或一致地以 `--state` 明確指定同一狀態檔。
+- `--vlan-min VLAN_MIN` / `--vlan-max VLAN_MAX`：VLAN pool 端點（預設
+  `100`/`3000`），供 `allocate`/`release`/`list` 共用。範圍須落在 802.1Q 可用
+  區間 `2..4094`（排除保留的 0/1/4095）；非法範圍（如 `--vlan-max 9999`）會被
+  明確拒絕、以非零 exit code 結束、不冒 traceback。
+- `--raw`（僅 `list`）：唯讀 dump ledger 的原始 JSON，**繞過拓樸與還原檢查**。
+  此模式完全不讀取 `topology.yaml`（可省略該位置參數），因此即使帳本版本不符、
+  內容不一致，或拓樸 YAML 缺失/損壞，仍能原樣檢視帳本以便診斷修復。
 
-載入、路徑查找或分配失敗時，會在 stderr 印一行清楚的錯誤訊息並以非零 exit code
-結束（不會冒出 Python traceback）。
+載入、路徑查找或分配失敗時，會在 stderr 印清楚的錯誤訊息並以非零 exit code
+結束（不會冒出 Python traceback）。這包含 `--state` 指向**不可建立/不可讀/唯讀/
+磁碟滿**等 I/O 失敗——一律以單一錯誤區塊回報、不冒 traceback。
 
 ### 舊介面對照（Phase 1 → Phase 2）
 
@@ -143,6 +151,35 @@ session s-0001
   trunk 段：
     spine-1:7 → agg-1:1（VLAN 100）
     agg-1:2 → leaf-1-1:1（VLAN 100）
+```
+
+### 帳本格式（ledger）
+
+狀態檔是一份 JSON ledger，頂層有三個 key：
+
+- `version`：ledger 的 **schema 版本**（整數，目前為 `2`）。load 時以此 key 與
+  程式內建版本比對，不符即明確拒絕。
+- `next_seq`：session 序號的**高水位**（整數）。序號只增不減——釋放最高序號的
+  session 後重啟，下一筆分配不會重用已用過的序號。
+- `sessions`：目前 active 的 session 陣列（各含 `session_id`、`vlan`、端點、
+  `path`、`physical_ports` 與 `trunk_segments`）。
+
+> `access_ports` 不入帳本：它是由 `physical_ports` 扣除 trunk 端節點即時重算的
+> 衍生值（單一真相來源），不受帳本竄改影響。
+
+跨行程併發安全：`allocate`/`release` 以同目錄的 lock 檔（`<state>.lock`）取跨
+行程排他鎖，鎖內重新讀取最新帳本再決策、save，確保多行程同時分配不會算出重複的
+序號或 VLAN。寫入採「tempfile + fsync + 原子換名 + 父目錄 fsync」，斷電時帳本不是
+舊內容就是新完整內容，不會半截損毀。
+
+### 唯讀檢視原始帳本（`list --raw`）
+
+當帳本版本不符、內容不一致，或拓樸 YAML 缺失/損壞導致正常 `list` 無法進行時，用
+`--raw` 直接 dump 原始 JSON（不碰拓樸、不做還原檢查）以便診斷：
+
+```bash
+# 原樣 dump 帳本（可省略 topology.yaml）
+python -m topo_manager list --raw --state .topo-state/allocations.json
 ```
 
 ## 通用多層約束（設計重點）

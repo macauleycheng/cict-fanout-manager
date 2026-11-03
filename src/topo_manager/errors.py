@@ -11,6 +11,9 @@
            路徑查找）。
   - 0.2.0  FEAT-005 Phase 2 新增 4 個分配/持久化錯誤子類
            （硬衝突/VLAN 耗盡/session 不存在/ledger 儲存）。
+  - 0.3.0  Phase 2 Hardening 新增 ConfigError（設定/參數非法，CLI 以既有
+           except TopologyError 攔截）；SessionStoreError docstring 補充
+           store 層讀寫 I/O 失敗亦屬此類。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -111,4 +114,18 @@ class SessionStoreError(TopologyError):
     還原時偵測到一致性問題（同一 access port 被兩個 session 佔用、或
     VLAN 重複）。訊息應含檔案路徑與底層原因，供使用者修正或改用
     ``--state`` 指定正確的狀態檔。
+
+    store 層讀寫 I/O 失敗亦屬此類：權限不足、路徑為目錄或不可建立、磁碟
+    滿、唯讀檔案系統、非 UTF-8 內容，一律包成本例外並保留 ``__cause__``
+    （exception chaining），讓 CLI 以單一錯誤區塊回報、不冒 traceback。
+    """
+
+
+class ConfigError(TopologyError):
+    """設定/參數非法時觸發（Phase 2 Hardening）。
+
+    觸發條件：使用者或設定層提供的參數不合法，例如 CLI 的 VLAN pool 範圍
+    （``--vlan-min``/``--vlan-max``）超出 802.1Q 可用範圍、或 ``list``（非
+    ``--raw``）未提供必要的 topology.yaml。屬 ``TopologyError`` 家族，CLI 以
+    既有 ``except TopologyError`` 攔截、印單一錯誤區塊、回非零、無 traceback。
     """

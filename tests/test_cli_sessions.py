@@ -15,6 +15,7 @@ Copyright (c) 2026 topo-manager。
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,107 @@ def test_allocate_hard_conflict_returns_nonzero(
     capsys.readouterr()
 
     code = main(["allocate", topo, "--from", "ixia-1/1", "--to", "dut-A1:Eth0", "--state", state])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("錯誤：")
+    assert "Traceback" not in captured.err
+    # 本階段 AC13（原 AC15 裁決）：硬衝突為單一「多行」錯誤區塊（標題列 +
+    # 至少一個衝突 port 行），不含 traceback。
+    assert captured.err.rstrip("\n").count("\n") >= 1
+
+
+def test_store_io_failure_cli_nonzero_no_traceback(
+    three_tier_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """--state 指向不可建立路徑（檔案當中間目錄）→ 非零、stderr 含路徑、無 traceback（#4）。"""
+    a_file = tmp_path / "afile"
+    a_file.write_text("x", encoding="utf-8")
+    bad_state = str(a_file / "nope" / "allocations.json")
+    code = main(
+        [
+            "allocate", str(three_tier_path), "--from", "ixia-1/1",
+            "--to", "dut-A1:Eth0", "--state", bad_state,
+        ]
+    )
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("錯誤：")
+    assert str(a_file) in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_list_raw_dumps_bad_ledger(
+    three_tier_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """版本不符/malformed id 帳本下：正常 list 非零，list --raw 回 0 並含原始 id（#12、AC11）。"""
+    state = _state_arg(tmp_path)
+    state_path = Path(state)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    # 版本不符（1）且 malformed id 的帳本。
+    state_path.write_text(
+        json.dumps(
+            {"version": 1, "sessions": [{"session_id": "manual-session"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    topo = str(three_tier_path)
+
+    # 正常 list（非 --raw）會因版本不符而非零。
+    assert main(["list", topo, "--state", state]) == 1
+    capsys.readouterr()
+
+    # list --raw 回 0 且 stdout 含原始 malformed id。
+    assert main(["list", "--raw", "--state", state]) == 0
+    out = capsys.readouterr().out
+    assert "manual-session" in out
+
+
+def test_list_raw_works_without_topology_or_with_bad_yaml(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """list --raw 繞過拓樸：缺 YAML 或壞 YAML 皆回 0 並 dump 帳本（#12）。"""
+    state = _state_arg(tmp_path)
+    state_path = Path(state)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"version": 2, "next_seq": 1, "sessions": []}),
+        encoding="utf-8",
+    )
+
+    # 完全不給 topology。
+    assert main(["list", "--raw", "--state", state]) == 0
+    out = capsys.readouterr().out
+    assert '"version"' in out
+
+    # 給一個不存在的 YAML 也不影響 --raw。
+    assert main(["list", "nonexistent.yaml", "--raw", "--state", state]) == 0
+    assert '"sessions"' in capsys.readouterr().out
+
+
+def test_list_non_raw_missing_topology_config_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """list（非 --raw）未給 topology → ConfigError、非零、無 traceback（#12）。"""
+    state = _state_arg(tmp_path)
+    code = main(["list", "--state", state])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("錯誤：")
+    assert "Traceback" not in captured.err
+
+
+def test_vlan_range_cli_config_error(
+    three_tier_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """--vlan-max 9999 超出 802.1Q → ConfigError 攔截、非零、無 traceback（#13、AC12）。"""
+    state = _state_arg(tmp_path)
+    code = main(
+        [
+            "allocate", str(three_tier_path), "--from", "ixia-1/1",
+            "--to", "dut-A1:Eth0", "--state", state, "--vlan-max", "9999",
+        ]
+    )
     assert code == 1
     captured = capsys.readouterr()
     assert captured.err.startswith("錯誤：")
