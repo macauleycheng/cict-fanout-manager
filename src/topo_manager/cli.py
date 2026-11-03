@@ -33,6 +33,12 @@ SessionStoreError，皆為其子類，自動一併攔截），印到 stderr 的�
            topology 改選填（nargs="?"）；allocate/release/list 加
            --vlan-min/--vlan-max；_build_allocator 把 ValueError 轉
            ConfigError 並傳 vlan 範圍；新增 _print_raw_ledger。
+  - 0.4.0  Phase 4 fanout 下發層：新增 plan/probe/apply/verify 四子命令與其
+           handler（_cmd_plan/_cmd_probe/_cmd_apply/_cmd_verify），於 _COMMANDS
+           分派表註冊；新增 --credentials/--fanout/--apply 選項輔助；drivers
+           模組（config/ec_ssh/deployer）一律於 handler 內延遲 import，確保
+           summary/path/allocate/release/list 與未裝 netmiko 時完全不受影響。
+           既有 5 子命令、_build_allocator、main() 的 except TopologyError 不動。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -122,6 +128,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="唯讀 dump 原始 ledger JSON（繞過拓樸與還原檢查，壞帳本亦可檢視）。",
     )
     _add_vlan_range_args(list_parser)
+
+    # plan <topology.yaml> --session/--from/--to [--state][--credentials][--fanout]
+    plan_parser = subparsers.add_parser(
+        "plan", help="純算 fanout 下發計畫（不連線）；--session 取既有、--from/--to 預覽。"
+    )
+    _add_topology_arg(plan_parser)
+    _add_session_or_endpoints_args(plan_parser)
+    _add_state_arg(plan_parser)
+    _add_vlan_range_args(plan_parser)
+    _add_credentials_arg(plan_parser)
+    _add_fanout_arg(plan_parser)
+
+    # probe [--credentials][--fanout]
+    probe_parser = subparsers.add_parser(
+        "probe", help="唯讀連線 fanout 並印 show version/vlan（診斷用）。"
+    )
+    _add_credentials_arg(probe_parser)
+    _add_fanout_arg(probe_parser)
+
+    # apply <topology.yaml> --session [--state][--credentials][--fanout][--apply]
+    apply_parser = subparsers.add_parser(
+        "apply", help="下發 session 至 fanout（預設 dry-run，--apply 才寫入）。"
+    )
+    _add_topology_arg(apply_parser)
+    _add_session_arg(apply_parser)
+    _add_state_arg(apply_parser)
+    _add_vlan_range_args(apply_parser)
+    _add_credentials_arg(apply_parser)
+    _add_fanout_arg(apply_parser)
+    _add_apply_flag(apply_parser)
+
+    # verify <topology.yaml> --session [--state][--credentials][--fanout][--apply]
+    verify_parser = subparsers.add_parser(
+        "verify", help="回讀驗證 session 是否已下發；--apply 時重套缺漏（重開機偵測）。"
+    )
+    _add_topology_arg(verify_parser)
+    _add_session_arg(verify_parser)
+    _add_state_arg(verify_parser)
+    _add_vlan_range_args(verify_parser)
+    _add_credentials_arg(verify_parser)
+    _add_fanout_arg(verify_parser)
+    _add_apply_flag(verify_parser)
 
     return parser
 
@@ -216,6 +264,87 @@ def _add_state_arg(parser: argparse.ArgumentParser) -> None:
             "session ledger 狀態檔路徑（預設 {0}，相對於當前工作目錄）；"
             "跨行程一致性需使用同一 cwd 或明確以 --state 指定同一檔。"
         ).format(_DEFAULT_STATE_PATH),
+    )
+
+
+def _add_session_arg(parser: argparse.ArgumentParser) -> None:
+    """為子命令加上必填 ``--session`` 選項（apply/verify 用）。
+
+    apply/verify 一律針對一筆既有 session 操作（經 allocator.get_session 取回），
+    故 ``--session`` 為必填。
+    """
+    parser.add_argument(
+        "--session",
+        dest="session_id",
+        metavar="SESSION_ID",
+        required=True,
+        help="目標 session 識別碼（如 s-0001，經帳本取回）。",
+    )
+
+
+def _add_session_or_endpoints_args(parser: argparse.ArgumentParser) -> None:
+    """為 ``plan`` 加上互斥的 ``--session`` 或 ``--from/--to``（擇一）。
+
+    ``--session`` 走 ``get_session`` 取既有 session；``--from/--to`` 走
+    ``derive_session`` 純推導預覽（不落帳）。兩者互斥且須擇一提供，由 handler
+    驗證（argparse 層僅收選項，缺漏/互斥語意於 ``_cmd_plan`` 以 ConfigError 回報）。
+    """
+    parser.add_argument(
+        "--session",
+        dest="session_id",
+        metavar="SESSION_ID",
+        default=None,
+        help="既有 session 識別碼（如 s-0001）；與 --from/--to 擇一。",
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_port",
+        metavar="GEN_PORT",
+        default=None,
+        help="generator 端 port（預覽用，與 --session 擇一）。",
+    )
+    parser.add_argument(
+        "--to",
+        dest="to_port",
+        metavar="DUT_PORT",
+        default=None,
+        help="DUT 端點 dev:port（預覽用，與 --session 擇一）。",
+    )
+
+
+def _add_credentials_arg(parser: argparse.ArgumentParser) -> None:
+    """為下發層子命令加上 ``--credentials`` 連線設定檔選項。
+
+    對應 ``load_fanout_config(path=...)``；None（未指定）時由設定層走預設檔名
+    與 env 覆寫（細節見 drivers/config.py）。憑證檔已列入 .gitignore，不入版控。
+    """
+    parser.add_argument(
+        "--credentials",
+        dest="credentials",
+        metavar="CREDENTIALS_JSON",
+        default=None,
+        help="fanout 連線設定檔路徑（JSON）；未指定時走預設檔名與 env 覆寫。",
+    )
+
+
+def _add_fanout_arg(parser: argparse.ArgumentParser) -> None:
+    """為下發層子命令加上 ``--fanout`` 選台選項（多台時必指定其一）。"""
+    parser.add_argument(
+        "--fanout",
+        dest="fanout",
+        metavar="FANOUT_NAME",
+        default=None,
+        help="指定要操作的 fanout 裝置名（設定含多台時必填）。",
+    )
+
+
+def _add_apply_flag(parser: argparse.ArgumentParser) -> None:
+    """為 apply/verify 加上 ``--apply`` 旗標（store_true，預設 False=dry-run）。"""
+    parser.add_argument(
+        "--apply",
+        dest="apply",
+        action="store_true",
+        help="實際連線並寫入設備（預設 dry-run，不寫入）。",
     )
 
 
@@ -410,6 +539,184 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_session_for_plan(args: argparse.Namespace):
+    """為 ``plan`` 取回或推導目標 session（--session 取既有、--from/--to 預覽）。
+
+    參數：
+      - args：已解析的命名空間（具 topology/state/vlan_min/vlan_max 與
+        session_id/from_port/to_port）。
+
+    回傳：
+      - 一筆 ``Session``（既有或 (preview) 臨時）。
+
+    例外：
+      - ConfigError：同時給或都不給（--session 與 --from/--to 須擇一）、或
+        --from/--to 只給其一。
+      - TopologyError 家族：載入/建圖/還原/查無 session/路徑查找失敗。
+    """
+    has_session = args.session_id is not None
+    has_endpoints = args.from_port is not None or args.to_port is not None
+
+    if has_session and has_endpoints:
+        raise ConfigError("plan：--session 與 --from/--to 互斥，請擇一")
+    if not has_session and not has_endpoints:
+        raise ConfigError("plan：請提供 --session 或成對的 --from/--to")
+
+    allocator = _build_allocator(
+        args.topology, args.state, args.vlan_min, args.vlan_max
+    )
+    if has_session:
+        return allocator.get_session(args.session_id)
+
+    if args.from_port is None or args.to_port is None:
+        raise ConfigError("plan：--from 與 --to 須成對提供")
+    return allocator.derive_session(args.from_port, args.to_port)
+
+
+def _build_deployer(credentials: Optional[str]):
+    """延遲 import drivers，載入連線設定並建 Deployer（下發層 handler 共用）。
+
+    drivers 子套件（config/ec_ssh/deployer）於此延遲 import：確保非下發層子命令
+    與未安裝 netmiko 的環境完全不觸發 drivers 匯入。driver_factory 以
+    ``FanoutEntry`` 建 ``EcSshDriver``（netmiko 仍於其 connect() 內延遲 import）。
+
+    參數：
+      - credentials：連線設定檔路徑（``--credentials``）；None 走預設/env。
+
+    回傳：
+      - ``(Deployer, FanoutConfig)`` tuple。
+
+    例外：
+      - ConfigError：連線設定載入/驗證失敗（由 load_fanout_config 丟出）。
+    """
+    from topo_manager.drivers.config import load_fanout_config
+    from topo_manager.drivers.deployer import Deployer
+    from topo_manager.drivers.ec_ssh import EcSshDriver
+
+    config = load_fanout_config(path=credentials)
+
+    def _factory(name: str, entry) -> "object":
+        """以單台 FanoutEntry 建立 EcSshDriver（供 Deployer 下發各 fanout）。"""
+        return EcSshDriver(
+            host=entry.host,
+            username=entry.username,
+            password=entry.password,
+            device_type=entry.device_type,
+            interface_template=entry.interface_template,
+        )
+
+    return Deployer(_factory, config), config
+
+
+def _print_plan_result(plan_result: "object", *, dry_run: bool) -> None:
+    """排版並印 ``PlanResult``：fanout→interface→VLAN→指令（設計 §CLI）。
+
+    參數：
+      - plan_result：``deployer.PlanResult``。
+      - dry_run：True 時標示為 DRY-RUN（不寫入）。
+    """
+    header = "下發計畫（session {0}，VLAN {1}）{2}".format(
+        plan_result.session_id,
+        plan_result.vlan,
+        "（DRY-RUN，未寫入）" if dry_run else "",
+    )
+    print(header)
+    for fanout_plan in plan_result.fanouts:
+        if not fanout_plan.changes:
+            print("  fanout {0}：（無變更）".format(fanout_plan.fanout))
+            continue
+        print("  fanout {0}：".format(fanout_plan.fanout))
+        for change in fanout_plan.changes:
+            print(
+                "    介面 {0} ← VLAN {1}".format(change.interface, change.vlan)
+            )
+        for command in fanout_plan.commands:
+            print("      $ {0}".format(command))
+
+
+def _cmd_plan(args: argparse.Namespace) -> int:
+    """執行 ``plan`` 子命令：純算下發計畫並印（絕不連線，設計 §CLI）。"""
+    session = _resolve_session_for_plan(args)
+    deployer, _config = _build_deployer(args.credentials)
+    plan_result = deployer.plan(session)
+    _print_plan_result(plan_result, dry_run=True)
+    return 0
+
+
+def _cmd_probe(args: argparse.Namespace) -> int:
+    """執行 ``probe`` 子命令：唯讀連線並印 show version/vlan（設計 §CLI）。"""
+    from topo_manager.drivers.config import load_fanout_config, select_fanout
+    from topo_manager.drivers.ec_ssh import EcSshDriver
+
+    config = load_fanout_config(path=args.credentials)
+    fanout_name = select_fanout(config, args.fanout)
+    entry = config.fanouts[fanout_name]
+    driver = EcSshDriver(
+        host=entry.host,
+        username=entry.username,
+        password=entry.password,
+        device_type=entry.device_type,
+        interface_template=entry.interface_template,
+    )
+    driver.connect()
+    try:
+        print("fanout {0} show version：".format(fanout_name))
+        print(driver.read_show("show version"))
+        print("fanout {0} show vlan：".format(fanout_name))
+        print(driver.read_show("show vlan"))
+    finally:
+        driver.disconnect()
+    return 0
+
+
+def _cmd_apply(args: argparse.Namespace) -> int:
+    """執行 ``apply`` 子命令：下發 session（預設 dry-run，--apply 才寫入）。"""
+    allocator = _build_allocator(
+        args.topology, args.state, args.vlan_min, args.vlan_max
+    )
+    session = allocator.get_session(args.session_id)
+    deployer, _config = _build_deployer(args.credentials)
+    plan_result = deployer.apply(session, apply=args.apply)
+    _print_plan_result(plan_result, dry_run=not args.apply)
+    if args.apply:
+        print("已套用（apply）至設備並通過回讀驗證。")
+    return 0
+
+
+def _print_verify_result(verify_result: "object", *, reapplied: bool) -> None:
+    """排版並印 ``VerifyResult``（缺漏/全部達成，設計 §CLI）。"""
+    if verify_result.ok:
+        print(
+            "verify：session {0} 全部 tagged 成員已達成{1}。".format(
+                verify_result.session_id,
+                "（重套後驗證通過）" if reapplied else "",
+            )
+        )
+        return
+    print("verify：session {0} 仍有缺漏：".format(verify_result.session_id))
+    for fanout_name, missing in verify_result.missing_by_fanout.items():
+        items = ", ".join(
+            "({0}, VLAN {1})".format(change.interface, change.vlan)
+            for change in missing
+        )
+        print("  fanout {0}：{1}".format(fanout_name, items))
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """執行 ``verify`` 子命令：回讀驗證；--apply 時重套缺漏（重開機偵測）。"""
+    allocator = _build_allocator(
+        args.topology, args.state, args.vlan_min, args.vlan_max
+    )
+    session = allocator.get_session(args.session_id)
+    deployer, _config = _build_deployer(args.credentials)
+    if args.apply:
+        result = deployer.detect_and_reapply(session, apply=True)
+    else:
+        result = deployer.verify(session)
+    _print_verify_result(result, reapplied=args.apply)
+    return 0
+
+
 # 子命令名 → 處理函式的分派表（新增子命令只需在此註冊）。
 _COMMANDS = {
     "summary": _cmd_summary,
@@ -417,6 +724,10 @@ _COMMANDS = {
     "allocate": _cmd_allocate,
     "release": _cmd_release,
     "list": _cmd_list,
+    "plan": _cmd_plan,
+    "probe": _cmd_probe,
+    "apply": _cmd_apply,
+    "verify": _cmd_verify,
 }
 
 

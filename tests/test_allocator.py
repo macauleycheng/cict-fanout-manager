@@ -585,3 +585,68 @@ def test_concurrent_multiprocess_same_access_port_one_winner(
     # 帳本最終只留一筆（後手未留下副作用）。
     reloaded = Allocator(load_topology(three_tier_path), JsonSessionStore(state))
     assert len(reloaded.list_sessions()) == 1
+
+
+# ----------------------------------------------------------------------
+# Phase 4：get_session（唯讀取回）與 derive_session（純推導預覽）
+# ----------------------------------------------------------------------
+
+
+def test_get_session_hit_returns_session(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """get_session 命中回正確 Session（唯讀，不改狀態）。"""
+    allocator = _make_allocator(three_tier_path, tmp_path)
+    created = allocator.allocate("ixia-1/1", "dut-A1:Eth0")
+
+    fetched = allocator.get_session(created.session_id)
+    assert fetched.session_id == created.session_id
+    assert fetched.vlan == created.vlan
+    assert fetched.path == created.path
+
+
+def test_get_session_miss_raises(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """get_session 查無丟 SessionNotFoundError（訊息含查無 id）。"""
+    allocator = _make_allocator(three_tier_path, tmp_path)
+    with pytest.raises(SessionNotFoundError) as exc_info:
+        allocator.get_session("s-9999")
+    assert "s-9999" in str(exc_info.value)
+
+
+def test_derive_session_returns_preview_without_side_effects(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """derive_session 回臨時 Session（id=='(preview)'），不寫 state、不改 list。"""
+    state_file = tmp_path / "state" / "allocations.json"
+    store = JsonSessionStore(state_file)
+    allocator = Allocator(load_topology(three_tier_path), store)
+
+    before = list(allocator.list_sessions())
+    state_existed_before = state_file.exists()
+
+    preview = allocator.derive_session("ixia-1/1", "dut-A1:Eth0")
+
+    assert preview.session_id == "(preview)"
+    assert preview.physical_ports == preview.path
+    assert preview.path[0] == "ixia-1:ixia-1/1"
+    assert preview.path[-1] == "dut-A1:Eth0"
+
+    # 不改變 list_sessions 結果、不寫 state 檔。
+    after = list(allocator.list_sessions())
+    assert [s.session_id for s in after] == [s.session_id for s in before]
+    assert state_file.exists() == state_existed_before
+
+
+def test_derive_session_does_not_consume_vlan_or_ports(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """derive_session 不佔 VLAN/access port：之後仍可真正 allocate 同一路徑。"""
+    allocator = _make_allocator(three_tier_path, tmp_path)
+    allocator.derive_session("ixia-1/1", "dut-A1:Eth0")
+
+    # 預覽不留副作用，故真正分配仍成功、拿到池內最小 VLAN。
+    session = allocator.allocate("ixia-1/1", "dut-A1:Eth0")
+    assert session.session_id == "s-0001"
+    assert session.vlan == 100

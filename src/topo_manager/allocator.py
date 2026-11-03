@@ -38,6 +38,11 @@ _used_vlans / _next_seq）在 __init__ 與每次交易鎖內由還原的 session
            重複/pool/physical_ports 一致/拓樸漂移）+ 序號高水位；allocate/
            release 外包 store.locked() 跨行程交易（_reload_locked /
            _allocate_locked / _release_locked），save 傳 next_seq。
+  - 0.4.0  Phase 4 fanout 下發層：新增唯讀 ``get_session``（命中回 Session、
+           查無丟 SessionNotFoundError，不取鎖/不寫 store）與純推導
+           ``derive_session``（僅 find_path + _build_trunk_segments 於記憶體
+           組臨時 Session，session_id='(preview)'，不取鎖/不 save/不動 derived
+           index，設計 §10 finding #4）；既有方法簽名與行為皆未變更。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -66,6 +71,14 @@ _SEQ_RE = re.compile(r"^s-(\d{4})$")
 
 # 還原失敗訊息統一使用的修復指引（N#3：用 --raw --state，不寫死 topology）。
 _RAW_HINT = "請以 'list --raw --state <狀態檔>' 檢視原始帳本後修正或移除該筆"
+
+# derive_session 預覽用的示範 VLAN 常數（純推導預覽，不佔池、不入帳本，設計
+# §10 finding #4）：預覽路徑/trunk 段時以此固定值標記 trunk 段 vlan，與真實
+# 分配（_pick_vlan 於封閉池內挑值）無關。
+_PREVIEW_VLAN = 3999
+
+# derive_session 回傳臨時 Session 的 session_id 哨兵值（表「僅預覽、未落帳」）。
+_PREVIEW_SESSION_ID = "(preview)"
 
 
 class TrunkSegment(BaseModel):
@@ -554,4 +567,69 @@ class Allocator:
         return sorted(
             self._sessions.values(),
             key=lambda session: self._parse_seq_strict(session.session_id),
+        )
+
+    def get_session(self, session_id: str) -> Session:
+        """唯讀取回一筆既有 session（不取鎖、不寫 store，設計 §10）。
+
+        以建構時快照的 ``self._sessions`` 查詢（可能短暫落後於其他行程剛提交的
+        寫入，與 list_sessions 一致）；查無即丟 ``SessionNotFoundError``。供下發
+        層（plan/apply/verify 以 ``--session`` 指定）唯讀取得目標 session，不改
+        任何狀態。
+
+        參數：
+          - session_id：欲查詢的 session 識別碼（如 ``s-0001``）。
+
+        回傳：
+          - 命中的 ``Session``。
+
+        例外：
+          - SessionNotFoundError：session_id 不在目前快照中（訊息含查無的
+            session_id，供改以 list 查詢）。
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise SessionNotFoundError(
+                "找不到 session：{0}".format(session_id)
+            )
+        return session
+
+    def derive_session(
+        self,
+        generator_port: str,
+        dut_port: str,
+        vlan: int = _PREVIEW_VLAN,
+    ) -> Session:
+        """純推導一筆「預覽用」臨時 session（不落帳，設計 §10 finding #4）。
+
+        僅在記憶體內組出臨時 ``Session``：以 ``find_path`` 查路徑、以
+        ``_build_trunk_segments`` 推導 trunk 段，不做硬衝突檢查、不挑/佔用池內
+        VLAN、不取鎖、不 ``save``、不動任何 derived index（_port_owner /
+        _used_vlans / _next_seq 皆不變）。供下發層以 ``--from/--to`` 即時預覽
+        「若分配將如何下發」而不污染帳本。
+
+        參數：
+          - generator_port：generator 端輸入（裸名或 ``dev:port``）。
+          - dut_port：DUT 端輸入（``dev:port``）。
+          - vlan：預覽用 VLAN（int），預設示範常數 ``_PREVIEW_VLAN``；僅用來
+            標記臨時 trunk 段，不代表真實分配值。
+
+        回傳：
+          - 臨時 ``Session``（``session_id == '(preview)'``、``physical_ports ==
+            list(path)``、trunk_segments 以 ``vlan`` 標記）。
+
+        例外：
+          - PathLookupError：find_path 失敗（原樣往外傳）。
+        """
+        path = self._graph.find_path(generator_port, dut_port)
+        physical_ports = list(path)
+        trunk_segments = self._build_trunk_segments(path, vlan)
+        return Session(
+            session_id=_PREVIEW_SESSION_ID,
+            vlan=vlan,
+            generator_port=generator_port,
+            dut_port=dut_port,
+            path=path,
+            physical_ports=physical_ports,
+            trunk_segments=trunk_segments,
         )
