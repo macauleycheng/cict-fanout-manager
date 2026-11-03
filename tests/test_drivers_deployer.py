@@ -27,11 +27,12 @@ import pytest
 
 from topo_manager.allocator import Allocator
 from topo_manager.drivers.base import (
+    PortRole_E,
     PortVlanChange,
     VlanMember,
     VlanState,
 )
-from topo_manager.drivers.deployer import Deployer
+from topo_manager.drivers.deployer import Deployer, SetupResult
 from topo_manager.errors import ApplyError, ReadBackMismatchError
 from topo_manager.loader import load_topology
 from topo_manager.store import JsonSessionStore
@@ -75,12 +76,24 @@ class _MockDriver:
         self._snapshots: List[VlanState] = []
         self._read_index = 0
         self.fail_on_apply = False
+        self.setup_calls = 0
+        self._tunnel_status = True
 
     def program(self, snapshots: List[VlanState], fail_on_apply: bool = False) -> "_MockDriver":
         """設定 read_vlans 腳本與 apply 是否失敗（回自身便於串接）。"""
         self._snapshots = snapshots
         self.fail_on_apply = fail_on_apply
         return self
+
+    def setup_global_tunnel(self, apply: bool = False) -> List[str]:
+        """stub：回固定全域 setup 指令；apply=True 時紀錄呼叫次數。"""
+        if apply:
+            self.setup_calls += 1
+        return ["dot1q-tunnel system-tunnel-control"]
+
+    def read_tunnel_status(self):
+        """stub：回固定全域 tunnel status（True=Enabled）。"""
+        return self._tunnel_status
 
     def connect(self) -> None:
         self.connected = True
@@ -120,15 +133,27 @@ def _make_session(three_tier_path: Path, tmp_path: Path):
 
 
 def _satisfied_state(fanout: str, changes: List[PortVlanChange]) -> VlanState:
-    """由期望變更組出「全部已 tagged 達成」的 VlanState（供 read-back 通過）。"""
+    """由期望變更組出「全部達成」的 VlanState（供 read-back 通過）。
+
+    依 role 分流組達成訊號（Phase 4 QinQ 擴充）：UPLINK 類以 tagged=True 成員
+    表達、EDGE 類以 ``(interface, "Access")`` 的 tunnel_modes 表達（diff 依
+    role 分流判定，決策 6）。
+    """
     members = {
         VlanMember(vlan=c.vlan, interface=c.interface, tagged=True)
         for c in changes
+        if c.role == PortRole_E.UPLINK
+    }
+    tunnel_modes = {
+        (c.interface, "Access")
+        for c in changes
+        if c.role == PortRole_E.EDGE
     }
     return VlanState(
         fanout=fanout,
         members=frozenset(members),
         existing_vlans=frozenset({c.vlan for c in changes}),
+        tunnel_modes=frozenset(tunnel_modes),
     )
 
 
@@ -315,3 +340,116 @@ def test_partial_failure_triggers_clear_and_apply_error(
     assert failing in str(exc_info.value)
     # 先前成功套用的 fanout 被 best-effort clear。
     assert len(drivers_by_name[first_success].clear_calls) >= 1
+
+
+# --------------------------------------------------------------------
+# Phase 4 QinQ / dot1q-tunnel 擴充測試（決策 7、8、9）。
+# --------------------------------------------------------------------
+
+
+def _edge(interface: str, vlan: int) -> PortVlanChange:
+    """建一筆 EDGE add 變更（測試輔助）。"""
+    return PortVlanChange(
+        fanout="f", interface=interface, vlan=vlan, action="add",
+        topology_node="f:{0}".format(interface), role=PortRole_E.EDGE,
+    )
+
+
+def _uplink(interface: str, vlan: int) -> PortVlanChange:
+    """建一筆 UPLINK add 變更（測試輔助）。"""
+    return PortVlanChange(
+        fanout="f", interface=interface, vlan=vlan, action="add",
+        topology_node="f:{0}".format(interface), role=PortRole_E.UPLINK,
+    )
+
+
+def test_best_effort_clear_only_uplink() -> None:
+    """_best_effort_clear 餵含 EDGE+UPLINK 時，driver.clear_vlan 僅收到 UPLINK（決策 7）。"""
+    config = _FakeConfig(["f"])
+    created = {}
+
+    def _factory(name, entry):
+        driver = _MockDriver(name)
+        created[name] = driver
+        return driver
+
+    deployer = Deployer(_factory, config)
+    applied = [("f", [_edge("Eth1/42", 3999), _uplink("Eth1/41", 100)])]
+    deployer._best_effort_clear(applied)
+
+    assert len(created["f"].clear_calls) == 1
+    cleared = created["f"].clear_calls[0]
+    # 只有 UPLINK 被清，EDGE 不被餵給 driver。
+    assert all(c.role == PortRole_E.UPLINK for c in cleared)
+    assert {c.interface for c in cleared} == {"Eth1/41"}
+
+
+def test_best_effort_clear_edge_only_does_not_connect() -> None:
+    """applied 只含 EDGE 時過濾後空、不連線（不動邊緣 port，決策 7）。"""
+    config = _FakeConfig(["f"])
+    created = {}
+
+    def _factory(name, entry):
+        driver = _MockDriver(name)
+        created[name] = driver
+        return driver
+
+    deployer = Deployer(_factory, config)
+    deployer._best_effort_clear([("f", [_edge("Eth1/42", 3999)])])
+
+    # 過濾後為空：不應建立/連線該 driver，更不應 clear。
+    assert "f" not in created
+
+
+def test_setup_tunnel_dry_run_no_connect() -> None:
+    """setup_tunnel(apply=False)：不連線、回 SetupResult 含指令、status=None（決策 8）。"""
+    config = _FakeConfig(["spine-1", "agg-1"])
+    created = {}
+
+    def _factory(name, entry):
+        driver = _MockDriver(name)
+        created[name] = driver
+        return driver
+
+    deployer = Deployer(_factory, config)
+    results = deployer.setup_tunnel(["spine-1", "agg-1"], apply=False)
+
+    assert len(results) == 2
+    assert all(isinstance(r, SetupResult) for r in results)
+    assert all(r.status is None for r in results)
+    assert all(
+        "dot1q-tunnel system-tunnel-control" in r.commands for r in results
+    )
+    # dry-run 未連線、未下發。
+    assert all(not d.connected for d in created.values())
+    assert all(d.setup_calls == 0 for d in created.values())
+
+
+def test_setup_tunnel_apply_connects_and_reads_status() -> None:
+    """setup_tunnel(apply=True)：連線下發並回回讀 status（決策 8）。"""
+    config = _FakeConfig(["spine-1"])
+    created = {}
+
+    def _factory(name, entry):
+        driver = _MockDriver(name)
+        created[name] = driver
+        return driver
+
+    deployer = Deployer(_factory, config)
+    results = deployer.setup_tunnel(["spine-1"], apply=True)
+
+    assert len(results) == 1
+    assert results[0].status is True
+    assert created["spine-1"].connected is True
+    assert created["spine-1"].disconnected is True
+    assert created["spine-1"].setup_calls == 1
+
+
+def test_format_missing_edge_mentions_tunnel_access() -> None:
+    """_format_missing 對 EDGE 缺漏輸出 tunnel access 字樣（finding #8）。"""
+    missing = [_edge("Eth1/42", 3999), _uplink("Eth1/41", 100)]
+    message = Deployer._format_missing("f", missing)
+    assert "tunnel access 設定" in message
+    assert "tagged 成員" in message
+    assert "Eth1/42" in message
+    assert "Eth1/41" in message

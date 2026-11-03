@@ -39,6 +39,12 @@ SessionStoreError，皆為其子類，自動一併攔截），印到 stderr 的�
            模組（config/ec_ssh/deployer）一律於 handler 內延遲 import，確保
            summary/path/allocate/release/list 與未裝 netmiko 時完全不受影響。
            既有 5 子命令、_build_allocator、main() 的 except TopologyError 不動。
+  - 0.5.0  Phase 4 QinQ/dot1q-tunnel 擴充（決策 8、9）：新增 ``setup`` 子命令
+           （全域 dot1q-tunnel system-tunnel-control 冪等下發，不吃 topology.yaml；
+           --fanout 指定分支復用 select_fanout、未指定時遍歷全部）與 _cmd_setup
+           handler，於 _COMMANDS 註冊；_print_plan_result 每個 change 加印其
+           role（邊緣/互聯）；_print_verify_result 診斷字串改中性詞（期望設定）。
+           既有 9 子命令、_build_allocator、main() 的 except 不動。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -170,6 +176,15 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_credentials_arg(verify_parser)
     _add_fanout_arg(verify_parser)
     _add_apply_flag(verify_parser)
+
+    # setup [--credentials][--fanout][--apply]
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="全域下發 dot1q-tunnel system-tunnel-control（預設 dry-run，--apply 才寫入）。",
+    )
+    _add_credentials_arg(setup_parser)
+    _add_fanout_arg(setup_parser)
+    _add_apply_flag(setup_parser)
 
     return parser
 
@@ -627,11 +642,27 @@ def _print_plan_result(plan_result: "object", *, dry_run: bool) -> None:
             continue
         print("  fanout {0}：".format(fanout_plan.fanout))
         for change in fanout_plan.changes:
+            role_label = (
+                "邊緣" if getattr(change, "role", None) == _edge_role() else "互聯"
+            )
             print(
-                "    介面 {0} ← VLAN {1}".format(change.interface, change.vlan)
+                "    介面 {0} ← VLAN {1}（{2}）".format(
+                    change.interface, change.vlan, role_label
+                )
             )
         for command in fanout_plan.commands:
             print("      $ {0}".format(command))
+
+
+def _edge_role():
+    """延遲取用 ``PortRole_E.EDGE``（drivers 於 handler 內才 import，§CLI）。
+
+    _print_plan_result 於下發層 handler 路徑被呼叫（此時 drivers 已可 import）；
+    於此延遲 import 以維持「非下發層子命令不觸發 drivers 匯入」的設計不變量。
+    """
+    from topo_manager.drivers.base import PortRole_E
+
+    return PortRole_E.EDGE
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
@@ -687,7 +718,7 @@ def _print_verify_result(verify_result: "object", *, reapplied: bool) -> None:
     """排版並印 ``VerifyResult``（缺漏/全部達成，設計 §CLI）。"""
     if verify_result.ok:
         print(
-            "verify：session {0} 全部 tagged 成員已達成{1}。".format(
+            "verify：session {0} 全部期望設定已達成{1}。".format(
                 verify_result.session_id,
                 "（重套後驗證通過）" if reapplied else "",
             )
@@ -717,6 +748,44 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_setup(args: argparse.Namespace) -> int:
+    """執行 ``setup`` 子命令：全域 dot1q-tunnel setup（決策 8）。
+
+    不吃 topology.yaml（全域 setup 與拓樸/session 無關）。``--fanout`` 指定時復用
+    ``select_fanout`` 做存在性驗證（查無丟 ConfigError）、僅取該台；未指定時
+    遍歷 config.fanouts 全部。呼叫 ``deployer.setup_tunnel`` 並印每台「將下發
+    （dry-run）/ 已下發 + 回讀狀態（apply）」。
+    """
+    from topo_manager.drivers.config import select_fanout
+
+    deployer, config = _build_deployer(args.credentials)
+    if args.fanout is not None:
+        fanout_names = [select_fanout(config, args.fanout)]
+    else:
+        fanout_names = list(config.fanouts.keys())
+
+    results = deployer.setup_tunnel(fanout_names, apply=args.apply)
+
+    header = "全域 dot1q-tunnel setup{0}".format(
+        "（DRY-RUN，未寫入）" if not args.apply else ""
+    )
+    print(header)
+    for result in results:
+        if args.apply:
+            if result.status is True:
+                status_text = "已下發，回讀狀態：Enabled"
+            elif result.status is False:
+                status_text = "已下發，回讀狀態：Disabled"
+            else:
+                status_text = "已下發，回讀狀態：未知"
+        else:
+            status_text = "將下發"
+        print("  fanout {0}：{1}".format(result.fanout, status_text))
+        for command in result.commands:
+            print("      $ {0}".format(command))
+    return 0
+
+
 # 子命令名 → 處理函式的分派表（新增子命令只需在此註冊）。
 _COMMANDS = {
     "summary": _cmd_summary,
@@ -728,6 +797,7 @@ _COMMANDS = {
     "probe": _cmd_probe,
     "apply": _cmd_apply,
     "verify": _cmd_verify,
+    "setup": _cmd_setup,
 }
 
 

@@ -25,6 +25,12 @@
            單一閘門與 read-back 驗證、tagged 快照跳過、部分失敗 best-effort
            clear + ApplyError、verify 唯讀、detect_and_reapply 重開機偵測
            重套）。不 import netmiko。
+  - 0.5.0  Phase 4 QinQ/dot1q-tunnel 擴充（決策 7、8、9）：``_best_effort_clear``
+           過濾只 clear UPLINK（產品路徑不動邊緣 port）；新增 ``SetupResult``
+           dataclass 與 ``setup_tunnel`` 方法（全域 dot1q-tunnel setup 的
+           dry-run/apply 閘門）；``_format_missing`` 依 role 分述診斷字串
+           （UPLINK「tagged 成員」、EDGE「tunnel access 設定」）。
+           plan/apply/verify/detect_and_reapply 核心邏輯不變。不 import netmiko。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -32,9 +38,14 @@ Copyright (c) 2026 topo-manager。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
-from topo_manager.drivers.base import FanoutDriver, PortVlanChange, VlanState
+from topo_manager.drivers.base import (
+    FanoutDriver,
+    PortRole_E,
+    PortVlanChange,
+    VlanState,
+)
 from topo_manager.drivers.planner import diff_expected_vs_actual, plan_changes
 from topo_manager.errors import ApplyError, ReadBackMismatchError
 
@@ -89,6 +100,22 @@ class VerifyResult:
     def ok(self) -> bool:
         """是否全部達成（無任何 fanout 有缺漏）。"""
         return not self.missing_by_fanout
+
+
+@dataclass(frozen=True)
+class SetupResult:
+    """單一 fanout 的全域 dot1q-tunnel setup 結果（不可變中繼值，決策 8）。
+
+    欄位：
+      - fanout：fanout 裝置名（str）。
+      - commands：將下發（dry-run）或已下發（apply）的指令清單（List[str]）。
+      - status：apply 後回讀的全域 802.1Q Tunnel Status（Optional[bool]）；
+        dry-run 為 None（未連線、未回讀）。
+    """
+
+    fanout: str
+    commands: List[str]
+    status: Optional[bool] = None
 
 
 class Deployer:
@@ -293,7 +320,11 @@ class Deployer:
             driver.disconnect()
 
     def _best_effort_clear(self, applied: List[tuple]) -> None:
-        """對已套用的 fanout best-effort 清除（吞下清理錯誤，設計 §7.2）。
+        """對已套用的 fanout best-effort 清除（只 clear UPLINK，決策 7）。
+
+        產品路徑（apply 失敗回滾）絕不還原邊緣 port：傳給 ``driver.clear_vlan``
+        前先過濾只留 UPLINK 變更；過濾後為空則不連線（不動邊緣 port）。EDGE 的
+        還原僅由 live 測試臨界清理路徑顯式呼叫 ``clear_vlan``（決策 7）。
 
         INPUT：
           - applied：``[(fanout 名, [PortVlanChange]), ...]`` 已套用清單。
@@ -305,17 +336,73 @@ class Deployer:
         例外：不對外拋出（清理為 best-effort；原始失敗才是回報主因）。
         """
         for fanout_name, changes in applied:
+            uplink_changes = [
+                change
+                for change in changes
+                if change.role == PortRole_E.UPLINK
+            ]
+            if not uplink_changes:
+                continue
             try:
                 driver = self._driver_factory(
                     fanout_name, self._config.fanouts[fanout_name]
                 )
                 driver.connect()
                 try:
-                    driver.clear_vlan(changes)
+                    driver.clear_vlan(uplink_changes)
                 finally:
                     driver.disconnect()
             except Exception:  # noqa: BLE001 — 清理失敗不掩蓋原始錯誤。
                 continue
+
+    def setup_tunnel(
+        self, fanout_names: List[str], *, apply: bool = False
+    ) -> List[SetupResult]:
+        """全域 ``dot1q-tunnel system-tunnel-control`` setup 編排（決策 8）。
+
+        對傳入的每台 fanout 冪等下發全域 tunnel 總開關：``apply=False``（預設）
+        以 ``driver.setup_global_tunnel(apply=False)`` 取指令、不連線、status=
+        None；``apply=True`` 則 connect → setup_global_tunnel(apply=True) →
+        read_tunnel_status() → disconnect（try/finally）。setup 冪等且無跨台
+        交易語意，單台失敗即往外拋（不回滾、不吞）。
+
+        INPUT：
+          - fanout_names：要操作的 fanout 名清單（List[str]）。
+          - apply：True 才真正連線下發；False 為 dry-run（keyword-only）。
+
+        OUTPUT：無。
+
+        RETURN：
+          - 每台的 ``SetupResult`` 清單（依傳入順序）。
+
+        例外：
+          - DriverConnectionError：apply 時某台連線/下發失敗（往外拋）。
+        """
+        results: List[SetupResult] = []
+        for fanout_name in fanout_names:
+            driver = self._driver_factory(
+                fanout_name, self._config.fanouts[fanout_name]
+            )
+            if not apply:
+                commands = driver.setup_global_tunnel(apply=False)
+                results.append(
+                    SetupResult(
+                        fanout=fanout_name, commands=commands, status=None
+                    )
+                )
+                continue
+            driver.connect()
+            try:
+                commands = driver.setup_global_tunnel(apply=True)
+                status = driver.read_tunnel_status()
+            finally:
+                driver.disconnect()
+            results.append(
+                SetupResult(
+                    fanout=fanout_name, commands=commands, status=status
+                )
+            )
+        return results
 
     def verify(self, session: object) -> VerifyResult:
         """唯讀驗證各 fanout 是否已達成期望（不寫入，設計 §7.3）。
@@ -416,7 +503,11 @@ class Deployer:
     def _format_missing(
         fanout_name: str, missing: List[PortVlanChange]
     ) -> str:
-        """把缺漏項排版成 ``ReadBackMismatchError`` 的訊息（逐條列出）。
+        """把缺漏項依 role 分述排版成訊息（決策 9、finding #8）。
+
+        依 ``change.role`` 分述缺漏真因：UPLINK 類為「tagged 成員」未達成、EDGE
+        類為「tunnel access 設定」未達成（邊緣缺漏真因是 tunnel mode 未達
+        Access，而非 tagged 成員）。逐條列出各 (interface, vlan)。
 
         INPUT：
           - fanout_name：fanout 裝置名（str）。
@@ -425,12 +516,30 @@ class Deployer:
         OUTPUT：無。
 
         RETURN：
-          - 多行訊息字串（含 fanout 名與各 (interface, vlan) 缺漏）。
+          - 多行訊息字串（含 fanout 名與依 role 分述的各 (interface, vlan)
+            缺漏）。
         """
-        items = ", ".join(
-            "({0}, VLAN {1})".format(change.interface, change.vlan)
-            for change in missing
-        )
-        return "回讀驗證不符（fanout {0}）：下列 tagged 成員仍缺漏：{1}".format(
-            fanout_name, items
+        uplink_missing = [
+            change for change in missing if change.role == PortRole_E.UPLINK
+        ]
+        edge_missing = [
+            change for change in missing if change.role == PortRole_E.EDGE
+        ]
+
+        parts: List[str] = []
+        if uplink_missing:
+            items = ", ".join(
+                "({0}, VLAN {1})".format(change.interface, change.vlan)
+                for change in uplink_missing
+            )
+            parts.append("tagged 成員仍缺漏：{0}".format(items))
+        if edge_missing:
+            items = ", ".join(
+                "({0}, VLAN {1})".format(change.interface, change.vlan)
+                for change in edge_missing
+            )
+            parts.append("tunnel access 設定仍缺漏：{0}".format(items))
+
+        return "回讀驗證不符（fanout {0}）：{1}".format(
+            fanout_name, "；".join(parts)
         )

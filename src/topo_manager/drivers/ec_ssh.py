@@ -9,15 +9,25 @@ import，確保未安裝 netmiko 的環境仍可匯入本模組並跑單元測�
 ``connection_factory`` 替身繞過真 netmiko（factory 回傳具 ``send_command`` /
 ``send_config_set`` / ``enable`` / ``disconnect`` 介面的 fake connection）。
 
-指令樣板一律以模組常數集中管理（``_DISABLE_PAGER_TEMPLATE`` /
-``_ENTER_INTF_TEMPLATE`` / ``_TRUNK_MODE_TEMPLATE`` / ``_APPLY_MEMBER_TEMPLATE``
-/ ``_CLEAR_MEMBER_TEMPLATE``），已於 FEAT-003 4a 以實機 ECS5550-54X
-（Edgecore、Cisco-like CLI）確認真實語法：進介面 ``interface ethernet 1/<port>``、
-trunk 模式 ``switchport mode trunk``（冪等）、加 tagged 成員
-``switchport allowed vlan add <vlan> tagged``（必須帶 ``tagged`` 關鍵字）、
-移除 ``switchport allowed vlan remove <vlan>``。關 pager 為 ``terminal length 0``
-（實機有效）。待跨型號差異時僅需更新本區常數即可（實機位址/帳密僅由 env 提供，
-絕不寫入本檔）。
+指令樣板一律以模組常數集中管理，並依可信度分為兩組（設計決策 4）：
+
+  - 組 A（已由 FEAT-003 4a 實機 ECS5550-54X 確認或由需求+使用者 #11 更正確認
+    方向）：進介面 ``interface ethernet 1/<port>``、trunk 模式
+    ``switchport mode trunk``（冪等）、加 tagged 成員
+    ``switchport allowed vlan add <vlan> tagged``、移除
+    ``switchport allowed vlan remove <vlan>``、關 pager ``terminal length 0``、
+    邊緣 ``switchport mode access`` + ``switchport native vlan <vlan>``。
+  - 組 B（本次尚待 live 於真機確認，AC-13 為第一道驗證）：全域
+    ``dot1q-tunnel system-tunnel-control``、邊緣/互聯 tunnel 模式
+    ``switchport dot1q-tunnel mode access`` / ``uplink`` / ``normal``、邊緣清除
+    ``no switchport native vlan``、``show dot1q-tunnel``。若真機回
+    ``% Unrecognized / % Invalid`` 須以真機字面覆寫對應常數並更新單元測試。
+
+本模組實作完整 QinQ / dot1q-tunnel 兩類 port：邊緣（access/native + tunnel
+access）與互聯（trunk tagged + tunnel uplink），並提供全域
+``dot1q-tunnel system-tunnel-control`` 的 setup。``build_commands`` 依
+``change.role`` + ``change.action`` 分四分支組裝。待跨型號差異時僅需更新本區
+常數即可（實機位址/帳密僅由 env 提供，絕不寫入本檔）。
 
 netmiko 的連線/認證/逾時例外一律就地捕捉並包成 ``DriverConnectionError``
 （保留 ``__cause__``、訊息不含密碼，設計 §8、§9）。
@@ -35,7 +45,16 @@ netmiko 的連線/認證/逾時例外一律就地捕捉並包成 ``DriverConnect
            tagged），並歸一化 interface 名（去除斜線後對齊空白）使 read-back
            與 apply 名一致；apply/clear 指令樣板改為實機語法（switchport mode
            trunk 冪等 + ``allowed vlan add <vlan> tagged`` / ``remove``，進介面
-           ``interface ethernet 1/<port>``）。不碰 native vlan。
+           ``interface ethernet 1/<port>``）。
+  - 0.5.0  Phase 4 QinQ/dot1q-tunnel 擴充（設計決策 3、4、7）：新增組 A/組 B
+           指令常數（可信度分組註解）與 ``show dot1q-tunnel`` status/per-port
+           正則；``build_commands`` 改為依 ``change.role`` + ``change.action``
+           四分支（UPLINK/EDGE × add/remove），新增 ``uplinked_interfaces``
+           冪等去重；新增 ``setup_global_tunnel``、``read_tunnel_status``（內部
+           經唯一入口 ``_parse_dot1q_tunnel_output``，不自寫 status 正則）；
+           ``read_vlans`` 併讀 ``show vlan`` + ``show dot1q-tunnel`` 併成一個
+           ``VlanState``；``clear_vlan`` 重建變更時補帶 ``role``。per-port Mode
+           正則依本次 live 擷取真機樣本定稿。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -43,10 +62,11 @@ Copyright (c) 2026 topo-manager。
 from __future__ import annotations
 
 import re
-from typing import Callable, List, Optional, Set
+from typing import Callable, FrozenSet, List, Optional, Set, Tuple
 
 from topo_manager.drivers.base import (
     FanoutDriver,
+    PortRole_E,
     PortVlanChange,
     VlanMember,
     VlanState,
@@ -57,14 +77,17 @@ from topo_manager.errors import (
     DriverParseError,
 )
 
-# 指令樣板（模組常數，設計 §8）。FEAT-003 4a 已以實機 ECS5550-54X 確認：
+# ====================================================================
+# 指令樣板（模組常數，設計 §8、決策 4）。依可信度分為組 A / 組 B。
+# 實機位址/帳密僅由 env 提供，絕不寫入本檔。
+# ====================================================================
+
+# --- 組 A：已實測確認（FEAT-003 4a 實機 ECS5550-54X）或需求+#11 確認方向 ---
 #   - 關 pager：'terminal length 0'（實機有效）。
 #   - 進介面：'interface ethernet 1/<port>'（提示符 ...(config-if)#）。
 #   - trunk 模式：'switchport mode trunk'（冪等——已是 trunk 則不重下）。
 #   - 加 tagged 成員：'switchport allowed vlan add <vlan> tagged'（必帶 tagged）。
 #   - 移除成員：'switchport allowed vlan remove <vlan>'。
-# 不碰 native vlan（使用者定義：fanout 互聯 port 一律 trunk、全封包帶 tag）。
-# 實機位址/帳密僅由 env 提供，絕不寫入本檔。
 _DISABLE_PAGER_TEMPLATE = "terminal length 0"
 # 進全域設定模式的指令：實機 ECS5550-54X 為 'configure'（非 cisco_ios 預設的
 # 'configure terminal'）；傳給 netmiko send_config_set 的 config_mode_command。
@@ -73,6 +96,26 @@ _ENTER_INTF_TEMPLATE = "interface ethernet 1/{port}"
 _TRUNK_MODE_TEMPLATE = "switchport mode trunk"
 _APPLY_MEMBER_TEMPLATE = "switchport allowed vlan add {vlan} tagged"
 _CLEAR_MEMBER_TEMPLATE = "switchport allowed vlan remove {vlan}"
+# 邊緣 access/native：需求明列、使用者 #11 更正後確認為 native vlan（非
+# 'switchport access vlan'，該命令不存在）。惟真機接受度仍以 AC-13 live 為最終
+# 驗證點。
+_ACCESS_MODE_TEMPLATE = "switchport mode access"
+_NATIVE_VLAN_TEMPLATE = "switchport native vlan {vlan}"
+
+# --- 組 B：本次尚待 live 於真機確認（AC-13 為第一道驗證）---
+# 若真機對任一指令回 '% Unrecognized / % Invalid'，以真機回報的正確字面覆寫
+# 該常數並更新對應單元測試，不得保留臆測字面（決策 4、finding #2）。
+# 全域 setup（冪等）。
+_GLOBAL_TUNNEL_CONTROL_TEMPLATE = "dot1q-tunnel system-tunnel-control"
+# 邊緣/互聯 tunnel 模式。
+_TUNNEL_ACCESS_TEMPLATE = "switchport dot1q-tunnel mode access"
+_TUNNEL_UPLINK_TEMPLATE = "switchport dot1q-tunnel mode uplink"
+# 邊緣類清除（僅本次 live 測試臨界清理用，非產品 release 行為；見決策 7）。
+# 清除式風險尤高（參照 #11 的更正前例），live 須以 read-back 驗證真的還原。
+_NO_NATIVE_VLAN_TEMPLATE = "no switchport native vlan"
+_TUNNEL_NORMAL_TEMPLATE = "switchport dot1q-tunnel mode normal"
+# show 指令常數（集中管理，明確不帶 pipe filter，FR-2.4/AC-7）。
+_SHOW_DOT1Q_TUNNEL = "show dot1q-tunnel"
 
 # show vlan 真機格式解析樣板（ECS5550-54X，key-value 多行區塊，設計 §8、FEAT-003
 # 4a）。每個 VLAN 為一區塊，以 'VLAN ID : <n>' 起始；成員列於 'Ports/Port
@@ -88,6 +131,18 @@ _MEMBER_TOKEN_RE = re.compile(
 )
 # 自 apply 用的 interface 名（如 'Eth1/41'）取出 port 編號，供組裝進介面指令。
 _INTERFACE_PORT_RE = re.compile(r"Eth\d+/\s*(\d+)")
+
+# show dot1q-tunnel 解析正則（設計決策 3、4、finding #1）。
+# 全域 status 行：需求 FR-2.1 已明示 '802.1Q Tunnel Status : Enabled/Disabled'。
+_TUNNEL_STATUS_RE = re.compile(
+    r"802\.1Q\s+Tunnel\s+Status\s*:\s*(Enabled|Disabled)", re.IGNORECASE
+)
+# per-port Mode 行（依本次 live 擷取真機 ECS5550-54X 'show dot1q-tunnel' 樣本
+# 定稿，finding #1）：每行形如 'Eth1/41    Uplink'（interface token
+# 'Eth<chassis>/<port>' 後接空白再接 Mode 欄位 Uplink/Access/Normal）。
+_TUNNEL_PORT_MODE_RE = re.compile(
+    r"^\s*Eth(\d+)/\s*(\d+)\s+(Uplink|Access|Normal)\b", re.IGNORECASE
+)
 
 
 class EcSshDriver(FanoutDriver):
@@ -238,21 +293,128 @@ class EcSshDriver(FanoutDriver):
             )
 
     def read_vlans(self) -> VlanState:
-        """下 ``show vlan`` 並自寫行解析成 ``VlanState``（設計 §8）。
+        """併讀 ``show vlan`` + ``show dot1q-tunnel`` 成一個 ``VlanState``（決策 3）。
+
+        先下 ``show vlan`` 以 ``_parse_vlan_output`` 取 members/existing_vlans，
+        再下 ``show dot1q-tunnel`` 經唯一解析入口 ``_parse_dot1q_tunnel_output``
+        取 (status, modes)，五欄併成一個 ``VlanState``。tunnel 區塊解析不到時回
+        空（不丟錯），只有 ``show vlan`` 完全解析不到 VLAN 才丟
+        ``DriverParseError``（維持既有致命性，設計決策 3）。
 
         INPUT：無。
 
         OUTPUT：無。
 
         RETURN：
-          - ``VlanState``（本 fanout 的 tagged 成員集合與既有 VLAN 集合）。
+          - ``VlanState``（本 fanout 的成員、既有 VLAN、per-port tunnel modes
+            與全域 tunnel status）。
 
         例外：
           - DriverConnectionError：連線失敗（由 ``read_show``）。
-          - DriverParseError：輸出無法解析為合法 VLAN 狀態（含片段摘要）。
+          - DriverParseError：``show vlan`` 輸出無法解析為合法 VLAN 狀態。
         """
-        raw_output = self.read_show("show vlan")
-        return self._parse_vlan_output(raw_output)
+        raw_vlan = self.read_show("show vlan")
+        base_state = self._parse_vlan_output(raw_vlan)
+
+        raw_tunnel = self.read_show(_SHOW_DOT1Q_TUNNEL)
+        status, modes = self._parse_dot1q_tunnel_output(raw_tunnel)
+
+        return VlanState(
+            fanout=base_state.fanout,
+            members=base_state.members,
+            existing_vlans=base_state.existing_vlans,
+            tunnel_modes=modes,
+            tunnel_status=status,
+        )
+
+    def setup_global_tunnel(self, apply: bool = False) -> List[str]:
+        """全域 ``dot1q-tunnel system-tunnel-control`` setup（冪等，決策 4）。
+
+        ``apply=False``（預設）：僅回傳將下發的指令清單，不連線、不寫入。
+        ``apply=True``：以 ``_send_config`` 冪等下發後仍回傳該清單（冪等性由
+        真機保證，driver 不先讀後寫）。
+
+        INPUT：
+          - apply：True 才真正下發；False 僅回指令清單（keyword/預設 False）。
+
+        OUTPUT：無。
+
+        RETURN：
+          - 將下發（或已下發）的指令清單（List[str]）。
+
+        例外：
+          - DriverConnectionError：apply 時未連線或下發失敗（保留 ``__cause__``）。
+        """
+        commands = [_GLOBAL_TUNNEL_CONTROL_TEMPLATE]
+        if apply:
+            self._send_config(commands, "下發全域 dot1q-tunnel setup")
+        return commands
+
+    def read_tunnel_status(self) -> Optional[bool]:
+        """讀全域 802.1Q Tunnel Status（經唯一解析入口，決策 3）。
+
+        實作明定為下 ``show dot1q-tunnel`` 後交由 ``_parse_dot1q_tunnel_output``
+        取 status，絕不自寫 status 正則（單一真相來源，finding #3）。
+
+        INPUT：無。
+
+        OUTPUT：無。
+
+        RETURN：
+          - 全域 tunnel status（Optional[bool]）：Enabled=True、Disabled=False、
+            解析不到=None。
+
+        例外：
+          - DriverConnectionError：連線失敗（由 ``read_show``）。
+        """
+        raw = self.read_show(_SHOW_DOT1Q_TUNNEL)
+        status, _modes = self._parse_dot1q_tunnel_output(raw)
+        return status
+
+    def _parse_dot1q_tunnel_output(
+        self, raw_output: str
+    ) -> Tuple[Optional[bool], FrozenSet[Tuple[str, str]]]:
+        """唯一的 ``show dot1q-tunnel`` 解析入口（決策 3、4、finding #1、#3）。
+
+        同時回全域 status 與 per-port modes；所有需要 tunnel 資訊的路徑
+        （``read_tunnel_status`` / ``read_vlans``）都只呼叫本函式，不各自寫正則。
+        採寬鬆策略：解析不到 tunnel 區塊時回 ``(None, frozenset())``，**不丟**
+        ``DriverParseError``（舊韌體無 tunnel 或格式不符時 fail-closed 由上層
+        diff 判缺漏，而非在此中斷）。per-port interface token 經
+        ``_normalize_interface`` 歸一化與 apply 名對齊。
+
+        INPUT：
+          - raw_output：``show dot1q-tunnel`` 的原始文字輸出（str）。
+
+        OUTPUT：無。
+
+        RETURN：
+          - ``(status, modes)``；status 為 Optional[bool]（Enabled=True/
+            Disabled=False/未知=None），modes 為 ``FrozenSet[(interface, mode)]``
+            （mode ∈ {"Uplink","Access","Normal"}）。
+
+        例外：不拋出（寬鬆解析）。
+        """
+        if not isinstance(raw_output, str):
+            return None, frozenset()
+
+        status: Optional[bool] = None
+        status_match = _TUNNEL_STATUS_RE.search(raw_output)
+        if status_match is not None:
+            status = status_match.group(1).lower() == "enabled"
+
+        modes: Set[Tuple[str, str]] = set()
+        for line in raw_output.splitlines():
+            port_match = _TUNNEL_PORT_MODE_RE.match(line)
+            if port_match is None:
+                continue
+            chassis = port_match.group(1)
+            port = port_match.group(2)
+            raw_mode = port_match.group(3).capitalize()
+            interface = self._normalize_interface(chassis, port)
+            modes.add((interface, raw_mode))
+
+        return status, frozenset(modes)
 
     @staticmethod
     def _normalize_interface(chassis: str, port: str) -> str:
@@ -414,15 +576,22 @@ class EcSshDriver(FanoutDriver):
         return interface
 
     def build_commands(self, changes: List[PortVlanChange]) -> List[str]:
-        """由變更計畫以模組常數樣板組裝設定指令（純邏輯、不送出，設計 §8）。
+        """由變更計畫依 role+action 四分支組裝設定指令（純邏輯、不送出，決策 4）。
 
-        依 ECS5550-54X 實機語法：每筆 ``action='add'`` 變更先進入介面
-        （``_ENTER_INTF_TEMPLATE``，``interface ethernet 1/<port>``）、確保為
-        trunk 模式（``_TRUNK_MODE_TEMPLATE``，``switchport mode trunk``）、再加
-        tagged 成員（``_APPLY_MEMBER_TEMPLATE``，``... add <vlan> tagged``）。
-        trunk 模式於同一批中對同一介面只下一次（冪等去重；設備端重下亦為 no-op）。
-        ``action='remove'`` 進介面後以 ``_CLEAR_MEMBER_TEMPLATE``
-        （``... remove <vlan>``）移除。不碰 native vlan。
+        依 ``change.role`` + ``change.action`` 分四分支（ECS5550-54X 實機語法 +
+        本次 QinQ 擴充）：
+
+          - UPLINK add（互聯）：進介面 → ``switchport mode trunk``（冪等去重）→
+            ``switchport allowed vlan add <vlan> tagged`` → ``switchport
+            dot1q-tunnel mode uplink``（每介面只下一次，冪等去重）。
+          - EDGE add（邊緣）：進介面 → ``switchport mode access`` → ``switchport
+            native vlan <vlan>`` → ``switchport dot1q-tunnel mode access``。
+          - UPLINK remove：進介面 → ``switchport allowed vlan remove <vlan>``。
+          - EDGE remove：進介面 → ``no switchport native vlan`` → ``switchport
+            dot1q-tunnel mode normal``（僅本次 live 測試臨界清理用，決策 7）。
+
+        trunk 與 uplink 模式於同一批中對同一介面各只下一次（冪等去重，避免同
+        介面多 VLAN 重複下模式指令；設備端重下亦為 no-op）。
 
         INPUT：
           - changes：本 fanout 的 ``PortVlanChange`` 清單。
@@ -435,21 +604,38 @@ class EcSshDriver(FanoutDriver):
         例外：不涉及 I/O，故不拋連線類例外。
         """
         commands: List[str] = []
-        # 本批中已下過 trunk 模式的介面（冪等去重，避免對同一介面重複下發）。
+        # 本批中已下過 trunk / uplink 模式的介面（冪等去重，避免重複下發）。
         trunked_interfaces: Set[str] = set()
+        uplinked_interfaces: Set[str] = set()
 
         for change in changes:
             port = self._port_from_interface(change.interface)
             commands.append(_ENTER_INTF_TEMPLATE.format(port=port))
-            if change.action == "add":
-                # 確保為 trunk 模式（同一批同一介面只下一次）。
+
+            if change.action == "add" and change.role == PortRole_E.UPLINK:
+                # 互聯 trunk tagged + dot1q-tunnel uplink。
                 if change.interface not in trunked_interfaces:
                     commands.append(_TRUNK_MODE_TEMPLATE)
                     trunked_interfaces.add(change.interface)
                 commands.append(
                     _APPLY_MEMBER_TEMPLATE.format(vlan=change.vlan)
                 )
+                if change.interface not in uplinked_interfaces:
+                    commands.append(_TUNNEL_UPLINK_TEMPLATE)
+                    uplinked_interfaces.add(change.interface)
+            elif change.action == "add" and change.role == PortRole_E.EDGE:
+                # 邊緣 access + native vlan + dot1q-tunnel access。
+                commands.append(_ACCESS_MODE_TEMPLATE)
+                commands.append(
+                    _NATIVE_VLAN_TEMPLATE.format(vlan=change.vlan)
+                )
+                commands.append(_TUNNEL_ACCESS_TEMPLATE)
+            elif change.role == PortRole_E.EDGE:
+                # EDGE remove：還原 native vlan 與 tunnel 模式（測試臨界清理）。
+                commands.append(_NO_NATIVE_VLAN_TEMPLATE)
+                commands.append(_TUNNEL_NORMAL_TEMPLATE)
             else:
+                # UPLINK remove：移除 tagged 成員。
                 commands.append(
                     _CLEAR_MEMBER_TEMPLATE.format(vlan=change.vlan)
                 )
@@ -494,6 +680,7 @@ class EcSshDriver(FanoutDriver):
                 vlan=change.vlan,
                 action="remove",
                 topology_node=change.topology_node,
+                role=change.role,
             )
             for change in changes
         ]

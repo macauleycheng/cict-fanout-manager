@@ -26,7 +26,12 @@ import pytest
 
 from topo_manager import cli
 from topo_manager.cli import main
-from topo_manager.drivers.base import PortVlanChange, VlanMember, VlanState
+from topo_manager.drivers.base import (
+    PortRole_E,
+    PortVlanChange,
+    VlanMember,
+    VlanState,
+)
 from topo_manager.drivers.deployer import Deployer
 
 
@@ -110,6 +115,14 @@ class _MockDriver:
 
     def read_show(self, command: str) -> str:
         return "ok"
+
+    def setup_global_tunnel(self, apply: bool = False) -> List[str]:
+        if apply:
+            self.setup_calls = getattr(self, "setup_calls", 0) + 1
+        return ["dot1q-tunnel system-tunnel-control"]
+
+    def read_tunnel_status(self):
+        return True
 
 
 def name_as_fanout(name: str) -> VlanState:
@@ -237,10 +250,17 @@ def test_apply_with_flag_writes(
         members = frozenset(
             VlanMember(vlan=c.vlan, interface=c.interface, tagged=True)
             for c in changes
+            if c.role == PortRole_E.UPLINK
+        )
+        tunnel_modes = frozenset(
+            (c.interface, "Access")
+            for c in changes
+            if c.role == PortRole_E.EDGE
         )
         satisfied = VlanState(
             fanout=name, members=members,
             existing_vlans=frozenset({c.vlan for c in changes}),
+            tunnel_modes=tunnel_modes,
         )
         empty = VlanState(fanout=name, members=frozenset(), existing_vlans=frozenset())
         driver.program([empty, satisfied])
@@ -299,3 +319,104 @@ def test_verify_reports_missing(
     assert code == 0
     out = capsys.readouterr().out
     assert "仍有缺漏" in out
+
+
+# --------------------------------------------------------------------
+# Phase 4 QinQ / dot1q-tunnel 擴充測試（決策 8、finding #7、AC-10/11）。
+# --------------------------------------------------------------------
+
+
+def test_setup_help_exits_zero(capsys: pytest.CaptureFixture) -> None:
+    """setup --help 可見且 exit 0（AC-10）。"""
+    with pytest.raises(SystemExit) as exc_info:
+        main(["setup", "--help"])
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    assert "setup" in out or "dot1q-tunnel" in out
+
+
+def test_setup_dry_run_does_not_connect(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """setup（dry-run）印計畫不連線（mock deployer，AC-10）。"""
+    names = ["spine-1", "agg-1"]
+    config = _FakeConfig(names)
+    created: Dict[str, _MockDriver] = {}
+
+    def _factory(name, entry):
+        driver = _MockDriver(name)
+        created[name] = driver
+        return driver
+
+    def _fake_build_deployer(credentials):
+        return Deployer(_factory, config), config
+
+    monkeypatch.setattr(cli, "_build_deployer", _fake_build_deployer)
+
+    code = main(["setup"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out
+    assert "dot1q-tunnel system-tunnel-control" in out
+    # dry-run：未連線。
+    assert all(not d.connected for d in created.values())
+
+
+def test_setup_apply_connects(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """setup --apply 連線下發（mock driver，AC-10）。"""
+    names = ["spine-1"]
+    config = _FakeConfig(names)
+    created: Dict[str, _MockDriver] = {}
+
+    def _factory(name, entry):
+        driver = _MockDriver(name)
+        created[name] = driver
+        return driver
+
+    def _fake_build_deployer(credentials):
+        return Deployer(_factory, config), config
+
+    monkeypatch.setattr(cli, "_build_deployer", _fake_build_deployer)
+
+    code = main(["setup", "--apply"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "已下發" in out
+    assert created["spine-1"].connected is True
+    assert getattr(created["spine-1"], "setup_calls", 0) == 1
+
+
+def test_setup_fanout_not_found_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """setup --fanout <不存在> → ConfigError → main 回 1、無 traceback（finding #7）。"""
+    creds = _write_credentials(tmp_path, ["spine-1", "agg-1"])
+    code = main(["setup", "--credentials", creds, "--fanout", "no-such"])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("錯誤：")
+    assert "Traceback" not in captured.err
+
+
+def test_apply_dry_run_output_shows_both_roles(
+    three_tier_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """apply dry-run 輸出同時含邊緣與互聯兩類變更（role 加印，AC-11）。"""
+    state = _state_arg(tmp_path)
+    creds = _write_credentials(tmp_path, ["spine-1", "agg-1", "leaf-1-1"])
+    topo = str(three_tier_path)
+    assert main(["allocate", topo, "--from", "ixia-1/1", "--to", "dut-A1:Eth0", "--state", state]) == 0
+    capsys.readouterr()
+
+    code = main(
+        ["apply", topo, "--session", "s-0001", "--state", state, "--credentials", creds]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out
+    assert "邊緣" in out
+    assert "互聯" in out

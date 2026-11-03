@@ -31,13 +31,21 @@ from typing import List
 
 import pytest
 
-from topo_manager.drivers.base import PortVlanChange
+from topo_manager.drivers.base import PortRole_E, PortVlanChange
 from topo_manager.drivers.ec_ssh import (
+    _ACCESS_MODE_TEMPLATE,
     _APPLY_MEMBER_TEMPLATE,
     _CLEAR_MEMBER_TEMPLATE,
     _DISABLE_PAGER_TEMPLATE,
     _ENTER_INTF_TEMPLATE,
+    _GLOBAL_TUNNEL_CONTROL_TEMPLATE,
+    _NATIVE_VLAN_TEMPLATE,
+    _NO_NATIVE_VLAN_TEMPLATE,
+    _SHOW_DOT1Q_TUNNEL,
     _TRUNK_MODE_TEMPLATE,
+    _TUNNEL_ACCESS_TEMPLATE,
+    _TUNNEL_NORMAL_TEMPLATE,
+    _TUNNEL_UPLINK_TEMPLATE,
     EcSshDriver,
 )
 from topo_manager.errors import (
@@ -75,6 +83,23 @@ _SHOW_VLAN_FIXTURE = (
     "\n"
 )
 
+# 真機 ECS5550-54X 的 'show dot1q-tunnel' 輸出樣本（本次 live 擷取定稿，
+# finding #1）：含全域 802.1Q Tunnel Status 行與 per-port Mode 表（每行
+# 'Eth1/<port>  <Mode>'，Mode ∈ Uplink/Access/Normal）。interface token 經
+# _normalize_interface 歸一化後與 apply 名一致（'Eth1/41' 等）。
+_SAMPLE_SHOW_DOT1Q_TUNNEL = (
+    "802.1Q Tunnel Status : Enabled\n"
+    "\n"
+    "Interface   Mode\n"
+    "----------- --------\n"
+    "Eth1/41     Uplink\n"
+    "Eth1/42     Access\n"
+    "Eth1/1      Normal\n"
+)
+
+# status=Disabled 樣本（驗 read_tunnel_status 解析 Disabled→False）。
+_SAMPLE_TUNNEL_DISABLED = "802.1Q Tunnel Status : Disabled\n"
+
 
 class _FakeConnection:
     """最小 netmiko connection 替身（紀錄呼叫，回預錄字串）。
@@ -86,20 +111,27 @@ class _FakeConnection:
       - disconnected：是否呼叫過 disconnect()（bool）。
     """
 
-    def __init__(self, show_vlan_output: str = _SHOW_VLAN_FIXTURE) -> None:
+    def __init__(
+        self,
+        show_vlan_output: str = _SHOW_VLAN_FIXTURE,
+        show_dot1q_output: str = "",
+    ) -> None:
         self.enabled = False
         self.sent_commands: List[str] = []
         self.config_sets: List[List[str]] = []
         self.disconnected = False
         self._show_vlan_output = show_vlan_output
+        self._show_dot1q_output = show_dot1q_output
 
     def enable(self) -> None:
         """進入特權模式（紀錄旗標）。"""
         self.enabled = True
 
     def send_command(self, command: str) -> str:
-        """紀錄唯讀指令並回預錄輸出（show vlan 回 fixture，其餘回空字串）。"""
+        """紀錄唯讀指令並回預錄輸出（show vlan / show dot1q-tunnel 各回 fixture）。"""
         self.sent_commands.append(command)
+        if "dot1q-tunnel" in command:
+            return self._show_dot1q_output
         if "vlan" in command:
             return self._show_vlan_output
         return ""
@@ -210,13 +242,16 @@ def test_build_commands_matches_template_render() -> None:
 
     commands = driver.build_commands(changes)
 
+    # UPLINK（預設 role）互聯序列每介面含 dot1q-tunnel mode uplink（AC-4）。
     expected = [
         _ENTER_INTF_TEMPLATE.format(port="7"),
         _TRUNK_MODE_TEMPLATE,
         _APPLY_MEMBER_TEMPLATE.format(vlan=100),
+        _TUNNEL_UPLINK_TEMPLATE,
         _ENTER_INTF_TEMPLATE.format(port="8"),
         _TRUNK_MODE_TEMPLATE,
         _APPLY_MEMBER_TEMPLATE.format(vlan=100),
+        _TUNNEL_UPLINK_TEMPLATE,
     ]
     assert commands == expected
     # 加成員指令必帶 'tagged' 關鍵字（實機 running-config 語法）。
@@ -332,3 +367,198 @@ def test_missing_netmiko_raises_dependency_error() -> None:
     with pytest.raises(DriverDependencyError) as exc_info:
         driver.connect()
     assert "netmiko" in str(exc_info.value)
+
+
+# --------------------------------------------------------------------
+# Phase 4 QinQ / dot1q-tunnel 擴充測試（決策 4、設計測試計畫）。
+# --------------------------------------------------------------------
+
+
+def _edge_change(interface: str, vlan: int, action: str = "add") -> PortVlanChange:
+    """建一筆 EDGE 角色變更（測試輔助）。"""
+    return PortVlanChange(
+        fanout="fanout-x", interface=interface, vlan=vlan,
+        action=action, topology_node="fanout-x:{0}".format(interface),
+        role=PortRole_E.EDGE,
+    )
+
+
+def _uplink_change(interface: str, vlan: int, action: str = "add") -> PortVlanChange:
+    """建一筆 UPLINK 角色變更（測試輔助）。"""
+    return PortVlanChange(
+        fanout="fanout-x", interface=interface, vlan=vlan,
+        action=action, topology_node="fanout-x:{0}".format(interface),
+        role=PortRole_E.UPLINK,
+    )
+
+
+def test_build_commands_edge_add_sequence() -> None:
+    """EDGE add 產出恰 4 行：進介面→access→native vlan→tunnel access（AC-3）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    commands = driver.build_commands([_edge_change("Eth1/42", 3999)])
+
+    assert commands == [
+        _ENTER_INTF_TEMPLATE.format(port="42"),
+        _ACCESS_MODE_TEMPLATE,
+        _NATIVE_VLAN_TEMPLATE.format(vlan=3999),
+        _TUNNEL_ACCESS_TEMPLATE,
+    ]
+
+
+def test_build_commands_uplink_add_sequence() -> None:
+    """UPLINK add 產出恰 4 行含 uplink：進介面→trunk→add tagged→uplink（AC-4）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    commands = driver.build_commands([_uplink_change("Eth1/41", 100)])
+
+    assert commands == [
+        _ENTER_INTF_TEMPLATE.format(port="41"),
+        _TRUNK_MODE_TEMPLATE,
+        _APPLY_MEMBER_TEMPLATE.format(vlan=100),
+        _TUNNEL_UPLINK_TEMPLATE,
+    ]
+
+
+def test_build_commands_uplink_multi_vlan_trunk_uplink_once() -> None:
+    """UPLINK 同介面多 VLAN：trunk 與 uplink 模式各只下一次（冪等去重）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    commands = driver.build_commands(
+        [_uplink_change("Eth1/41", 100), _uplink_change("Eth1/41", 200)]
+    )
+
+    assert commands.count(_TRUNK_MODE_TEMPLATE) == 1
+    assert commands.count(_TUNNEL_UPLINK_TEMPLATE) == 1
+    # 兩個 VLAN 的 tagged 成員都有加。
+    assert _APPLY_MEMBER_TEMPLATE.format(vlan=100) in commands
+    assert _APPLY_MEMBER_TEMPLATE.format(vlan=200) in commands
+
+
+def test_build_commands_edge_remove_sequence() -> None:
+    """EDGE remove 走 no native vlan + mode normal（測試臨界清理，決策 7）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    commands = driver.build_commands([_edge_change("Eth1/42", 3999, action="remove")])
+
+    assert commands == [
+        _ENTER_INTF_TEMPLATE.format(port="42"),
+        _NO_NATIVE_VLAN_TEMPLATE,
+        _TUNNEL_NORMAL_TEMPLATE,
+    ]
+
+
+def test_clear_vlan_preserves_edge_role() -> None:
+    """clear_vlan 重建變更保留 EDGE role（不掉成 UPLINK，決策 7）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    driver.connect()
+    driver.clear_vlan([_edge_change("Eth1/42", 3999)])
+
+    sent = conn.config_sets[0]
+    # EDGE 清除走 no native vlan + mode normal，而非 UPLINK 的 allowed vlan remove。
+    assert _NO_NATIVE_VLAN_TEMPLATE in sent
+    assert _TUNNEL_NORMAL_TEMPLATE in sent
+    assert not any("allowed vlan remove" in cmd for cmd in sent)
+
+
+def test_setup_global_tunnel_dry_run_returns_commands() -> None:
+    """setup_global_tunnel(apply=False) 回含 system-tunnel-control 指令、不連線（AC-5）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    commands = driver.setup_global_tunnel(apply=False)
+
+    assert commands == [_GLOBAL_TUNNEL_CONTROL_TEMPLATE]
+    # dry-run 不送出任何設定指令。
+    assert conn.config_sets == []
+
+
+def test_setup_global_tunnel_apply_sends_commands() -> None:
+    """setup_global_tunnel(apply=True) 經 fake connection 送出同指令（AC-5）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    driver.connect()
+    commands = driver.setup_global_tunnel(apply=True)
+
+    assert commands == [_GLOBAL_TUNNEL_CONTROL_TEMPLATE]
+    assert conn.config_sets == [[_GLOBAL_TUNNEL_CONTROL_TEMPLATE]]
+
+
+def test_read_tunnel_status_enabled_disabled_unknown() -> None:
+    """read_tunnel_status 解析 Enabled→True / Disabled→False / 未知→None。"""
+    enabled = _make_driver(
+        _FakeConnection(show_dot1q_output=_SAMPLE_SHOW_DOT1Q_TUNNEL)
+    )
+    enabled.connect()
+    assert enabled.read_tunnel_status() is True
+
+    disabled = _make_driver(
+        _FakeConnection(show_dot1q_output=_SAMPLE_TUNNEL_DISABLED)
+    )
+    disabled.connect()
+    assert disabled.read_tunnel_status() is False
+
+    unknown = _make_driver(_FakeConnection(show_dot1q_output=""))
+    unknown.connect()
+    assert unknown.read_tunnel_status() is None
+
+
+def test_read_tunnel_status_uses_single_parse_entry(monkeypatch) -> None:
+    """read_tunnel_status 與 read_vlans 皆經 _parse_dot1q_tunnel_output（finding #3）。"""
+    conn = _FakeConnection(show_dot1q_output=_SAMPLE_SHOW_DOT1Q_TUNNEL)
+    driver = _make_driver(conn)
+    driver.connect()
+
+    calls = {"n": 0}
+    original = driver._parse_dot1q_tunnel_output
+
+    def _spy(raw):
+        calls["n"] += 1
+        return original(raw)
+
+    monkeypatch.setattr(driver, "_parse_dot1q_tunnel_output", _spy)
+
+    driver.read_tunnel_status()
+    driver.read_vlans()
+    # 兩條路徑都經唯一入口（read_tunnel_status 一次、read_vlans 一次）。
+    assert calls["n"] == 2
+
+
+def test_read_vlans_parses_tunnel_modes_and_status() -> None:
+    """read_vlans 併讀後 tunnel_modes / tunnel_status 正確（per-port 定稿，AC-6）。"""
+    conn = _FakeConnection(show_dot1q_output=_SAMPLE_SHOW_DOT1Q_TUNNEL)
+    driver = _make_driver(conn)
+    driver.connect()
+
+    state = driver.read_vlans()
+
+    assert state.tunnel_status is True
+    assert ("Eth1/41", "Uplink") in state.tunnel_modes
+    assert ("Eth1/42", "Access") in state.tunnel_modes
+    assert ("Eth1/1", "Normal") in state.tunnel_modes
+    # interface token 經 _normalize_interface 與 apply 名一致。
+    assert driver._normalize_interface("1", "42") == "Eth1/42"
+
+
+def test_read_vlans_tunnel_empty_when_no_tunnel_block() -> None:
+    """無 tunnel 區塊時 tunnel_modes 空、tunnel_status None（不丟錯，決策 3）。"""
+    conn = _FakeConnection(show_dot1q_output="")
+    driver = _make_driver(conn)
+    driver.connect()
+
+    state = driver.read_vlans()
+    assert state.tunnel_modes == frozenset()
+    assert state.tunnel_status is None
+    # show vlan 仍正常解析。
+    assert state.existing_vlans == frozenset({1, 10, 4093})
+
+
+def test_show_dot1q_tunnel_command_has_no_pipe_filter() -> None:
+    """送出的 show dot1q-tunnel 指令字面不含 '| include'（AC-7）。"""
+    conn = _FakeConnection(show_dot1q_output=_SAMPLE_SHOW_DOT1Q_TUNNEL)
+    driver = _make_driver(conn)
+    driver.connect()
+    driver.read_vlans()
+
+    assert _SHOW_DOT1Q_TUNNEL in conn.sent_commands
+    assert all("| include" not in cmd for cmd in conn.sent_commands)

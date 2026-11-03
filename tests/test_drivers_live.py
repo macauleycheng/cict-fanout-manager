@@ -13,9 +13,11 @@
   - ``TOPO_FANOUT_SECRET``：enable 密碼（有則 connect 後進特權模式）。
   - ``TOPO_FANOUT_INTERFACE_TEMPLATE``：port→介面名樣板（預設 ``Eth1/{port}``）。
   - ``TOPO_FANOUT_TRUNK_PORT``：4b 寫入/復原測試要操作的 trunk port 編號
-    （缺此一項時 4b 單獨 skip；4a 唯讀仍可跑）。
-  - ``TOPO_FANOUT_CAPTURE_DIR``：4a 擷取真機 ``show vlan`` 輸出的存放目錄
-    （缺省時寫入 pytest 的 tmp_path，不落入版控）。
+    （缺此一項時 4b 單獨 skip；4a 唯讀仍可跑）。建議 Eth1/41。
+  - ``TOPO_FANOUT_EDGE_PORT``：Phase 4 QinQ 邊緣 port 寫入/復原要操作的 port
+    編號（缺此一項時邊緣 live 測試單獨 skip）。建議 Eth1/42。
+  - ``TOPO_FANOUT_CAPTURE_DIR``：擷取真機 ``show vlan`` / ``show dot1q-tunnel``
+    輸出的存放目錄（缺省時寫入 pytest 的 tmp_path，不落入版控）。
 
 4a（唯讀）：connect → ``read_show('show version')`` → ``read_vlans()``，斷言能連、
 能解析、且全程未寫入；並擷取真機 ``show vlan`` 原始輸出存檔，供日後把 ec_ssh 的
@@ -32,6 +34,14 @@ read-back（確認已還原、VLAN 3999 成員消失）。整段寫入/驗證/�
   - 0.4.0  FEAT-003 初版，建立 live 測試骨架（預設 skip；4a 唯讀探測並擷取
            show vlan 供 parser fixture；4b VLAN 3999 寫入/復原並 try/finally
            保證還原）。連線憑證一律讀 env，不從版控檔讀。
+  - 0.5.0  Phase 4 QinQ/dot1q-tunnel 擴充（決策 4、finding #1，AC-6/13/14）：
+           擷取真機 ``show dot1q-tunnel`` 原始輸出供 per-port 正則/fixture 覆核；
+           全域 ``setup_global_tunnel(apply=True)`` + ``read_tunnel_status`` 確認
+           Enabled（冪等）；邊緣 port（TOPO_FANOUT_EDGE_PORT）native vlan 3999 +
+           dot1q-tunnel mode access 寫入→read-back Mode=Access→try/finally 以
+           EDGE remove（no native vlan + mode normal）還原並 read-back；互聯 port
+           加驗 dot1q-tunnel mode uplink。只動 VLAN 3999 與測試 port，絕不動既有
+           VLAN 1/2/3/4/10/20/4093 與 Eth1/1/Eth1/11。缺 env 一律 skip。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -44,7 +54,7 @@ from typing import Dict, Optional
 
 import pytest
 
-from topo_manager.drivers.base import PortVlanChange, VlanState
+from topo_manager.drivers.base import PortRole_E, PortVlanChange, VlanState
 from topo_manager.drivers.ec_ssh import EcSshDriver
 
 # 本檔整檔標記 live：預設不收集；-m live 時缺 env 亦 skip。
@@ -279,3 +289,172 @@ def test_live_apply_and_rollback_vlan_3999(
             _RESERVED_TEST_VLAN,
             True,
         ) not in _members_for_interface(after_clear, interface)
+
+
+# --------------------------------------------------------------------
+# Phase 4 QinQ / dot1q-tunnel live 測試（決策 4、finding #1，AC-6/13/14）。
+# --------------------------------------------------------------------
+
+
+def test_live_global_tunnel_setup_idempotent(
+    live_driver: EcSshDriver,
+) -> None:
+    """全域 setup：setup_global_tunnel(apply=True) + read_tunnel_status 確認 Enabled。
+
+    setup 冪等（真機保證）；連續下發不改結果。此測試只動全域總開關，不動任何
+    port。
+
+    INPUT：
+      - live_driver：以 live env 建構的 ``EcSshDriver`` fixture。
+
+    OUTPUT：無。
+
+    RETURN：None。
+
+    例外：連線/下發類例外會使測試 fail（全域 setup 無還原需求，冪等）。
+    """
+    with live_driver as driver:
+        driver.setup_global_tunnel(apply=True)
+        status = driver.read_tunnel_status()
+        assert status is True
+
+
+def test_live_capture_show_dot1q_tunnel(
+    live_driver: EcSshDriver, tmp_path: Path
+) -> None:
+    """擷取真機 'show dot1q-tunnel' 原始輸出供 per-port 正則/fixture 覆核（finding #1）。
+
+    於已 setup 的設備上擷取完整原始輸出（含全域 status 行與 per-port Mode 表），
+    寫入 ``TOPO_FANOUT_CAPTURE_DIR``/``tmp_path``，供把 ec_ssh 的
+    ``_SAMPLE_SHOW_DOT1Q_TUNNEL`` fixture 與 ``_TUNNEL_PORT_MODE_RE`` 覆核對齊
+    真機。此測試唯讀，不寫入設備。
+
+    INPUT：
+      - live_driver：以 live env 建構的 ``EcSshDriver`` fixture。
+      - tmp_path：pytest 內建暫存目錄（擷取檔預設落點）。
+
+    OUTPUT：
+      - 把真機 ``show dot1q-tunnel`` 原始輸出寫入擷取目錄。
+
+    RETURN：None。
+
+    例外：連線類例外會使測試 fail（唯讀）。
+    """
+    with live_driver as driver:
+        raw_tunnel = driver.read_show("show dot1q-tunnel")
+
+    capture_dir_env = os.environ.get("TOPO_FANOUT_CAPTURE_DIR")
+    capture_dir = Path(capture_dir_env) if capture_dir_env else tmp_path
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    capture_path = capture_dir / "live_show_dot1q_tunnel.txt"
+    header = (
+        "# 真機 'show dot1q-tunnel' 原始輸出擷取（Phase 4 QinQ，finding #1）。\n"
+        "# 用途：覆核 ec_ssh 的 _SAMPLE_SHOW_DOT1Q_TUNNEL fixture 與\n"
+        "#   _TUNNEL_STATUS_RE / _TUNNEL_PORT_MODE_RE；若真機 per-port Mode 行或\n"
+        "#   status 行格式與現有正則不符，以本擷取字面覆寫 fixture/正則並更新\n"
+        "#   單元測試（決策 4、finding #1）。\n"
+    )
+    capture_path.write_text(header + "\n" + raw_tunnel, encoding="utf-8")
+    assert capture_path.exists()
+
+
+def test_live_edge_port_native_vlan_and_tunnel_access(
+    live_driver: EcSshDriver,
+) -> None:
+    """邊緣 port：native vlan 3999 + dot1q-tunnel access 寫入→read-back→還原（AC-13）。
+
+    需 ``TOPO_FANOUT_EDGE_PORT``；缺此 env 時單獨 skip。整段寫入/驗證/還原以
+    try/finally 包覆：finally 以 EDGE remove（no native vlan + mode normal）
+    強制還原，確保不在設備留痕（決策 7、§11.2）。只動 VLAN 3999 與該邊緣 port。
+
+    INPUT：
+      - live_driver：以 live env 建構的 ``EcSshDriver`` fixture。
+
+    OUTPUT：無（測試結束時設備狀態還原為測試前）。
+
+    RETURN：None。
+
+    例外：連線/下發/回讀類例外或 read-back 不符會使測試 fail；finally 仍會
+      嘗試還原。
+    """
+    edge_port = os.environ.get("TOPO_FANOUT_EDGE_PORT")
+    if not edge_port:
+        pytest.skip(
+            "缺少 TOPO_FANOUT_EDGE_PORT（邊緣 port 寫入/復原需指定），跳過"
+        )
+
+    interface = live_driver._interface_template.format(port=edge_port)
+    edge_change = PortVlanChange(
+        fanout=live_driver._host,
+        interface=interface,
+        vlan=_RESERVED_TEST_VLAN,
+        action="add",
+        topology_node="live-edge:{0}".format(edge_port),
+        role=PortRole_E.EDGE,
+    )
+
+    with live_driver as driver:
+        applied = False
+        try:
+            driver.apply_vlan([edge_change])
+            applied = True
+
+            # read-back：該 interface 的 dot1q-tunnel Mode 須為 Access。
+            after_apply = driver.read_vlans()
+            assert (interface, "Access") in after_apply.tunnel_modes
+        finally:
+            if applied:
+                driver.clear_vlan([edge_change])
+
+        # read-back：確認 tunnel mode 已還原（不再是 Access）。
+        after_clear = driver.read_vlans()
+        assert (interface, "Access") not in after_clear.tunnel_modes
+
+
+def test_live_uplink_port_tunnel_uplink(
+    live_driver: EcSshDriver,
+) -> None:
+    """互聯 port：trunk tagged + dot1q-tunnel uplink 寫入→read-back Mode=Uplink→還原。
+
+    需 ``TOPO_FANOUT_TRUNK_PORT``；缺此 env 時單獨 skip。try/finally 以 UPLINK
+    remove（allowed vlan remove）+ mode normal 還原。只動 VLAN 3999 與該互聯
+    port。
+
+    INPUT：
+      - live_driver：以 live env 建構的 ``EcSshDriver`` fixture。
+
+    OUTPUT：無（測試結束時設備狀態還原）。
+
+    RETURN：None。
+
+    例外：連線/下發/回讀類例外或 read-back 不符會使測試 fail；finally 仍會
+      嘗試還原。
+    """
+    trunk_port = os.environ.get("TOPO_FANOUT_TRUNK_PORT")
+    if not trunk_port:
+        pytest.skip(
+            "缺少 TOPO_FANOUT_TRUNK_PORT（互聯 port tunnel uplink 需指定），跳過"
+        )
+
+    interface = live_driver._interface_template.format(port=trunk_port)
+    uplink_change = PortVlanChange(
+        fanout=live_driver._host,
+        interface=interface,
+        vlan=_RESERVED_TEST_VLAN,
+        action="add",
+        topology_node="live-uplink:{0}".format(trunk_port),
+        role=PortRole_E.UPLINK,
+    )
+
+    with live_driver as driver:
+        applied = False
+        try:
+            driver.apply_vlan([uplink_change])
+            applied = True
+
+            # read-back：該 interface 的 dot1q-tunnel Mode 須為 Uplink。
+            after_apply = driver.read_vlans()
+            assert (interface, "Uplink") in after_apply.tunnel_modes
+        finally:
+            if applied:
+                driver.clear_vlan([uplink_change])
