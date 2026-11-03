@@ -7,6 +7,9 @@
 
 歷史（HISTORY）：
   - 0.2.0  FEAT-005 初版。
+  - 0.3.1  Phase 2 Hardening 測試補洞：還原層重複 VLAN（Issue #2）、access
+           port 衝突（Issue #3）、兩行程撞同一 access port 的競爭語意
+           （Issue #4）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -366,6 +369,63 @@ def test_restore_legit_shared_trunk_not_flagged(
     assert len(allocator.list_sessions()) == 2
 
 
+def test_restore_duplicate_vlan_raises(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """還原偵測跨 session 重複 VLAN → SessionStoreError（Issue #2、FR-H14.1）。
+
+    兩筆 session 走不相交 access port（s-0001 用 ixia-1/1→dut-A1、s-0002 用
+    ixia-1/2→dut-A2），但共用同一 VLAN 100。access port 不衝突，故必然是
+    「VLAN 全域唯一」分支觸發 SessionStoreError。
+    """
+    state = tmp_path / "state" / "allocations.json"
+    a2_path = [
+        "ixia-1:ixia-1/2", "spine-1:2", "spine-1:7", "agg-1:1",
+        "agg-1:2", "leaf-1-1:1", "leaf-1-1:13", "dut-A2:Eth0",
+    ]
+    # s-0002 的 trunk 段須與 s-0002 的 VLAN 一致（重算只比對端點，vlan 不入比對）。
+    a2_trunks = [
+        {"a_node": "spine-1:7", "b_node": "agg-1:1", "vlan": 100},
+        {"a_node": "agg-1:2", "b_node": "leaf-1-1:1", "vlan": 100},
+    ]
+    s1 = _session_dict("s-0001", 100, "ixia-1/1", "dut-A1:Eth0", _A1_PATH, _A1_TRUNKS)
+    # 相同 VLAN 100、不同 access port。
+    s2 = _session_dict("s-0002", 100, "ixia-1/2", "dut-A2:Eth0", a2_path, a2_trunks)
+    _write_ledger(state, [s1, s2], next_seq=3)
+    with pytest.raises(SessionStoreError) as exc_info:
+        Allocator(load_topology(three_tier_path), JsonSessionStore(state))
+    message = str(exc_info.value)
+    assert "VLAN" in message
+    assert "100" in message
+
+
+def test_restore_access_port_conflict_raises(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """還原偵測 access port 被兩 session 佔用 → SessionStoreError（Issue #3、FR-H14.1）。
+
+    兩筆 session 共用同一 access port（皆以 ixia-1/1→dut-A1 的同一條路徑，
+    generator 端 access port ixia-1:ixia-1/1 相同）但 VLAN 不同，故在 VLAN
+    唯一性之外，必定觸發「access port 同時被兩 session 佔用」分支。
+    """
+    state = tmp_path / "state" / "allocations.json"
+    a1b_trunks = [
+        {"a_node": "spine-1:7", "b_node": "agg-1:1", "vlan": 101},
+        {"a_node": "agg-1:2", "b_node": "leaf-1-1:1", "vlan": 101},
+    ]
+    s1 = _session_dict("s-0001", 100, "ixia-1/1", "dut-A1:Eth0", _A1_PATH, _A1_TRUNKS)
+    # 相同路徑（同 access port）、不同 VLAN，避免先被 VLAN 重複分支攔截。
+    s2 = _session_dict("s-0002", 101, "ixia-1/1", "dut-A1:Eth0", _A1_PATH, a1b_trunks)
+    _write_ledger(state, [s1, s2], next_seq=3)
+    with pytest.raises(SessionStoreError) as exc_info:
+        Allocator(load_topology(three_tier_path), JsonSessionStore(state))
+    message = str(exc_info.value)
+    assert "access port" in message
+    # 衝突 port 與兩擁有者皆應被點名。
+    assert "ixia-1:ixia-1/1" in message
+    assert "s-0001" in message and "s-0002" in message
+
+
 # ======================================================================
 # Phase 2 Hardening：save 回捲（#7）
 # ======================================================================
@@ -486,3 +546,42 @@ def test_concurrent_multiprocess_allocate(
     # 帳本兩筆都在且可重 load。
     reloaded = Allocator(load_topology(three_tier_path), JsonSessionStore(state))
     assert len(reloaded.list_sessions()) == 2
+
+
+def test_concurrent_multiprocess_same_access_port_one_winner(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """兩行程撞同一 access port：恰一方成功、另一方得 HardConflictError、帳本只留一筆（#1、FR-H1.4）。
+
+    兩 worker 以完全相同的 (generator, dut) 競爭同一條路徑（同一組 access
+    port）。跨行程鎖序列化後，先取鎖者 allocate 成功並寫入帳本，後取鎖者於
+    鎖內 reload 看到既有 session，硬衝突檢查使其得 HardConflictError。驗證恰
+    一成功、一硬衝突，且帳本最終只留一筆。
+    """
+    state = str(tmp_path / "newstate" / "allocations.json")
+    topo = str(three_tier_path)
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=2) as pool:
+        results = pool.starmap(
+            _concurrent_worker,
+            [
+                (topo, state, "ixia-1/1", "dut-A1:Eth0"),
+                (topo, state, "ixia-1/1", "dut-A1:Eth0"),
+            ],
+        )
+
+    successes = [(sid, vlan) for sid, vlan in results if sid != "ERROR"]
+    errors = [vlan for sid, vlan in results if sid == "ERROR"]
+
+    # 恰一方成功、另一方失敗。
+    assert len(successes) == 1, results
+    assert len(errors) == 1, results
+    # 失敗方為硬衝突（而非其他錯誤）。
+    assert "硬衝突" in errors[0], errors
+    # 成功的那筆為 s-0001。
+    assert successes[0][0] == "s-0001"
+
+    # 帳本最終只留一筆（後手未留下副作用）。
+    reloaded = Allocator(load_topology(three_tier_path), JsonSessionStore(state))
+    assert len(reloaded.list_sessions()) == 1

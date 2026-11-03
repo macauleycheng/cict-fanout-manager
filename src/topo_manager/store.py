@@ -33,6 +33,9 @@ fcntl / pathlib / contextlib），不引入任何新相依。
            fsync、包 I/O 例外、temp cleanup 不先 exists()；新增 locked()
            跨行程檔案鎖、load_raw()、_ensure_dir_durable()、_open_lock_fd()、
            _fsync_dir()。
+  - 0.3.1  修補 locked() 臨界區（yield 前）的 _ensure_dir_durable 呼叫，將其
+           OSError 就地包成 SessionStoreError（保留 chaining），避免裸 OSError
+           穿透 CLI 冒 traceback（FR-H1.5/FR-H3.3/NFR-H5）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -196,18 +199,20 @@ class JsonSessionStore:
         以 ``fcntl.flock(fd, LOCK_EX)`` 阻塞取鎖，並用 ``signal.SIGALRM`` 設
         逾時（預設 10 秒）包住阻塞呼叫，逾時轉 ``SessionStoreError``。取鎖
         成功後、臨界區內呼叫 ``_ensure_dir_durable(parent)``（冪等），使「建
-        目錄 + fsync」落在 flock 序列化範圍內。
+        目錄 + fsync」落在 flock 序列化範圍內；該呼叫的 ``OSError`` 亦就地包成
+        ``SessionStoreError``（store 自身準備程式，保留 chaining）。
 
         ``timeout`` 為整數秒（``signal.alarm`` 限制，僅接受整數並截斷小數，
         不支援次秒級粒度）；傳入非整數會被 ``signal.alarm`` 靜默截斷。本專案
         所有呼叫一律用整數（預設 10 秒）。
 
-        例外語意（N#5）：``except OSError`` 僅攔「取鎖本身」的 OSError
-        （``_open_lock_fd``/``flock``）；臨界區（``yield`` 之後、呼叫端於鎖內
-        執行的程式碼）拋出的例外**原樣穿透**不被攔截，僅 ``finally`` 負責釋鎖
+        例外語意（N#5）：取鎖本身的 OSError（``_open_lock_fd``/``flock``）與
+        ``yield`` 前的 ``_ensure_dir_durable`` 準備皆由 store 包成
+        ``SessionStoreError``；而臨界區（``yield`` 之後、呼叫端於鎖內執行的
+        決策/save）拋出的例外**原樣穿透**不被攔截，僅 ``finally`` 負責釋鎖
         （還原 handler、關 fd）。前置不變量：``save()`` 已就地把所有 I/O
         OSError 包成 ``SessionStoreError``，故臨界區內的 save 失敗以
-        ``SessionStoreError`` 形式穿透，不會被此處的 ``except OSError`` 誤攔。
+        ``SessionStoreError`` 形式穿透。
         """
         lock_path = str(self._path) + ".lock"
         try:
@@ -235,7 +240,19 @@ class JsonSessionStore:
                 ) from exc
             signal.alarm(0)                 # 取鎖成功，立即取消計時器
             # 取鎖後、臨界區內再 durable 建目錄一次（冪等 no-op 若已建）。
-            self._ensure_dir_durable(self._path.parent)
+            # 此為 store 自身在 yield 前的基礎設施準備，其 mkdir/_fsync_dir 的
+            # OSError 須由 store 包成 SessionStoreError（保留 chaining），避免裸
+            # OSError 穿透 CLI 冒 traceback（FR-H1.5/FR-H3.3/NFR-H5）。注意：
+            # except 範圍僅涵蓋此準備呼叫，不涵蓋其後 yield（yield 後呼叫端於
+            # 臨界區執行的決策/save 例外仍原樣穿透，save 已自我包裝）。
+            try:
+                self._ensure_dir_durable(self._path.parent)
+            except OSError as exc:
+                raise SessionStoreError(
+                    "鎖內建立狀態目錄失敗（{0}）：{1}".format(
+                        self._path.parent, exc
+                    )
+                ) from exc
             yield
         finally:
             signal.alarm(0)                             # 保險：確保計時器清除

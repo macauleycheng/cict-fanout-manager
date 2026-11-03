@@ -14,6 +14,8 @@ cleanup、save 回捲兩情境（N#4）、load_raw 缺檔/壞 JSON、locked 取�
   - 0.3.0  Phase 2 Hardening：更新既有斷言（access_ports 移除、save 補
            next_seq、load() 回 LoadedLedger）；新增 I/O/durability/回捲/
            load_raw/locked 測試。
+  - 0.3.1  新增 locked 臨界區 _ensure_dir_durable 的 OSError 包裝回歸測試
+           （Issue #1）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -369,3 +371,28 @@ def test_locked_timeout_raises(tmp_path: Path, monkeypatch) -> None:
             pass
     assert "逾時" in str(exc_info.value)
     assert exc_info.value.__cause__ is not None
+
+
+def test_locked_critical_section_ensure_dir_oserror_wrapped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """locked 臨界區 _ensure_dir_durable 丟 OSError → SessionStoreError（Issue #1）。
+
+    注入方式讓臨界區（取鎖成功、alarm(0) 之後、yield 之前）的
+    _ensure_dir_durable 呼叫 raise OSError，確認得到 SessionStoreError（保留
+    chaining）而非裸 OSError 穿透——後者會讓 CLI 的 except TopologyError 攔不到
+    而冒 traceback。
+    """
+    path = tmp_path / "state" / "allocations.json"
+    store = JsonSessionStore(path)
+
+    def _boom(dir_path):
+        raise OSError("simulated dir fsync failure in critical section")
+
+    monkeypatch.setattr(store, "_ensure_dir_durable", _boom)
+    with pytest.raises(SessionStoreError) as exc_info:
+        with store.locked():
+            pass
+    # 必須是 SessionStoreError（TopologyError 家族），且保留 chaining。
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(path.parent) in str(exc_info.value)
