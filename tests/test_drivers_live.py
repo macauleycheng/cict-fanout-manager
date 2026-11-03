@@ -54,17 +54,21 @@ pytestmark = pytest.mark.live
 # 現場既有 VLAN 衝突的風險。
 _RESERVED_TEST_VLAN = 3999
 
-# 4a 擷取檔頂端附帶的 §8.2 待證清單（提醒以真機輸出覆核暫定假設）。
+# 4a 擷取檔頂端附帶的 §8.2 覆核結論（FEAT-003 4a 已以實機 ECS5550-54X 覆核）。
 _CAPTURE_HEADER = (
     "# 真機 'show vlan' 原始輸出擷取（FEAT-003 4a）。\n"
-    "# §8.2 待證清單——以本輸出與對應 show 指令覆核 ec_ssh 暫定假設：\n"
-    "#   1. device_type：netmiko device_type 是否為 cisco_ios 或需專屬類型。\n"
-    "#   2. 關 pager 指令：_DISABLE_PAGER_TEMPLATE 是否為正確語法。\n"
-    "#   3. apply/clear 樣板：_CREATE_VLAN/_ENTER_INTF/_APPLY_MEMBER/\n"
-    "#      _CLEAR_MEMBER_TEMPLATE 是否符合真機 CLI。\n"
-    "#   4. 是否登入即 enable：免 secret 是否已於特權模式。\n"
-    "#   5. interface 命名正則：_INTERFACE_TOKEN_RE / _VLAN_LINE_RE 是否能解析\n"
-    "#      真機 show vlan 的欄位與 tagged/untagged 判定。\n"
+    "# §8.2 覆核結論——已以實機 ECS5550-54X（Edgecore、Cisco-like CLI）確認：\n"
+    "#   1. device_type：netmiko device_type=cisco_ios 可連（show version 成功）。\n"
+    "#   2. 關 pager 指令：_DISABLE_PAGER_TEMPLATE='terminal length 0' 有效。\n"
+    "#   3. apply/clear 樣板：進介面 'interface ethernet 1/<port>'、trunk 模式\n"
+    "#      'switchport mode trunk'（冪等）、加成員 'switchport allowed vlan\n"
+    "#      add <vlan> tagged'（必帶 tagged）、移除 'switchport allowed vlan\n"
+    "#      remove <vlan>'；進設定模式用 'configure'（非 'configure terminal'）。\n"
+    "#   4. 是否登入即 enable：免 secret 即可下設定（登入帳號登入即具權限）。\n"
+    "#   5. show vlan 格式：key-value 多行區塊（'VLAN ID :' 開區塊、'Ports/Port\n"
+    "#      Channels :' 含續行收集成員），成員 token 'Eth1/ N(S)'，(S)=tagged；\n"
+    "#      parser 已改為 _VLAN_ID_RE/_PORTS_LABEL_RE/_MEMBER_TOKEN_RE 並歸一化\n"
+    "#      interface 名（'Eth1/ 2' → 'Eth1/2'）以利 read-back 比對。\n"
 )
 
 

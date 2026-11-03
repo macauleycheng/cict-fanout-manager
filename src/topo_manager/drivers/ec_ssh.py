@@ -10,10 +10,14 @@ import，確保未安裝 netmiko 的環境仍可匯入本模組並跑單元測�
 ``send_config_set`` / ``enable`` / ``disconnect`` 介面的 fake connection）。
 
 指令樣板一律以模組常數集中管理（``_DISABLE_PAGER_TEMPLATE`` /
-``_CREATE_VLAN_TEMPLATE`` / ``_ENTER_INTF_TEMPLATE`` / ``_APPLY_MEMBER_TEMPLATE``
-/ ``_CLEAR_MEMBER_TEMPLATE``），目前為暫定值並標 ``TODO(4a)``：待實機
-確認真實 CLI 語法後，僅需更新本區常數即可，不動邏輯（實機位址/帳密僅由 env
-提供，絕不寫入本檔）。
+``_ENTER_INTF_TEMPLATE`` / ``_TRUNK_MODE_TEMPLATE`` / ``_APPLY_MEMBER_TEMPLATE``
+/ ``_CLEAR_MEMBER_TEMPLATE``），已於 FEAT-003 4a 以實機 ECS5550-54X
+（Edgecore、Cisco-like CLI）確認真實語法：進介面 ``interface ethernet 1/<port>``、
+trunk 模式 ``switchport mode trunk``（冪等）、加 tagged 成員
+``switchport allowed vlan add <vlan> tagged``（必須帶 ``tagged`` 關鍵字）、
+移除 ``switchport allowed vlan remove <vlan>``。關 pager 為 ``terminal length 0``
+（實機有效）。待跨型號差異時僅需更新本區常數即可（實機位址/帳密僅由 env 提供，
+絕不寫入本檔）。
 
 netmiko 的連線/認證/逾時例外一律就地捕捉並包成 ``DriverConnectionError``
 （保留 ``__cause__``、訊息不含密碼，設計 §8、§9）。
@@ -25,6 +29,13 @@ netmiko 的連線/認證/逾時例外一律就地捕捉並包成 ``DriverConnect
            build_commands 純組裝、apply_vlan/clear_vlan 以 send_config_set
            下發、netmiko 例外包成 DriverConnectionError）。netmiko 僅於
            connect() 內延遲 import。
+  - 0.4.1  FEAT-003 4a 實機修正：依 ECS5550-54X 真機實測重寫 _parse_vlan_output
+           為 key-value 區塊格式解析（``VLAN ID :`` 開區塊、``Ports/Port
+           Channels :`` 含續行收集成員、``Eth1/ N(S)`` token，(S) 視為
+           tagged），並歸一化 interface 名（去除斜線後對齊空白）使 read-back
+           與 apply 名一致；apply/clear 指令樣板改為實機語法（switchport mode
+           trunk 冪等 + ``allowed vlan add <vlan> tagged`` / ``remove``，進介面
+           ``interface ethernet 1/<port>``）。不碰 native vlan。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -46,19 +57,37 @@ from topo_manager.errors import (
     DriverParseError,
 )
 
-# 指令樣板（模組常數，設計 §8）。TODO(4a)：以下皆為暫定值，待實機
-# 確認 Edgecore 真實 CLI 語法後更新，不動邏輯（實機位址/帳密僅由 env 提供）。
+# 指令樣板（模組常數，設計 §8）。FEAT-003 4a 已以實機 ECS5550-54X 確認：
+#   - 關 pager：'terminal length 0'（實機有效）。
+#   - 進介面：'interface ethernet 1/<port>'（提示符 ...(config-if)#）。
+#   - trunk 模式：'switchport mode trunk'（冪等——已是 trunk 則不重下）。
+#   - 加 tagged 成員：'switchport allowed vlan add <vlan> tagged'（必帶 tagged）。
+#   - 移除成員：'switchport allowed vlan remove <vlan>'。
+# 不碰 native vlan（使用者定義：fanout 互聯 port 一律 trunk、全封包帶 tag）。
+# 實機位址/帳密僅由 env 提供，絕不寫入本檔。
 _DISABLE_PAGER_TEMPLATE = "terminal length 0"
-_CREATE_VLAN_TEMPLATE = "vlan {vlan}"
-_ENTER_INTF_TEMPLATE = "interface {interface}"
-_APPLY_MEMBER_TEMPLATE = "switchport trunk allowed vlan add {vlan}"
-_CLEAR_MEMBER_TEMPLATE = "switchport trunk allowed vlan remove {vlan}"
+# 進全域設定模式的指令：實機 ECS5550-54X 為 'configure'（非 cisco_ios 預設的
+# 'configure terminal'）；傳給 netmiko send_config_set 的 config_mode_command。
+_CONFIG_MODE_COMMAND = "configure"
+_ENTER_INTF_TEMPLATE = "interface ethernet 1/{port}"
+_TRUNK_MODE_TEMPLATE = "switchport mode trunk"
+_APPLY_MEMBER_TEMPLATE = "switchport allowed vlan add {vlan} tagged"
+_CLEAR_MEMBER_TEMPLATE = "switchport allowed vlan remove {vlan}"
 
-# show vlan 輸出的行解析樣板（自寫解析，設計 §8）。TODO(4a)：暫以通用格式
-# 解析——每行首為 VLAN id，之後出現的 EthX/Y token 視為該 VLAN 的 tagged 成員；
-# 待實機輸出確認後調整。
-_VLAN_LINE_RE = re.compile(r"^\s*(\d+)\b(.*)$")
-_INTERFACE_TOKEN_RE = re.compile(r"\bEth\d+/\d+\b")
+# show vlan 真機格式解析樣板（ECS5550-54X，key-value 多行區塊，設計 §8、FEAT-003
+# 4a）。每個 VLAN 為一區塊，以 'VLAN ID : <n>' 起始；成員列於 'Ports/Port
+# Channels : ...' 行並可續行縮排。成員 token 形如 'Eth1/ 2(S)'（斜線後可能有對齊
+# 空白，如 'Eth1/ 2' 與 'Eth1/10'），'(S)' 表 static/tagged 成員。
+_VLAN_ID_RE = re.compile(r"^\s*VLAN\s+ID\s*:\s*(\d+)\s*$")
+_PORTS_LABEL_RE = re.compile(r"^\s*Ports/Port\s+Channels\s*:\s*(.*)$")
+# 任何「以冒號分隔的鍵值行」視為新欄位（用來判斷 Ports 續行是否結束）。
+_KEY_VALUE_RE = re.compile(r"^\s*[A-Za-z][\w /]*\s*:\s*")
+# 成員 token：EthX/ N 或 EthX/N（斜線後容忍對齊空白），後可帶 '(S)' 等旗標。
+_MEMBER_TOKEN_RE = re.compile(
+    r"\bEth(\d+)/\s*(\d+)\s*(\([A-Za-z]\))?"
+)
+# 自 apply 用的 interface 名（如 'Eth1/41'）取出 port 編號，供組裝進介面指令。
+_INTERFACE_PORT_RE = re.compile(r"Eth\d+/\s*(\d+)")
 
 
 class EcSshDriver(FanoutDriver):
@@ -225,12 +254,38 @@ class EcSshDriver(FanoutDriver):
         raw_output = self.read_show("show vlan")
         return self._parse_vlan_output(raw_output)
 
-    def _parse_vlan_output(self, raw_output: str) -> VlanState:
-        """把 ``show vlan`` 原始輸出解析成 ``VlanState``（設計 §8）。
+    @staticmethod
+    def _normalize_interface(chassis: str, port: str) -> str:
+        """把成員 token 的 (chassis, port) 歸一化成 driver 內部一致的 interface 名。
 
-        TODO(4a)：目前以通用格式解析——每行若以數字開頭視為一筆 VLAN，該行
-        之後出現的 ``EthX/Y`` token 視為該 VLAN 的 tagged 成員。待實機輸出
-        確認後以真機格式取代本解析（含 tagged/untagged 欄位判定）。
+        實機 show vlan 的成員 token 可能寫成 ``Eth1/ 2``（斜線後有對齊空白）或
+        ``Eth1/10``；為了讓 read-back 解析出的 interface 名與 apply 時用的
+        interface 名（``interface_template`` 產生的 ``Eth1/41`` 形式）一致比對，
+        統一歸一化為 ``Eth<chassis>/<port>``（去除斜線後的對齊空白、port 不補零）。
+
+        INPUT：
+          - chassis：機箱/模組編號（str，如 ``'1'``）。
+          - port：port 編號（str，可能含前導對齊空白，如 ``' 2'``）。
+
+        OUTPUT：無。
+
+        RETURN：
+          - 歸一化後的 interface 名（str，如 ``'Eth1/2'`` / ``'Eth1/10'``）。
+
+        例外：不拋出。
+        """
+        return "Eth{0}/{1}".format(chassis, int(port))
+
+    def _parse_vlan_output(self, raw_output: str) -> VlanState:
+        """把 ``show vlan`` 原始輸出解析成 ``VlanState``（設計 §8、FEAT-003 4a）。
+
+        依 ECS5550-54X 實機格式解析：``show vlan`` 為 key-value 多行區塊，每個
+        VLAN 一個區塊，以 ``VLAN ID : <n>`` 起始；該區塊的成員列於
+        ``Ports/Port Channels : ...`` 一行並可續行（後續縮排行、直到遇到下一個
+        鍵值行或下一個 ``VLAN ID`` 區塊為止）。成員 token 形如 ``Eth1/ 2(S)``
+        （斜線後可能有對齊空白），``(S)`` 視為 static/tagged 成員（tagged=True）。
+        interface 名經 ``_normalize_interface`` 歸一化，與 apply 用名一致以利
+        read-back 比對。
 
         INPUT：
           - raw_output：``show vlan`` 的原始文字輸出（str）。
@@ -241,7 +296,7 @@ class EcSshDriver(FanoutDriver):
           - 解析後的 ``VlanState``。
 
         例外：
-          - DriverParseError：輸出非字串或完全解析不到任何 VLAN 行（含片段
+          - DriverParseError：輸出非字串或完全解析不到任何 VLAN 區塊（含片段
             摘要，供診斷設備型號/韌體差異）。
         """
         if not isinstance(raw_output, str):
@@ -252,22 +307,36 @@ class EcSshDriver(FanoutDriver):
 
         members: Set[VlanMember] = set()
         existing_vlans: Set[int] = set()
-        matched_any = False
+        current_vlan: Optional[int] = None
+        # 是否正處於某 VLAN 的 'Ports/Port Channels :' 成員收集（含續行）中。
+        collecting_ports = False
 
         for line in raw_output.splitlines():
-            line_match = _VLAN_LINE_RE.match(line)
-            if line_match is None:
+            vlan_match = _VLAN_ID_RE.match(line)
+            if vlan_match is not None:
+                current_vlan = int(vlan_match.group(1))
+                existing_vlans.add(current_vlan)
+                collecting_ports = False
                 continue
-            matched_any = True
-            vlan_id = int(line_match.group(1))
-            existing_vlans.add(vlan_id)
-            remainder = line_match.group(2)
-            for interface in _INTERFACE_TOKEN_RE.findall(remainder):
-                members.add(
-                    VlanMember(vlan=vlan_id, interface=interface, tagged=True)
-                )
 
-        if not matched_any:
+            ports_match = _PORTS_LABEL_RE.match(line)
+            if ports_match is not None:
+                # 進入成員收集：本行冒號後文字即首批成員，後續縮排行為續行。
+                collecting_ports = True
+                self._collect_members(
+                    ports_match.group(1), current_vlan, members
+                )
+                continue
+
+            if collecting_ports:
+                # 續行判定：若本行又是一個鍵值行（如 'Status : ...'）或空行，
+                # 表示成員區塊結束；否則視為成員續行續收。
+                if _KEY_VALUE_RE.match(line) is not None or not line.strip():
+                    collecting_ports = False
+                    continue
+                self._collect_members(line, current_vlan, members)
+
+        if not existing_vlans:
             snippet = raw_output.strip()[:200]
             raise DriverParseError(
                 "無法從 'show vlan' 輸出解析出任何 VLAN（fanout {0}）；輸出片段："
@@ -280,13 +349,80 @@ class EcSshDriver(FanoutDriver):
             existing_vlans=frozenset(existing_vlans),
         )
 
+    def _collect_members(
+        self,
+        text: str,
+        current_vlan: Optional[int],
+        members: Set[VlanMember],
+    ) -> None:
+        """自一段文字抽出成員 token 並併入 ``members`` 集合（解析輔助）。
+
+        每個 token（``Eth<chassis>/<port>`` 後可帶 ``(S)`` 等旗標）歸一化為一致
+        interface 名後，以 ``tagged``（``(S)`` = static/tagged 成員）加入目前
+        VLAN 的成員集合。當 ``current_vlan`` 為 None（成員出現在任何 VLAN 區塊
+        之前，理論上不會發生）時略過。
+
+        INPUT：
+          - text：可能含成員 token 的一段文字（str）。
+          - current_vlan：目前所屬 VLAN id（Optional[int]）。
+          - members：待併入的成員集合（Set[VlanMember]，就地修改）。
+
+        OUTPUT：
+          - 就地將解析到的成員加入 ``members``。
+
+        RETURN：None。
+
+        例外：不拋出。
+        """
+        if current_vlan is None:
+            return
+        for match in _MEMBER_TOKEN_RE.finditer(text):
+            chassis = match.group(1)
+            port = match.group(2)
+            flag = match.group(3)
+            # (S) = static/tagged 成員（實機 trunk tagged）；本階段下發一律
+            # 要求 tagged，故將帶 (S) 旗標成員視為 tagged=True。
+            tagged = flag is not None and flag.upper() == "(S)"
+            interface = self._normalize_interface(chassis, port)
+            members.add(
+                VlanMember(
+                    vlan=current_vlan, interface=interface, tagged=tagged
+                )
+            )
+
+    @staticmethod
+    def _port_from_interface(interface: str) -> str:
+        """自 interface 名（如 ``Eth1/41``）取出 port 編號，供組裝進介面指令。
+
+        實機進介面指令為 ``interface ethernet 1/<port>``，故需由 driver 內部一致
+        的 interface 名（``Eth<chassis>/<port>``）取出 ``<port>``。容忍斜線後對齊
+        空白；若無法解析則回退為原字串（不致中斷組裝，便於診斷）。
+
+        INPUT：
+          - interface：driver 內部 interface 名（str，如 ``'Eth1/41'``）。
+
+        OUTPUT：無。
+
+        RETURN：
+          - port 編號字串（str，如 ``'41'``）；無法解析時回原 interface。
+
+        例外：不拋出。
+        """
+        match = _INTERFACE_PORT_RE.search(interface)
+        if match is not None:
+            return match.group(1)
+        return interface
+
     def build_commands(self, changes: List[PortVlanChange]) -> List[str]:
         """由變更計畫以模組常數樣板組裝設定指令（純邏輯、不送出，設計 §8）。
 
-        每筆 ``action='add'`` 變更先確保 VLAN 存在（``_CREATE_VLAN_TEMPLATE``）、
-        進入介面（``_ENTER_INTF_TEMPLATE``）、再套 tagged 成員
-        （``_APPLY_MEMBER_TEMPLATE``）；``action='remove'`` 則用
-        ``_CLEAR_MEMBER_TEMPLATE``。同一 VLAN 的建立指令只產生一次（去重）。
+        依 ECS5550-54X 實機語法：每筆 ``action='add'`` 變更先進入介面
+        （``_ENTER_INTF_TEMPLATE``，``interface ethernet 1/<port>``）、確保為
+        trunk 模式（``_TRUNK_MODE_TEMPLATE``，``switchport mode trunk``）、再加
+        tagged 成員（``_APPLY_MEMBER_TEMPLATE``，``... add <vlan> tagged``）。
+        trunk 模式於同一批中對同一介面只下一次（冪等去重；設備端重下亦為 no-op）。
+        ``action='remove'`` 進介面後以 ``_CLEAR_MEMBER_TEMPLATE``
+        （``... remove <vlan>``）移除。不碰 native vlan。
 
         INPUT：
           - changes：本 fanout 的 ``PortVlanChange`` 清單。
@@ -299,28 +435,23 @@ class EcSshDriver(FanoutDriver):
         例外：不涉及 I/O，故不拋連線類例外。
         """
         commands: List[str] = []
-        created_vlans: Set[int] = set()
+        # 本批中已下過 trunk 模式的介面（冪等去重，避免對同一介面重複下發）。
+        trunked_interfaces: Set[str] = set()
 
         for change in changes:
-            if change.action == "add" and change.vlan not in created_vlans:
-                commands.append(
-                    _CREATE_VLAN_TEMPLATE.format(vlan=change.vlan)
-                )
-                created_vlans.add(change.vlan)
-            commands.append(
-                _ENTER_INTF_TEMPLATE.format(interface=change.interface)
-            )
+            port = self._port_from_interface(change.interface)
+            commands.append(_ENTER_INTF_TEMPLATE.format(port=port))
             if change.action == "add":
+                # 確保為 trunk 模式（同一批同一介面只下一次）。
+                if change.interface not in trunked_interfaces:
+                    commands.append(_TRUNK_MODE_TEMPLATE)
+                    trunked_interfaces.add(change.interface)
                 commands.append(
-                    _APPLY_MEMBER_TEMPLATE.format(
-                        interface=change.interface, vlan=change.vlan
-                    )
+                    _APPLY_MEMBER_TEMPLATE.format(vlan=change.vlan)
                 )
             else:
                 commands.append(
-                    _CLEAR_MEMBER_TEMPLATE.format(
-                        interface=change.interface, vlan=change.vlan
-                    )
+                    _CLEAR_MEMBER_TEMPLATE.format(vlan=change.vlan)
                 )
 
         return commands
@@ -388,7 +519,11 @@ class EcSshDriver(FanoutDriver):
             return
         connection = self._require_connection()
         try:
-            connection.send_config_set(commands)
+            # 實機進設定模式用 'configure'（非 cisco_ios 預設 'configure
+            # terminal'），以 config_mode_command 覆寫；netmiko 會自動 end 離開。
+            connection.send_config_set(
+                commands, config_mode_command=_CONFIG_MODE_COMMAND
+            )
         except Exception as exc:  # noqa: BLE001
             self._reraise_as_connection_error(exc, action_desc)
 

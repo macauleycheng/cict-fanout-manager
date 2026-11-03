@@ -5,15 +5,22 @@
 import 真 ``netmiko.ConnectHandler``。涵蓋：
 
   - connect 流程：以注入 factory 建連、有 secret 時呼叫 enable、顯式關 pager。
-  - read_vlans：餵暫定 show vlan fixture，驗自寫行解析為 tagged VlanMember
-    （TODO(4a) 以真機輸出取代）。
-  - build_commands：樣板組裝 == 已知輸入的樣板渲染。
-  - apply_vlan/clear_vlan：送出的指令集 == build_commands 結果。
+  - read_vlans：餵真機 ECS5550-54X 的 show vlan fixture（key-value 多行區塊 +
+    續行成員 + 'Eth1/ N(S)' token），驗 key-value 區塊 parser 解析為 tagged
+    VlanMember、既有 VLAN 集合、interface 歸一化一致。
+  - build_commands：樣板組裝 == 已知輸入的真機語法渲染（含 trunk 模式冪等與
+    'add <vlan> tagged'）。
+  - apply_vlan/clear_vlan：送出的指令集 == build_commands 結果（含 tagged）。
   - netmiko 例外：連線/逾時類例外被包成 DriverConnectionError（保留 __cause__、
     訊息不含密碼）。
 
 歷史（HISTORY）：
   - 0.4.0  FEAT-002 初版。
+  - 0.4.1  FEAT-003 4a 實機修正：show vlan fixture 改用真機 ECS5550-54X
+           key-value 區塊格式；驗 parser 的續行成員收集、(S)=tagged、interface
+           歸一化（'Eth1/ 2' → 'Eth1/2'）；build/apply/clear 改驗真機語法
+           （interface ethernet 1/<port>、switchport mode trunk 冪等、
+           allowed vlan add <vlan> tagged / remove <vlan>）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -28,9 +35,9 @@ from topo_manager.drivers.base import PortVlanChange
 from topo_manager.drivers.ec_ssh import (
     _APPLY_MEMBER_TEMPLATE,
     _CLEAR_MEMBER_TEMPLATE,
-    _CREATE_VLAN_TEMPLATE,
     _DISABLE_PAGER_TEMPLATE,
     _ENTER_INTF_TEMPLATE,
+    _TRUNK_MODE_TEMPLATE,
     EcSshDriver,
 )
 from topo_manager.errors import (
@@ -39,11 +46,33 @@ from topo_manager.errors import (
     DriverParseError,
 )
 
-# 暫定 show vlan fixture（TODO(4a)：以實機真機輸出取代）。
+# 真機 ECS5550-54X 的 show vlan 輸出樣本（FEAT-003 4a 實測格式）：key-value 多行
+# 區塊，每 VLAN 一區塊；成員列於 'Ports/Port Channels :' 行並可續行縮排；成員
+# token 形如 'Eth1/ 2(S)'（斜線後可能有對齊空白，如 'Eth1/ 2' 與 'Eth1/10'），
+# '(S)' = static/tagged 成員。Remote SPAN VLANs 區塊置於最後（此處留空）。
 _SHOW_VLAN_FIXTURE = (
-    "VLAN   Name       Ports\n"
-    "100    vlan100    Eth1/7, Eth1/8\n"
-    "200    vlan200    Eth1/9\n"
+    "VLAN ID             : 1\n"
+    "Type                : Static\n"
+    "Name                : DefaultVlan\n"
+    "Status              : Active\n"
+    "Ports/Port Channels : Eth1/ 2(S) Eth1/ 3(S) Eth1/ 4(S) Eth1/ 5(S)\n"
+    "                      Eth1/ 6(S) Eth1/ 7(S) Eth1/ 8(S) Eth1/10(S)\n"
+    "\n"
+    "VLAN ID             : 10\n"
+    "Type                : Static\n"
+    "Name                : vlan10\n"
+    "Status              : Active\n"
+    "Ports/Port Channels : Eth1/41(S)\n"
+    "\n"
+    "VLAN ID             : 4093\n"
+    "Type                : Static\n"
+    "Name                : vlan4093\n"
+    "Status              : Active\n"
+    "Ports/Port Channels : Eth1/41(S)\n"
+    "\n"
+    "Remote SPAN VLANs\n"
+    "-----------------\n"
+    "\n"
 )
 
 
@@ -75,8 +104,8 @@ class _FakeConnection:
             return self._show_vlan_output
         return ""
 
-    def send_config_set(self, commands: List[str]) -> str:
-        """紀錄送出的設定指令批。"""
+    def send_config_set(self, commands: List[str], **kwargs) -> str:
+        """紀錄送出的設定指令批（吞下 config_mode_command 等 netmiko 參數）。"""
         self.config_sets.append(list(commands))
         return ""
 
@@ -117,18 +146,41 @@ def test_connect_flow_calls_enable_with_secret() -> None:
 
 
 def test_read_vlans_parses_tagged_members() -> None:
-    """read_vlans 自寫解析 show vlan fixture 為 tagged 成員與既有 VLAN。"""
+    """read_vlans 以真機 key-value 區塊格式解析成員、既有 VLAN、interface 歸一化。"""
     conn = _FakeConnection()
     driver = _make_driver(conn)
     driver.connect()
 
     state = driver.read_vlans()
 
-    assert state.existing_vlans == frozenset({100, 200})
+    # 既有 VLAN 集合取自各 'VLAN ID :' 區塊。
+    assert state.existing_vlans == frozenset({1, 10, 4093})
     present = {(m.interface, m.vlan, m.tagged) for m in state.members}
-    assert ("Eth1/7", 100, True) in present
-    assert ("Eth1/8", 100, True) in present
-    assert ("Eth1/9", 200, True) in present
+    # VLAN 1 的續行成員與 interface 歸一化（'Eth1/ 2' → 'Eth1/2'）。
+    assert ("Eth1/2", 1, True) in present
+    assert ("Eth1/8", 1, True) in present
+    # 續行行收集的成員也須被解析到。
+    assert ("Eth1/10", 1, True) in present
+    # (S) 判為 tagged=True。
+    assert ("Eth1/41", 10, True) in present
+    assert ("Eth1/41", 4093, True) in present
+
+
+def test_read_vlans_interface_name_matches_apply_name() -> None:
+    """read-back 解析出的 interface 名與 apply 用 interface 名一致（4b 比對前提）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    driver.connect()
+
+    state = driver.read_vlans()
+
+    # apply 時用 interface_template 產生的名（如 'Eth1/41'）須能在 read-back
+    # 成員集合中以相同字串比對到（(vlan, tagged) in members 的前提）。
+    interface = driver._interface_template.format(port=41)
+    matched = {
+        (m.vlan, m.tagged) for m in state.members if m.interface == interface
+    }
+    assert (4093, True) in matched
 
 
 def test_read_vlans_parse_failure_raises() -> None:
@@ -142,7 +194,7 @@ def test_read_vlans_parse_failure_raises() -> None:
 
 
 def test_build_commands_matches_template_render() -> None:
-    """build_commands 的組裝 == 已知輸入的樣板渲染（建 VLAN 去重）。"""
+    """build_commands 的組裝 == 真機語法樣板渲染（進介面 + trunk 模式 + tagged）。"""
     conn = _FakeConnection()
     driver = _make_driver(conn)
     changes = [
@@ -159,13 +211,39 @@ def test_build_commands_matches_template_render() -> None:
     commands = driver.build_commands(changes)
 
     expected = [
-        _CREATE_VLAN_TEMPLATE.format(vlan=100),
-        _ENTER_INTF_TEMPLATE.format(interface="Eth1/7"),
-        _APPLY_MEMBER_TEMPLATE.format(interface="Eth1/7", vlan=100),
-        _ENTER_INTF_TEMPLATE.format(interface="Eth1/8"),
-        _APPLY_MEMBER_TEMPLATE.format(interface="Eth1/8", vlan=100),
+        _ENTER_INTF_TEMPLATE.format(port="7"),
+        _TRUNK_MODE_TEMPLATE,
+        _APPLY_MEMBER_TEMPLATE.format(vlan=100),
+        _ENTER_INTF_TEMPLATE.format(port="8"),
+        _TRUNK_MODE_TEMPLATE,
+        _APPLY_MEMBER_TEMPLATE.format(vlan=100),
     ]
     assert commands == expected
+    # 加成員指令必帶 'tagged' 關鍵字（實機 running-config 語法）。
+    assert "switchport allowed vlan add 100 tagged" in commands
+
+
+def test_build_commands_trunk_mode_idempotent_per_interface() -> None:
+    """同一介面在同一批中 trunk 模式只下一次（冪等去重）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    changes = [
+        PortVlanChange(
+            fanout="fanout-x", interface="Eth1/41", vlan=100,
+            action="add", topology_node="fanout-x:41",
+        ),
+        PortVlanChange(
+            fanout="fanout-x", interface="Eth1/41", vlan=200,
+            action="add", topology_node="fanout-x:41",
+        ),
+    ]
+
+    commands = driver.build_commands(changes)
+
+    # 同一介面兩筆 add，trunk 模式指令只出現一次。
+    assert commands.count(_TRUNK_MODE_TEMPLATE) == 1
+    # 進介面指令以 port 編號組裝（interface ethernet 1/41）。
+    assert _ENTER_INTF_TEMPLATE.format(port="41") in commands
 
 
 def test_apply_vlan_sends_build_commands_result() -> None:
@@ -201,8 +279,11 @@ def test_clear_vlan_sends_remove_commands() -> None:
 
     assert len(conn.config_sets) == 1
     sent = conn.config_sets[0]
-    assert _ENTER_INTF_TEMPLATE.format(interface="Eth1/7") in sent
-    assert _CLEAR_MEMBER_TEMPLATE.format(interface="Eth1/7", vlan=100) in sent
+    assert _ENTER_INTF_TEMPLATE.format(port="7") in sent
+    assert _CLEAR_MEMBER_TEMPLATE.format(vlan=100) in sent
+    # clear 不應帶 tagged、也不應下 trunk 模式（只移除成員）。
+    assert "switchport allowed vlan remove 100" in sent
+    assert _TRUNK_MODE_TEMPLATE not in sent
 
 
 class NetmikoTimeoutException(Exception):
