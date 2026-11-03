@@ -18,6 +18,9 @@
 歷史（HISTORY）：
   - 0.4.0  Phase 3 初版，建立 api_client/live_server fixtures 與 happy-path
            + 單元 + fullscale 煙測（設計 §10）。
+  - 0.4.1  Phase 3 審查：Issue 6 多 session（含多段/共用 trunk）的 access port
+           佔用/可用斷言；Issue 4 fullscale 效能斷言改為實際守門（<2s 裕度，
+           設計 §9 期望 <1s）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -44,6 +47,11 @@ from topo_manager.errors import ConfigError
 # _LiveServer 握把型別於 conftest.py 定義，供本檔與 test_api_errors.py 共用；
 # fixtures 由 pytest 依名稱自動注入，型別註解以字串前置參照避免跨模組 import）
 # ----------------------------------------------------------------------
+
+
+# fullscale GET /resources/available 的效能守門預算（秒，Issue 4）。設計 §9
+# 期望 <1s；取 2s 作 CI 裕度（避免抖動誤報）的同時仍能抓到明顯回歸。
+_FULLSCALE_AVAILABLE_BUDGET_S = 2.0
 
 
 def _read_ledger(state_path: Path) -> dict:
@@ -228,6 +236,120 @@ def test_full_cycle(live_server: _LiveServer) -> None:
     assert live_server.client.get("/sessions").json()["count"] == 0
 
 
+def test_available_multi_session_trunk_not_occupied(
+    live_server: _LiveServer,
+) -> None:
+    """多 session（含多段 trunk 路徑）下：trunk 端不被誤標佔用、access port 正確佔用（Issue 6）。
+
+    3tier 的 generator→DUT 路徑經 spine→agg→leaf 多段 trunk。兩筆走**同一 rack**
+    （共用 agg-1/leaf-1-1 的 trunk 段）的 session：
+      - 兩端 access port（generator 端 ``<gen>:<port>``、DUT 端 ``dut:port``）
+        應各自進 occupied 且 owner 為對應 session；
+      - 共用的 trunk 端節點（``spine-1:7``、``agg-1:1``、``agg-1:2``、
+        ``leaf-1-1:1``）**不得**出現在 occupied（trunk 可被多 session 共用，
+        這正是 _occupied_access_ports 扣除 trunk 端的目的）。
+    """
+    client = live_server.client
+
+    # 兩筆同 rack（leaf-1-1）的 session，路徑共用 agg-1↔leaf-1-1 trunk。
+    first = client.post(
+        "/sessions",
+        json={"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"},
+    )
+    assert first.status_code == 201
+    first_id = first.json()["session_id"]
+
+    second = client.post(
+        "/sessions",
+        json={"generator_port": "ixia-1/2", "dut_port": "dut-A2:Eth0"},
+    )
+    assert second.status_code == 201
+    second_id = second.json()["session_id"]
+
+    available = client.get("/resources/available").json()
+    occupied = available["occupied_ports"]
+
+    # 兩筆各自的兩端 access port 被正確標佔用、owner 正確。
+    assert occupied.get("ixia-1:ixia-1/1") == first_id
+    assert occupied.get("dut-A1:Eth0") == first_id
+    assert occupied.get("ixia-1:ixia-1/2") == second_id
+    assert occupied.get("dut-A2:Eth0") == second_id
+
+    # 共用的 trunk 端節點不得被誤標為佔用（可被多 session 共用）。
+    for trunk_node in ("spine-1:7", "agg-1:1", "agg-1:2", "leaf-1-1:1"):
+        assert trunk_node not in occupied, trunk_node
+
+    # 被佔用的 DUT access port 不再出現在可用清單。
+    dut_nodes = {item["node"] for item in available["available_dut_ports"]}
+    assert "dut-A1:Eth0" not in dut_nodes
+    assert "dut-A2:Eth0" not in dut_nodes
+    # 共用 trunk 端（非 generator/DUT access port）本就不在 gen/dut 可用清單中，
+    # 但未被標佔用——以 occupied 不含它們即足以證明不被誤佔（上方已斷言）。
+
+    # 另一 rack（rack-2，leaf-2-1）的 DUT 仍完全可用（未受 rack-1 佔用影響）。
+    assert "dut-B1:Eth0" in dut_nodes
+    assert "dut-B4:Eth1" in dut_nodes
+
+
+def test_available_cross_rack_sessions_occupancy(
+    live_server: _LiveServer,
+) -> None:
+    """跨 rack 多 session：各 rack 的 trunk 端互不干擾、僅自身 access port 佔用（Issue 6）。
+
+    一筆走 rack-1（agg-1/leaf-1-1）、一筆走 rack-2（agg-2/leaf-2-1）。兩條路徑
+    不共用 trunk，但同經 spine-1。驗證：各自的 access port 佔用正確、兩條路徑的
+    所有 trunk 端皆不被標佔用、且 occupied 恰為 4 個 access port（兩筆各兩端）。
+    """
+    client = live_server.client
+
+    first = client.post(
+        "/sessions",
+        json={"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"},
+    )
+    assert first.status_code == 201
+    first_id = first.json()["session_id"]
+
+    second = client.post(
+        "/sessions",
+        json={"generator_port": "trex-1/0", "dut_port": "dut-B1:Eth0"},
+    )
+    assert second.status_code == 201
+    second_id = second.json()["session_id"]
+
+    occupied = client.get("/resources/available").json()["occupied_ports"]
+
+    # access port = physical_ports − trunk 端。兩筆各自的 access port（含路徑
+    # 中間的非 trunk 端節點，如 spine 面向 generator 的 port、leaf 面向 DUT 的
+    # port）皆正確標佔用、owner 正確；occupied 恰為這兩組 access port 的聯集，
+    # 不含任何 trunk 端。
+    assert occupied == {
+        # rack-1（first）：generator 端、spine 面向 gen 的 port、leaf 面向 DUT
+        # 的 port、DUT 端。
+        "ixia-1:ixia-1/1": first_id,
+        "spine-1:1": first_id,
+        "leaf-1-1:11": first_id,
+        "dut-A1:Eth0": first_id,
+        # rack-2（second）。
+        "trex-1:trex-1/0": second_id,
+        "spine-1:3": second_id,
+        "leaf-2-1:11": second_id,
+        "dut-B1:Eth0": second_id,
+    }
+
+    # 兩條路徑各自的 trunk 端皆不被標佔用（上方 == 已排除，這裡再明示守門）。
+    for trunk_node in (
+        "spine-1:7",
+        "agg-1:1",
+        "agg-1:2",
+        "leaf-1-1:1",
+        "spine-1:8",
+        "agg-2:1",
+        "agg-2:2",
+        "leaf-2-1:1",
+    ):
+        assert trunk_node not in occupied, trunk_node
+
+
 def test_fullscale_smoke(fullscale_live_server: _LiveServer) -> None:
     """fullscale：available→POST→list→DELETE→重複 POST 觸 409（AC-15）。
 
@@ -240,10 +362,14 @@ def test_fullscale_smoke(fullscale_live_server: _LiveServer) -> None:
     available = client.get("/resources/available")
     elapsed = time.time() - start
     assert available.status_code == 200
-    # 記錄：fullscale（12 gen × 1152 tg）GET /resources/available 實測回應時間。
-    # 於本機實測約 elapsed 秒；若明顯 >1s 依設計 §9 退路改共用啟動單例（可逆、
-    # 不改 API 契約）。本測試不預先切換，僅斷言成功。
-    assert elapsed >= 0.0
+    # 效能守門（Issue 4）：fullscale（12 gen × 1152 tg）GET /resources/available
+    # 每請求重建 allocator（load_topology + 建圖 + 帳本還原）是熱點。設計 §9
+    # 門檻為 <1s；本機實測約 0.7s。此處斷言 < _FULLSCALE_AVAILABLE_BUDGET_S
+    # （2s，帶裕度避免 CI 抖動誤報），若核心日後明顯變慢，CI 會抓到回歸。
+    assert elapsed < _FULLSCALE_AVAILABLE_BUDGET_S, (
+        "fullscale GET /resources/available 耗時 {0:.3f}s 超過守門門檻 "
+        "{1:.1f}s（設計 §9 期望 <1s）".format(elapsed, _FULLSCALE_AVAILABLE_BUDGET_S)
+    )
 
     gen_port = available.json()["available_generator_ports"][0]["port"]
     dut_node = available.json()["available_dut_ports"][0]["node"]

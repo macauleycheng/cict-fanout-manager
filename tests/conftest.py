@@ -10,6 +10,9 @@
   - 0.4.0  Phase 3：新增 REST API 測試共用 fixtures（api_client TestClient、
            主執行緒 live-server 子行程 live_server / fullscale_live_server 與
            _LiveServer 握把）；供 test_api.py 與 test_api_errors.py 共用。
+  - 0.4.1  Phase 3 審查：新增 faulty_write_live_server（寫路徑注入
+           RuntimeError，Issue 3）fixture 與 _start_faulty_write_live_server
+           輔助。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -171,6 +174,98 @@ def _stop_live_server(proc: subprocess.Popen, server: _LiveServer) -> None:
 def live_server(three_tier_path: Path, tmp_path: Path):
     """3tier 主執行緒 live-server fixture（供寫入端點整合測試）。"""
     proc, server = _start_live_server(three_tier_path, tmp_path)
+    try:
+        yield server
+    finally:
+        _stop_live_server(proc, server)
+
+
+# 供 faulty-write live-server 的子行程進入點：建 app（啟動期 fail-fast 合法）、
+# 把啟動單例 allocator 的 allocate 換成注入非 TopologyError 的 RuntimeError，
+# 以 uvicorn 在子行程主執行緒跑真 HTTP（Issue 3：寫路徑非預期例外→結構化 500、
+# 鎖乾淨釋放）。以模組字串經 `python -c` 執行，避免在 fixture 行內塞大段腳本。
+_FAULTY_WRITE_SERVER_SCRIPT = (
+    "import os\n"
+    "import uvicorn\n"
+    "from topo_manager.api import create_app\n"
+    "from topo_manager.api.deps import Settings\n"
+    "settings = Settings(\n"
+    "    topology_path=os.environ['TOPO_MANAGER_TOPOLOGY'],\n"
+    "    state_path=os.environ['TOPO_MANAGER_STATE'],\n"
+    "    vlan_min=100,\n"
+    "    vlan_max=3000,\n"
+    ")\n"
+    "app = create_app(settings)\n"
+    "\n"
+    "\n"
+    "def _boom(*_args, **_kwargs):\n"
+    "    raise RuntimeError('注入的非預期寫路徑例外')\n"
+    "\n"
+    "\n"
+    "# 只換 allocate（POST 寫路徑）：驗非 TopologyError 例外在真 server 下的行為。\n"
+    "app.state.allocator.allocate = _boom\n"
+    "uvicorn.run(\n"
+    "    app,\n"
+    "    host=os.environ['TOPO_MANAGER_HOST'],\n"
+    "    port=int(os.environ['TOPO_MANAGER_PORT']),\n"
+    ")\n"
+)
+
+
+def _start_faulty_write_live_server(
+    topology_path: Path, tmp_path: Path
+) -> Tuple[subprocess.Popen, _LiveServer]:
+    """啟動「寫路徑注入 RuntimeError」的主執行緒 live-server（Issue 3）。
+
+    與 ``_start_live_server`` 同樣以子行程擁有自己的主執行緒（signal 檔鎖可用），
+    差別在進入點為 ``_FAULTY_WRITE_SERVER_SCRIPT``（把單例 allocate 換成拋
+    RuntimeError）。讀端點（如 /openapi.json、/sessions）照常，供就緒輪詢與
+    「鎖乾淨釋放」的後續驗證。
+    """
+    port = _free_port()
+    state = tmp_path / "state" / "allocations.json"
+    env = dict(os.environ)
+    env["TOPO_MANAGER_TOPOLOGY"] = str(topology_path)
+    env["TOPO_MANAGER_STATE"] = str(state)
+    env["TOPO_MANAGER_HOST"] = "127.0.0.1"
+    env["TOPO_MANAGER_PORT"] = str(port)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _FAULTY_WRITE_SERVER_SCRIPT],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    base_url = "http://127.0.0.1:{0}".format(port)
+    client = httpx.Client(base_url=base_url, timeout=10.0)
+
+    deadline = time.time() + 15.0
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            output = (
+                proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
+            )
+            raise RuntimeError("faulty live-server 啟動失敗：\n{0}".format(output))
+        try:
+            response = client.get("/openapi.json")
+            if response.status_code == 200:
+                ready = True
+                break
+        except httpx.HTTPError:
+            time.sleep(0.2)
+    if not ready:
+        proc.terminate()
+        raise RuntimeError("faulty live-server 等待就緒逾時")
+
+    return proc, _LiveServer(base_url, state, client)
+
+
+@pytest.fixture
+def faulty_write_live_server(three_tier_path: Path, tmp_path: Path):
+    """寫路徑注入 RuntimeError 的 3tier 主執行緒 live-server（Issue 3）。"""
+    proc, server = _start_faulty_write_live_server(three_tier_path, tmp_path)
     try:
         yield server
     finally:

@@ -9,6 +9,9 @@
 歷史（HISTORY）：
   - 0.4.0  Phase 3 初版，建立 status_for 映射表與三個 handler + 註冊函式
            （設計 §6.2/§6.3/§6.4/§6.5）。
+  - 0.4.1  Phase 3 審查 Issue 1：請求期拓樸漂移（讀路徑 build_allocator 重讀
+           YAML 失敗）五個環境性 TopologyError 子類映射成 503（而非 500），
+           與啟動期 fail-fast / 寫路徑吃單例的語意分離。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -30,6 +33,11 @@ from topo_manager.errors import (
     SessionNotFoundError,
     SessionStoreError,
     TopologyError,
+    TopologyFileError,
+    TopologyGraphError,
+    TopologyParseError,
+    TopologyReferenceError,
+    TopologyValidationError,
     VlanPoolExhaustedError,
 )
 
@@ -38,12 +46,26 @@ _LOGGER = logging.getLogger("topo_manager.api")
 
 # 例外類別 → HTTP 狀態碼的明確對照表（設計 §6.2）。查不到的 TopologyError
 # 子類落 500（見 status_for）。
+#
+# 「請求期拓樸漂移」→ 503（Issue 1）：讀路徑（GET /sessions、
+# GET /resources/available）每請求以 build_allocator 重讀 YAML 並建圖；啟動
+# 後若 YAML 被改壞 / 刪除 / 權限變更，load_topology / 建圖會丟下列五個環境性
+# TopologyError 子類。這類錯誤是「服務暫時不可用、使用者修檔後可重試」，語意
+# 上屬 503 而非 500（500 的 InternalError 會誤導成程式 bug）。此五類在啟動期由
+# fail-fast 攔下、寫路徑（吃啟動單例、不重讀 YAML）亦不會拋，故僅可能發生於
+# 讀路徑的請求期拓樸漂移——把它們映射成 503 不影響寫路徑的 404/409/400 語意。
 _STATUS_BY_EXC: Dict[Type[TopologyError], int] = {
     HardConflictError: 409,
     VlanPoolExhaustedError: 409,
     SessionNotFoundError: 404,
     PathLookupError: 404,
     SessionStoreError: 503,
+    # 請求期拓樸載入 / 建圖失敗（環境性、可修檔重試）→ 503（Issue 1）。
+    TopologyFileError: 503,
+    TopologyParseError: 503,
+    TopologyValidationError: 503,
+    TopologyReferenceError: 503,
+    TopologyGraphError: 503,
     ConfigError: 500,
 }
 
