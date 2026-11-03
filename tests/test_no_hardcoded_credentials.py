@@ -7,6 +7,8 @@
 
 歷史（HISTORY）：
   - 0.4.0  FEAT-001 初版。
+  - 0.4.0  FEAT-003：本掃描檔本身必然含被掃字面（``_FORBIDDEN_LITERALS``），
+           故將本檔自掃描清單排除，避免守門測試誤判自身。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -47,10 +49,15 @@ def test_no_hardcoded_live_credentials() -> None:
     """tracked .py/.toml/.json（排除 *.example.json）不含 live 憑證字面。"""
     offenders: List[str] = []
 
+    # 本掃描檔自身必然含 _FORBIDDEN_LITERALS 字面，排除以免誤判。
+    this_file = Path(__file__).resolve()
+
     for path in _tracked_files():
         if path.suffix not in _SCANNED_SUFFIXES:
             continue
         if path.name.endswith(".example.json"):
+            continue
+        if path.resolve() == this_file:
             continue
         if not path.exists():
             # tracked 但工作區暫缺（罕見）：跳過。

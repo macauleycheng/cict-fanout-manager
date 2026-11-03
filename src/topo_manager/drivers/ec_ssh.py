@@ -12,7 +12,8 @@ import，確保未安裝 netmiko 的環境仍可匯入本模組並跑單元測�
 指令樣板一律以模組常數集中管理（``_DISABLE_PAGER_TEMPLATE`` /
 ``_CREATE_VLAN_TEMPLATE`` / ``_ENTER_INTF_TEMPLATE`` / ``_APPLY_MEMBER_TEMPLATE``
 / ``_CLEAR_MEMBER_TEMPLATE``），目前為暫定值並標 ``TODO(4a)``：待實機
-（192.168.42.237）確認真實 CLI 語法後，僅需更新本區常數即可，不動邏輯。
+確認真實 CLI 語法後，僅需更新本區常數即可，不動邏輯（實機位址/帳密僅由 env
+提供，絕不寫入本檔）。
 
 netmiko 的連線/認證/逾時例外一律就地捕捉並包成 ``DriverConnectionError``
 （保留 ``__cause__``、訊息不含密碼，設計 §8、§9）。
@@ -46,7 +47,7 @@ from topo_manager.errors import (
 )
 
 # 指令樣板（模組常數，設計 §8）。TODO(4a)：以下皆為暫定值，待實機
-# （192.168.42.237 admin/admin）確認 Edgecore 真實 CLI 語法後更新，不動邏輯。
+# 確認 Edgecore 真實 CLI 語法後更新，不動邏輯（實機位址/帳密僅由 env 提供）。
 _DISABLE_PAGER_TEMPLATE = "terminal length 0"
 _CREATE_VLAN_TEMPLATE = "vlan {vlan}"
 _ENTER_INTF_TEMPLATE = "interface {interface}"

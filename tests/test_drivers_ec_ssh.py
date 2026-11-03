@@ -39,7 +39,7 @@ from topo_manager.errors import (
     DriverParseError,
 )
 
-# 暫定 show vlan fixture（TODO(4a)：以 192.168.42.237 真機輸出取代）。
+# 暫定 show vlan fixture（TODO(4a)：以實機真機輸出取代）。
 _SHOW_VLAN_FIXTURE = (
     "VLAN   Name       Ports\n"
     "100    vlan100    Eth1/7, Eth1/8\n"
