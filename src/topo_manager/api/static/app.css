@@ -1,0 +1,390 @@
+/* CICT Fanout Manager Web UI stylesheet (design §2, §3, §5).
+ *
+ * Four-panel CSS-grid layout plus SVG node/edge/tooltip/error-banner styling.
+ * Colors mirror docs/topology.html (gen/fanout-role/dut, trunk, active).
+ * No build step; served verbatim via GET /static/app.css.
+ */
+
+:root {
+    --gen: #2e7d32;
+    --fanout: #1565c0;
+    --spine: #6a1b9a;
+    --agg: #1565c0;
+    --leaf: #ef6c00;
+    --core: #6a1b9a;
+    --dut: #37474f;
+    --line: #b0bec5;
+    --active: #e53935;
+    --bg: #fafbfc;
+    --panel: #ffffff;
+    --border: #e0e0e0;
+    --text: #263238;
+    --muted: #607d8b;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    font-family: "Segoe UI", system-ui, "Microsoft JhengHei", sans-serif;
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+}
+
+h1 {
+    font-size: 18px;
+    margin: 0;
+}
+
+/* Overall grid: top bar spans full width; below it a two-column body with a
+ * detail panel spanning the bottom. */
+#app {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas:
+        "topbar topbar"
+        "topology create"
+        "detail  sessions";
+    gap: 10px;
+    padding: 10px;
+    height: 100vh;
+}
+
+#topbar {
+    grid-area: topbar;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 16px;
+}
+
+#topbar .spacer {
+    flex: 1;
+}
+
+#topo-identity {
+    font-size: 13px;
+    color: var(--muted);
+}
+
+#vlan-usage {
+    font-size: 13px;
+    color: var(--muted);
+}
+
+#topbar label {
+    font-size: 13px;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+button {
+    font: inherit;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: #f5f7fa;
+    color: var(--text);
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    background: #eceff1;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+button.primary {
+    background: var(--gen);
+    color: #fff;
+    border-color: #1b5e20;
+}
+
+button.danger {
+    background: var(--active);
+    color: #fff;
+    border-color: #b71c1c;
+}
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    overflow: auto;
+}
+
+.panel h2 {
+    font-size: 14px;
+    margin: 0 0 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+#topology-panel {
+    grid-area: topology;
+    overflow: auto;
+}
+
+#topology-svg {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+#create-panel {
+    grid-area: create;
+}
+
+#create-panel .field {
+    margin-bottom: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+#create-panel label {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+select,
+input[type="text"] {
+    font: inherit;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: #fff;
+    width: 100%;
+}
+
+#sessions-panel {
+    grid-area: sessions;
+    display: flex;
+    flex-direction: column;
+}
+
+#session-filter {
+    margin-bottom: 8px;
+}
+
+#session-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow: auto;
+}
+
+#session-list li {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+
+#session-list li:hover {
+    background: #f5f7fa;
+}
+
+#session-list li.selected {
+    border-color: var(--active);
+    background: #ffebee;
+}
+
+#session-list .sid {
+    font-weight: 600;
+}
+
+#session-list .meta {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+#detail-panel {
+    grid-area: detail;
+}
+
+#detail-content {
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+#detail-content dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+}
+
+#detail-content dt {
+    color: var(--muted);
+}
+
+#detail-content dd {
+    margin: 0;
+    word-break: break-all;
+}
+
+/* Error banner: hidden by default, shown on error with a close button. */
+#error-banner {
+    display: none;
+    background: #ffebee;
+    border: 1px solid #ef9a9a;
+    color: #b71c1c;
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    font-size: 13px;
+    align-items: center;
+    gap: 10px;
+}
+
+#error-banner.visible {
+    display: flex;
+}
+
+#error-banner .msg {
+    flex: 1;
+}
+
+#error-banner .type {
+    font-size: 11px;
+    color: var(--muted);
+}
+
+#error-banner .close {
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: #b71c1c;
+    font-size: 16px;
+    padding: 0 4px;
+}
+
+/* ---- SVG node / edge styling ---- */
+
+.node rect {
+    stroke-width: 1.5;
+}
+
+.node text.label {
+    font-size: 11px;
+    font-weight: 600;
+    fill: #fff;
+}
+
+.node text.role {
+    font-size: 9px;
+    fill: #fff;
+    opacity: 0.85;
+}
+
+.node.gen rect {
+    fill: var(--gen);
+    stroke: #1b5e20;
+}
+
+.node.dut rect {
+    fill: var(--dut);
+    stroke: #263238;
+}
+
+.node.fanout rect {
+    fill: var(--fanout);
+    stroke: #0d47a1;
+}
+
+/* Role-specific fanout colors (display only; layout never reads role). */
+.node.fanout.role-spine rect {
+    fill: var(--spine);
+    stroke: #4a148c;
+}
+
+.node.fanout.role-core rect {
+    fill: var(--core);
+    stroke: #4a148c;
+}
+
+.node.fanout.role-agg rect {
+    fill: var(--agg);
+    stroke: #0d47a1;
+}
+
+.node.fanout.role-leaf rect {
+    fill: var(--leaf);
+    stroke: #e65100;
+}
+
+.node.active rect {
+    stroke: var(--active);
+    stroke-width: 3;
+}
+
+.edge {
+    stroke: var(--line);
+    stroke-width: 1.4;
+    fill: none;
+}
+
+.edge.trunk {
+    stroke: #78909c;
+    stroke-width: 2.2;
+}
+
+.edge.active {
+    stroke: var(--active);
+    stroke-width: 3;
+}
+
+/* ---- Tooltip: absolutely-positioned HTML div, hidden by default ---- */
+
+#tooltip {
+    position: absolute;
+    display: none;
+    pointer-events: none;
+    background: #263238;
+    color: #fff;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    line-height: 1.5;
+    max-width: 280px;
+    z-index: 20;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+#tooltip.visible {
+    display: block;
+}
+
+#tooltip .port.in-session {
+    color: #ff8a80;
+    font-weight: 600;
+}
+
+.empty {
+    color: var(--muted);
+    font-style: italic;
+}

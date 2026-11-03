@@ -32,6 +32,11 @@ topo-manager-api = "topo_manager.api.server:run"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Web UI 靜態資產隨 wheel/sdist 出貨（設計 §1.5）：package-data 預設不含非 .py
+# 檔，顯式列出 api/static/* 讓非 editable 安裝也找得到 index.html/app.css/app.js。
+[tool.setuptools.package-data]
+"topo_manager.api" = ["static/*", "static/**/*"]
+
 [tool.pytest.ini_options]
 # live marker 標記需真實設備的測試；預設 addopts 以 '-m not live' 排除收集，
 # 避免無設備環境誤跑（設計 §11.2）。

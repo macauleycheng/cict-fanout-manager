@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<!--
+  CICT Fanout Manager Web UI shell (design §3).
+
+  Static shell with stable element ids that the acceptance tests assert on and
+  that app.js populates at runtime. Served verbatim via GET /. All dynamic
+  content is produced client-side by app.js calling the five JSON endpoints.
+  User-facing text is English (per design + README convention).
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CICT Fanout Manager</title>
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+    <div id="app">
+        <header id="topbar">
+            <h1>CICT Fanout Manager</h1>
+            <span id="topo-identity">Loading&hellip;</span>
+            <span id="vlan-usage">VLANs in use: &ndash;</span>
+            <span class="spacer"></span>
+            <button id="btn-refresh" type="button">Refresh</button>
+            <label>
+                <input id="chk-autorefresh" type="checkbox">
+                Auto-refresh (10s)
+            </label>
+        </header>
+
+        <section id="topology-panel" class="panel">
+            <h2>Topology</h2>
+            <svg id="topology-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+        </section>
+
+        <section id="create-panel" class="panel">
+            <h2>Create Session</h2>
+            <div class="field">
+                <label for="sel-generator">Generator port</label>
+                <select id="sel-generator">
+                    <option value="">Select a generator port&hellip;</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="sel-dut">DUT port</label>
+                <select id="sel-dut">
+                    <option value="">Select a DUT port&hellip;</option>
+                </select>
+            </div>
+            <button id="btn-allocate" class="primary" type="button" disabled>Allocate</button>
+        </section>
+
+        <section id="detail-panel" class="panel">
+            <h2>Session Detail</h2>
+            <div id="error-banner">
+                <span class="type"></span>
+                <span class="msg"></span>
+                <button class="close" type="button" aria-label="Dismiss">&times;</button>
+            </div>
+            <div id="detail-content">
+                <p class="empty">No session selected.</p>
+            </div>
+        </section>
+
+        <section id="sessions-panel" class="panel">
+            <h2>Sessions</h2>
+            <input id="session-filter" type="text" placeholder="Filter by id / VLAN / port&hellip;">
+            <ul id="session-list"></ul>
+        </section>
+    </div>
+
+    <div id="tooltip"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -12,6 +12,9 @@ settings / shared allocator / topology 存入 ``app.state`` 供 routes 取用。
 歷史（HISTORY）：
   - 0.4.0  Phase 3 初版，建立 create_app factory（fail-fast、掛 router、
            註冊 exception handlers，設計 §3、§4.3、§5.6）。
+  - 0.5.0  Web UI：於 include_router 之後呼叫 register_ui(app) 掛 /static 與
+           GET /（僅用既有五個端點、不新增後端邏輯，設計 §1）。_API_VERSION
+           維持 "0.4.0"（API 契約未變；UI 版本僅記於 HISTORY）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -25,6 +28,7 @@ from fastapi import FastAPI
 from topo_manager.api import routes
 from topo_manager.api.deps import Settings, build_allocator
 from topo_manager.api.errors import register_exception_handlers
+from topo_manager.api.ui import register_ui
 from topo_manager.loader import load_topology
 
 # app metadata（設計 §5.6）。
@@ -74,6 +78,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.allocator = allocator
 
     app.include_router(routes.router)
+    # Web UI 靜態服務：於 include_router 之後掛 /static 與 GET /（設計 §1.1/§1.4）。
+    # register_ui 純靜態、不碰 app.state / allocator / topology，不參與 fail-fast。
+    register_ui(app)
     register_exception_handlers(app)
 
     return app
