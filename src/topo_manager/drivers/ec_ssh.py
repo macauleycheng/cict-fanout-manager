@@ -54,7 +54,19 @@ netmiko 的連線/認證/逾時例外一律就地捕捉並包成 ``DriverConnect
            經唯一入口 ``_parse_dot1q_tunnel_output``，不自寫 status 正則）；
            ``read_vlans`` 併讀 ``show vlan`` + ``show dot1q-tunnel`` 併成一個
            ``VlanState``；``clear_vlan`` 重建變更時補帶 ``role``。per-port Mode
-           正則依本次 live 擷取真機樣本定稿。
+           正則初版（實作時無法連真機，格式為臆測）。
+  - 0.5.1  Phase 4 QinQ live 修正（finding #1）：實機 ECS5550-54X
+           ``show dot1q-tunnel`` 的 per-port 表格 port token 實為 'Eth 1/ 1'
+           （'Eth' 後有空格、斜線後個位數前有對齊空格，兩位數則無），非臆測的
+           'Eth1/41'。修正 ``_TUNNEL_PORT_MODE_RE`` 於 'Eth' 後加入空白量詞以
+           容忍該空白（斜線後既有空白量詞已足夠）；歸一化邏輯不變仍能把
+           'Eth 1/ 1' 與 show vlan 的 'Eth1/ 2(S)' 對齊成同一 'Eth1/N'。單元
+           fixture 改用真機實擷格式。另修正 ``_TUNNEL_NORMAL_TEMPLATE``：臆測的
+           'switchport dot1q-tunnel mode normal' 於真機回
+           '% Invalid input detected'，正確還原字面為
+           'no switchport dot1q-tunnel mode'。以真機 QinQ 邊緣+互聯 live 驗證
+           通過（邊緣 Eth1/42、互聯 Eth1/41，VLAN 3999，測後 read-back 確認還原
+           為 Normal、無 VLAN 3999 殘留）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -113,7 +125,10 @@ _TUNNEL_UPLINK_TEMPLATE = "switchport dot1q-tunnel mode uplink"
 # 邊緣類清除（僅本次 live 測試臨界清理用，非產品 release 行為；見決策 7）。
 # 清除式風險尤高（參照 #11 的更正前例），live 須以 read-back 驗證真的還原。
 _NO_NATIVE_VLAN_TEMPLATE = "no switchport native vlan"
-_TUNNEL_NORMAL_TEMPLATE = "switchport dot1q-tunnel mode normal"
+# 還原 tunnel 模式為 Normal：實機 ECS5550-54X 不接受臆測的 'switchport
+# dot1q-tunnel mode normal'（回 '% Invalid input detected'），正確字面為
+# 'no switchport dot1q-tunnel mode'（live 實測確認，finding #1）。
+_TUNNEL_NORMAL_TEMPLATE = "no switchport dot1q-tunnel mode"
 # show 指令常數（集中管理，明確不帶 pipe filter，FR-2.4/AC-7）。
 _SHOW_DOT1Q_TUNNEL = "show dot1q-tunnel"
 
@@ -137,11 +152,14 @@ _INTERFACE_PORT_RE = re.compile(r"Eth\d+/\s*(\d+)")
 _TUNNEL_STATUS_RE = re.compile(
     r"802\.1Q\s+Tunnel\s+Status\s*:\s*(Enabled|Disabled)", re.IGNORECASE
 )
-# per-port Mode 行（依本次 live 擷取真機 ECS5550-54X 'show dot1q-tunnel' 樣本
-# 定稿，finding #1）：每行形如 'Eth1/41    Uplink'（interface token
-# 'Eth<chassis>/<port>' 後接空白再接 Mode 欄位 Uplink/Access/Normal）。
+# per-port Mode 行（依本次 live 實機 ECS5550-54X 'show dot1q-tunnel' 擷取定稿，
+# finding #1）：真機表格每行形如 'Eth 1/ 1 Uplink Disabled'——'Eth' 與機箱編號
+# 間有空格、斜線後個位數前也可能有對齊空格（如 'Eth 1/ 1' vs 'Eth 1/11'），其後
+# 接 Mode 欄位 Uplink/Access/Normal 再接 Priority Mapping 欄。故 'Eth' 後、斜線
+# 後皆以 ``\s*`` 容忍對齊空白。歸一化後（_normalize_interface）與 apply 名、
+# show vlan 成員名（'Eth1/ 2(S)' → 'Eth1/2'）對齊，使 read-back 比對成立。
 _TUNNEL_PORT_MODE_RE = re.compile(
-    r"^\s*Eth(\d+)/\s*(\d+)\s+(Uplink|Access|Normal)\b", re.IGNORECASE
+    r"^\s*Eth\s*(\d+)/\s*(\d+)\s+(Uplink|Access|Normal)\b", re.IGNORECASE
 )
 
 
@@ -586,9 +604,12 @@ class EcSshDriver(FanoutDriver):
             dot1q-tunnel mode uplink``（每介面只下一次，冪等去重）。
           - EDGE add（邊緣）：進介面 → ``switchport mode access`` → ``switchport
             native vlan <vlan>`` → ``switchport dot1q-tunnel mode access``。
-          - UPLINK remove：進介面 → ``switchport allowed vlan remove <vlan>``。
-          - EDGE remove：進介面 → ``no switchport native vlan`` → ``switchport
-            dot1q-tunnel mode normal``（僅本次 live 測試臨界清理用，決策 7）。
+          - UPLINK remove：進介面 → ``switchport allowed vlan remove <vlan>`` →
+            ``no switchport dot1q-tunnel mode``（還原 Normal，每介面只下一次，
+            冪等去重；僅本次 live 測試臨界清理用，決策 7）。
+          - EDGE remove：進介面 → ``no switchport native vlan`` → ``no
+            switchport dot1q-tunnel mode``（還原為 Normal；僅本次 live 測試臨界
+            清理用，決策 7）。
 
         trunk 與 uplink 模式於同一批中對同一介面各只下一次（冪等去重，避免同
         介面多 VLAN 重複下模式指令；設備端重下亦為 no-op）。
@@ -607,6 +628,8 @@ class EcSshDriver(FanoutDriver):
         # 本批中已下過 trunk / uplink 模式的介面（冪等去重，避免重複下發）。
         trunked_interfaces: Set[str] = set()
         uplinked_interfaces: Set[str] = set()
+        # 本批中已下過 tunnel 模式還原（UPLINK remove）的介面（冪等去重）。
+        normalized_tunnel_interfaces: Set[str] = set()
 
         for change in changes:
             port = self._port_from_interface(change.interface)
@@ -635,10 +658,15 @@ class EcSshDriver(FanoutDriver):
                 commands.append(_NO_NATIVE_VLAN_TEMPLATE)
                 commands.append(_TUNNEL_NORMAL_TEMPLATE)
             else:
-                # UPLINK remove：移除 tagged 成員。
+                # UPLINK remove：移除 tagged 成員，並把 tunnel 模式自 uplink 還原
+                # 為 Normal（live 測試臨界清理；真機 'no switchport dot1q-tunnel
+                # mode'，決策 7）。tunnel 模式還原每介面只下一次（冪等去重）。
                 commands.append(
                     _CLEAR_MEMBER_TEMPLATE.format(vlan=change.vlan)
                 )
+                if change.interface not in normalized_tunnel_interfaces:
+                    commands.append(_TUNNEL_NORMAL_TEMPLATE)
+                    normalized_tunnel_interfaces.add(change.interface)
 
         return commands
 

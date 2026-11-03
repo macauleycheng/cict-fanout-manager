@@ -39,9 +39,16 @@ read-back（確認已還原、VLAN 3999 成員消失）。整段寫入/驗證/�
            全域 ``setup_global_tunnel(apply=True)`` + ``read_tunnel_status`` 確認
            Enabled（冪等）；邊緣 port（TOPO_FANOUT_EDGE_PORT）native vlan 3999 +
            dot1q-tunnel mode access 寫入→read-back Mode=Access→try/finally 以
-           EDGE remove（no native vlan + mode normal）還原並 read-back；互聯 port
-           加驗 dot1q-tunnel mode uplink。只動 VLAN 3999 與測試 port，絕不動既有
-           VLAN 1/2/3/4/10/20/4093 與 Eth1/1/Eth1/11。缺 env 一律 skip。
+           EDGE remove（no native vlan + no dot1q-tunnel mode 還原 Normal）還原
+           並 read-back；互聯 port 加驗 dot1q-tunnel mode uplink 並以 UPLINK
+           remove + no dot1q-tunnel mode 還原、read-back 確認回 Normal。finally
+           另刪自動建立的 VLAN 3999 定義（vlan database / no vlan 3999），確保
+           測後完全無殘留。只動 VLAN 3999 與測試 port，絕不動既有 VLAN
+           1/2/3/4/10/20/4093 與 Eth1/1/Eth1/11。缺 env 一律 skip。
+  - 0.5.1  live 還原指令修正（finding #1）：真機 ECS5550-54X 不接受
+           'switchport dot1q-tunnel mode normal'（回 '% Invalid input
+           detected'），tunnel 模式還原正確字面為 'no switchport dot1q-tunnel
+           mode'；VLAN 刪除須於 'vlan database' 內 'no vlan <id>'。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -184,6 +191,41 @@ def _members_for_interface(state: VlanState, interface: str) -> set:
     }
 
 
+# 刪除保留測試 VLAN 定義的指令序列（實機 ECS5550-54X：於 'vlan database' 內
+# 'no vlan <id>'；live 實測確認，'no vlan <id>' 於全域設定模式回
+# '% Invalid input detected'）。apply_vlan 會讓設備自動建立該 VLAN，clear_vlan
+# 僅移除 port 成員/模式而不刪 VLAN 定義，故 live 測試於 finally 另行刪除，確保
+# 測後設備完全無 VLAN 3999 殘留（§11.2、完成驗證標準）。
+_DELETE_RESERVED_VLAN_COMMANDS = [
+    "vlan database",
+    "no vlan {0}".format(_RESERVED_TEST_VLAN),
+]
+
+
+def _delete_reserved_vlan(driver: EcSshDriver) -> None:
+    """刪除保留測試 VLAN 3999 的定義（best-effort 清理；絕不拋出，測試輔助）。
+
+    供 live 測試 finally 區塊呼叫：即使刪除失敗（韌體差異）也不掩蓋臨界區的
+    原始斷言失敗。經 driver 既有的 ``_send_config`` 下發（與單元測試一致地使用
+    driver 內部方法），不擴充對外 API。
+
+    INPUT：
+      - driver：已連線的 ``EcSshDriver``。
+
+    OUTPUT：無（於設備上刪除 VLAN 定義）。
+
+    RETURN：None。
+
+    例外：不拋出（best-effort）。
+    """
+    try:
+        driver._send_config(
+            list(_DELETE_RESERVED_VLAN_COMMANDS), "刪除保留測試 VLAN"
+        )
+    except Exception:  # noqa: BLE001 — 清理 best-effort，不掩蓋臨界區例外。
+        pass
+
+
 def test_live_readonly_probe_and_capture(
     live_driver: EcSshDriver, tmp_path: Path
 ) -> None:
@@ -279,9 +321,11 @@ def test_live_apply_and_rollback_vlan_3999(
                 True,
             ) in _members_for_interface(after_apply, interface)
         finally:
-            # 無論斷言成敗，強制清除還原（設計 §11.2）。
+            # 無論斷言成敗，強制清除還原（設計 §11.2）：先移除 port 成員，再刪
+            # 自動建立的 VLAN 3999 定義，確保設備完全無殘留。
             if applied:
                 driver.clear_vlan([change])
+                _delete_reserved_vlan(driver)
 
         # read-back：確認 VLAN 3999 成員已自該 interface 還原消失。
         after_clear = driver.read_vlans()
@@ -403,8 +447,11 @@ def test_live_edge_port_native_vlan_and_tunnel_access(
             after_apply = driver.read_vlans()
             assert (interface, "Access") in after_apply.tunnel_modes
         finally:
+            # EDGE remove（no native vlan + no dot1q-tunnel mode）還原 port，
+            # 再刪自動建立的 VLAN 3999 定義，確保無殘留（決策 7、§11.2）。
             if applied:
                 driver.clear_vlan([edge_change])
+                _delete_reserved_vlan(driver)
 
         # read-back：確認 tunnel mode 已還原（不再是 Access）。
         after_clear = driver.read_vlans()
@@ -456,5 +503,18 @@ def test_live_uplink_port_tunnel_uplink(
             after_apply = driver.read_vlans()
             assert (interface, "Uplink") in after_apply.tunnel_modes
         finally:
+            # 無論斷言成敗，強制還原：UPLINK remove（allowed vlan remove 3999
+            # + no dot1q-tunnel mode 還原 Normal），再刪自動建立的 VLAN 3999
+            # 定義，確保不在設備留痕（決策 7、§11.2）。
             if applied:
                 driver.clear_vlan([uplink_change])
+                _delete_reserved_vlan(driver)
+
+        # read-back：確認 tunnel mode 已還原（不再是 Uplink）、VLAN 3999 tagged
+        # 成員已自該 interface 消失。
+        after_clear = driver.read_vlans()
+        assert (interface, "Uplink") not in after_clear.tunnel_modes
+        assert (
+            _RESERVED_TEST_VLAN,
+            True,
+        ) not in _members_for_interface(after_clear, interface)

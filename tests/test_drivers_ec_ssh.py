@@ -83,18 +83,24 @@ _SHOW_VLAN_FIXTURE = (
     "\n"
 )
 
-# 真機 ECS5550-54X 的 'show dot1q-tunnel' 輸出樣本（本次 live 擷取定稿，
-# finding #1）：含全域 802.1Q Tunnel Status 行與 per-port Mode 表（每行
-# 'Eth1/<port>  <Mode>'，Mode ∈ Uplink/Access/Normal）。interface token 經
-# _normalize_interface 歸一化後與 apply 名一致（'Eth1/41' 等）。
+# 真機 ECS5550-54X 的 'show dot1q-tunnel' 輸出樣本（本次 live 實機擷取定稿，
+# finding #1）：含全域 '802.1Q Tunnel Status : Enabled' 行、'802.1Q Tunnel TPID'
+# 行與 per-port Mode 表。表頭為 'Port Mode Priority Mapping'，每行形如
+# 'Eth 1/ 1 Uplink Disabled'——port token 是 'Eth 1/ 1'（'Eth' 後有空格、斜線後
+# 個位數前有對齊空格），兩位數則為 'Eth 1/11'（斜線後無空格）。Mode 欄 ∈
+# Uplink/Access/Normal。interface token 經 _normalize_interface 歸一化後與 apply
+# 名一致（'Eth 1/ 1' → 'Eth1/1'、'Eth 1/41' → 'Eth1/41'）。
 _SAMPLE_SHOW_DOT1Q_TUNNEL = (
     "802.1Q Tunnel Status : Enabled\n"
+    "802.1Q Tunnel TPID   : 8100 (Hex)\n"
     "\n"
-    "Interface   Mode\n"
-    "----------- --------\n"
-    "Eth1/41     Uplink\n"
-    "Eth1/42     Access\n"
-    "Eth1/1      Normal\n"
+    "Port     Mode   Priority Mapping \n"
+    "-------- ------ ---------------- \n"
+    "Eth 1/ 1 Uplink Disabled         \n"
+    "Eth 1/ 2 Normal Disabled         \n"
+    "Eth 1/11 Access Disabled         \n"
+    "Eth 1/41 Normal Disabled         \n"
+    "Eth 1/42 Access Disabled         \n"
 )
 
 # status=Disabled 樣本（驗 read_tunnel_status 解析 Disabled→False）。
@@ -435,6 +441,41 @@ def test_build_commands_uplink_multi_vlan_trunk_uplink_once() -> None:
     assert _APPLY_MEMBER_TEMPLATE.format(vlan=200) in commands
 
 
+def test_build_commands_uplink_remove_restores_tunnel_normal() -> None:
+    """UPLINK remove 走 allowed vlan remove + no dot1q-tunnel mode（還原 Normal）。
+
+    live 實測：互聯 port 清理須把 tunnel 模式自 uplink 還原為 Normal，真機正確
+    字面為 'no switchport dot1q-tunnel mode'（決策 7、finding #1）。
+    """
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    commands = driver.build_commands(
+        [_uplink_change("Eth1/41", 3999, action="remove")]
+    )
+
+    assert commands == [
+        _ENTER_INTF_TEMPLATE.format(port="41"),
+        _CLEAR_MEMBER_TEMPLATE.format(vlan=3999),
+        _TUNNEL_NORMAL_TEMPLATE,
+    ]
+
+
+def test_build_commands_uplink_remove_tunnel_normal_once() -> None:
+    """UPLINK remove 同介面多 VLAN：tunnel 模式還原只下一次（冪等去重）。"""
+    conn = _FakeConnection()
+    driver = _make_driver(conn)
+    commands = driver.build_commands(
+        [
+            _uplink_change("Eth1/41", 100, action="remove"),
+            _uplink_change("Eth1/41", 200, action="remove"),
+        ]
+    )
+
+    assert commands.count(_TUNNEL_NORMAL_TEMPLATE) == 1
+    assert _CLEAR_MEMBER_TEMPLATE.format(vlan=100) in commands
+    assert _CLEAR_MEMBER_TEMPLATE.format(vlan=200) in commands
+
+
 def test_build_commands_edge_remove_sequence() -> None:
     """EDGE remove 走 no native vlan + mode normal（測試臨界清理，決策 7）。"""
     conn = _FakeConnection()
@@ -533,9 +574,14 @@ def test_read_vlans_parses_tunnel_modes_and_status() -> None:
     state = driver.read_vlans()
 
     assert state.tunnel_status is True
-    assert ("Eth1/41", "Uplink") in state.tunnel_modes
+    # 真機樣本：'Eth 1/ 1'=Uplink（個位數斜線後有對齊空白）、'Eth 1/11'=Access
+    # （兩位數斜線後無空白）、'Eth 1/41'=Normal。皆經正則容忍 'Eth' 後與斜線後
+    # 空白並歸一化後與 apply 名對齊。
+    assert ("Eth1/1", "Uplink") in state.tunnel_modes
+    assert ("Eth1/2", "Normal") in state.tunnel_modes
+    assert ("Eth1/11", "Access") in state.tunnel_modes
+    assert ("Eth1/41", "Normal") in state.tunnel_modes
     assert ("Eth1/42", "Access") in state.tunnel_modes
-    assert ("Eth1/1", "Normal") in state.tunnel_modes
     # interface token 經 _normalize_interface 與 apply 名一致。
     assert driver._normalize_interface("1", "42") == "Eth1/42"
 
