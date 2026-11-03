@@ -1,80 +1,192 @@
-# topo-manager（拓樸管理工具）
+# topo-manager (Topology Manager)
 
-拓樸管理 CLI 工具。讀取描述打流環境的拓樸 YAML（generator、fanout、rack/DUT
-與實體連線），驗證其正確性後建成有向多層圖，印出摘要，查詢任一 generator port
-到任一 DUT port 的實體路徑，並管理「generator→DUT」的 session 分配（含全域唯一
-VLAN 與 JSON 持久化）。
+`topo-manager` models a packet-test (traffic-generation) lab end to end and
+drives the fanout switches that stitch it together. From a single topology YAML
+describing your traffic generators, fanout switches, racks/DUTs, and the
+physical cabling between them, the tool will:
 
-Phase 1 聚焦「載入 → 驗證 → 建圖 → 摘要 / 路徑查找」；Phase 2 在其上加入 session
-分配引擎（硬衝突偵測、全域唯一 VLAN、斷電可還原的 JSON ledger）並把 CLI 重構成
-子命令。
+- **Validate** the topology and build a directed, multi-tier graph.
+- **Inspect** it: print a human-readable summary and resolve the physical path
+  from any generator port to any DUT traffic port.
+- **Allocate sessions**: reserve a `generator -> DUT` path with a globally
+  unique VLAN and persist it to a crash-safe JSON ledger.
+- **Push VLAN config** to real fanout switches over SSH, isolating each session
+  with a QinQ / 802.1Q `dot1q-tunnel` outer S-VLAN.
+- **Expose everything over a REST API** so an external system (such as the
+  ATLAS integration) can query resources and request/release sessions via HTTP.
 
-## 安裝
+The same model and algorithms handle two-tier, three-tier, and larger fabrics
+with no code changes — adding a tier only means describing one more layer of
+links in the YAML.
 
-需 Python 3.8+。於專案根目錄以可編輯模式安裝（含測試相依）：
+---
+
+## Installation
+
+Requires **Python 3.8+**. Install in editable mode from the project root
+(including the test extras):
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-相依：`pydantic`（2.5~2.10）、`networkx`（3.1，Python 3.8 可用的最高版）、
-`PyYAML`、`fastapi`（0.110.x，Phase 3 REST API）、`uvicorn`（0.23~0.33，ASGI
-server）；測試用 `pytest` 與 `httpx`（REST 測試）。
+Core dependencies:
 
-## 執行
+- `pydantic` (2.5–2.10) — data models and validation
+- `networkx` (3.1, the highest version still supporting Python 3.8) — graph
+- `PyYAML` — topology YAML parsing
+- `fastapi` (0.110.x) — REST API layer
+- `uvicorn` (0.23–0.33) — ASGI server for the REST API
 
-CLI 採「子命令（subcommand）」介面，每個子命令都吃一個位置參數 `<topology.yaml>`：
+The `[dev]` extra adds `pytest` and `httpx` (the latter is used by the
+Starlette test client in the REST API tests).
+
+Pushing VLAN config to real switches needs the optional **drivers** extra,
+which adds `netmiko` for SSH. `netmiko` is imported lazily — only when a driver
+actually opens a connection — so the pure-logic, config, and CLI paths work
+without it installed:
 
 ```bash
-python -m topo_manager <command> <topology.yaml> [選項]
+pip install -e ".[dev,drivers]"
 ```
 
-| 子命令 | 用途 | 主要選項 |
+Two console scripts are installed:
+
+- `topo-manager` — the CLI (equivalent to `python -m topo_manager`)
+- `topo-manager-api` — launches the REST API server
+
+---
+
+## CLI overview
+
+The CLI uses a subcommand interface. Most subcommands take a single positional
+argument, `<topology.yaml>`:
+
+```bash
+python -m topo_manager <command> <topology.yaml> [options]
+```
+
+| Command | Purpose | Key options |
 | --- | --- | --- |
-| `summary` | 載入拓樸並印人類可讀摘要 | （無） |
-| `path` | 印一條 generator→DUT 實體路徑 | `--from`、`--to`（須成對） |
-| `allocate` | 分配一筆 session（含 VLAN 與路徑）並持久化 | `--from`、`--to`、`--state`、`--vlan-min`、`--vlan-max` |
-| `release` | 釋放一筆既有 session | `--session`、`--state`、`--vlan-min`、`--vlan-max` |
-| `list` | 列出目前所有 active session（或 `--raw` 唯讀 dump） | `--state`、`--raw`、`--vlan-min`、`--vlan-max`；`<topology.yaml>` 在 `--raw` 時可省略 |
+| `summary` | Load a topology and print a human-readable summary | (none) |
+| `path` | Print one generator->DUT physical path | `--from`, `--to` |
+| `allocate` | Allocate a session (VLAN + path) and persist it | `--from`, `--to`, `--state`, `--vlan-min`, `--vlan-max` |
+| `release` | Release an existing session | `--session`, `--state`, `--vlan-min`, `--vlan-max` |
+| `list` | List active sessions (or `--raw` read-only dump) | `--state`, `--raw`, `--vlan-min`, `--vlan-max` |
+| `plan` | Compute the fanout push plan (never connects) | `--session` or `--from`/`--to`, `--credentials`, `--fanout` |
+| `probe` | Read-only connect to a fanout, print `show version`/`show vlan` | `--credentials`, `--fanout` |
+| `apply` | Push a session to the fanout(s) (dry-run unless `--apply`) | `--session`, `--credentials`, `--fanout`, `--apply` |
+| `verify` | Read back and verify a session is deployed; `--apply` re-pushes gaps | `--session`, `--credentials`, `--fanout`, `--apply` |
+| `setup` | Push the global `dot1q-tunnel` master switch (dry-run unless `--apply`) | `--credentials`, `--fanout`, `--apply` |
 
-選項說明：
+Common option reference:
 
-- `--from GEN_PORT`：generator 端 port，可裸名（如 `ixia-1/1`）或 `dev:port`。
-- `--to DUT_PORT`：DUT 端點，**一律 `dev:port` 形式**（如 `dut-A1:Eth0`）；
-  因 tg_port 名稱會跨 DUT 重複，裸名無法唯一指定。`path` / `allocate` 兩者皆須提供。
-- `--session SESSION_ID`：`release` 欲釋放的 session 識別碼（如 `s-0001`）。
-- `--state STATE_JSON`：session ledger 狀態檔路徑，預設
-  `.topo-state/allocations.json`（相對於**當前工作目錄**）。跨行程一致性需使用
-  同一 cwd，或一致地以 `--state` 明確指定同一狀態檔。
-- `--vlan-min VLAN_MIN` / `--vlan-max VLAN_MAX`：VLAN pool 端點（預設
-  `100`/`3000`），供 `allocate`/`release`/`list` 共用。範圍須落在 802.1Q 可用
-  區間 `2..4094`（排除保留的 0/1/4095）；非法範圍（如 `--vlan-max 9999`）會被
-  明確拒絕、以非零 exit code 結束、不冒 traceback。
-- `--raw`（僅 `list`）：唯讀 dump ledger 的原始 JSON，**繞過拓樸與還原檢查**。
-  此模式完全不讀取 `topology.yaml`（可省略該位置參數），因此即使帳本版本不符、
-  內容不一致，或拓樸 YAML 缺失/損壞，仍能原樣檢視帳本以便診斷修復。
+- `--from GEN_PORT` — the generator-side port, either a bare name (e.g.
+  `ixia-1/1`) or `dev:port`.
+- `--to DUT_PORT` — the DUT endpoint, **always `dev:port`** (e.g.
+  `dut-A1:Eth0`). Because `tg_port` names repeat across DUTs, a bare name cannot
+  identify it uniquely. Required for `path` / `allocate`.
+- `--session SESSION_ID` — the session identifier (e.g. `s-0001`).
+- `--state STATE_JSON` — path to the session ledger, default
+  `.topo-state/allocations.json` (relative to the **current working
+  directory**). Cross-process consistency requires the same cwd, or passing
+  `--state` consistently to the same file.
+- `--vlan-min` / `--vlan-max` — VLAN pool bounds (default `100`/`3000`), shared
+  by `allocate`/`release`/`list` and the deployment commands. The range must
+  lie within the usable 802.1Q band `2..4094` (reserved 0/1/4095 excluded); an
+  illegal range (e.g. `--vlan-max 9999`) is rejected cleanly with a non-zero
+  exit code and no traceback.
+- `--raw` (`list` only) — read-only dump of the raw ledger JSON, **bypassing**
+  topology and restore checks. See [Inspecting a broken
+  ledger](#inspecting-a-broken-ledger-list---raw).
+- `--credentials` / `--fanout` / `--apply` — fanout connection options, covered
+  in [Pushing VLAN config to fanout
+  switches](#pushing-vlan-config-to-fanout-switches).
 
-載入、路徑查找或分配失敗時，會在 stderr 印清楚的錯誤訊息並以非零 exit code
-結束（不會冒出 Python traceback）。這包含 `--state` 指向**不可建立/不可讀/唯讀/
-磁碟滿**等 I/O 失敗——一律以單一錯誤區塊回報、不冒 traceback。
+When loading, path lookup, or allocation fails, the CLI prints a single clear
+error line to stderr and exits non-zero (no Python traceback). This includes
+I/O failures where `--state` points to a path that cannot be created/read, is
+read-only, or the disk is full — all reported as a single error block.
 
-### 舊介面對照（Phase 1 → Phase 2）
+---
 
-Phase 1 的扁平介面 `python -m topo_manager <yaml> [--from --to]` 已改為子命令：
+## Topology YAML
 
-| Phase 1（舊） | Phase 2（新） |
-| --- | --- |
-| `python -m topo_manager <yaml>` | `python -m topo_manager summary <yaml>` |
-| `python -m topo_manager <yaml> --from A --to B` | `python -m topo_manager path <yaml> --from A --to B` |
+The topology YAML describes the lab. Top-level keys are `version`, `site`, and
+the four entity lists `generators`, `fanouts`, `racks`, and `links`.
 
-### 兩層範例（Core → Leaf → DUT）
+- **generators** — each has a `name`, a `type` (e.g. `ixia`, `trex`), and a
+  list of `ports`.
+- **fanouts** — each has a `name`, a `role` label (e.g. `core`, `spine`, `agg`,
+  `leaf`), and a `port_count`.
+- **racks** — each has a `name` and a list of `duts`; each DUT has a `name`, a
+  `model`, and its `tg_ports` (traffic-generation ports).
+- **links** — each link connects endpoint `a` to endpoint `b`, where each
+  endpoint is `{dev, port}`. **Only connected ports are listed.** Any port not
+  appearing in `links` is treated as an *edge port* (see the QinQ section
+  below).
+
+```yaml
+version: 1
+site: lab-a
+
+generators:
+  - name: ixia-1
+    type: ixia
+    ports: [ixia-1/1, ixia-1/2]
+
+fanouts:
+  - name: core-1
+    role: core
+    port_count: 24
+  - name: leaf-1-1
+    role: leaf
+    port_count: 24
+
+racks:
+  - name: rack-1
+    duts:
+      - name: dut-A1
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+
+links:
+  - a: {dev: ixia-1, port: ixia-1/1}
+    b: {dev: core-1, port: 1}
+  - a: {dev: leaf-1-1, port: 1}
+    b: {dev: core-1, port: 7}
+  - a: {dev: dut-A1, port: Eth0}
+    b: {dev: leaf-1-1, port: 11}
+```
+
+Three ready-to-use examples ship in `examples/`:
+
+- `topology-2tier.yaml` — a small, human-readable Core -> Leaf -> DUT fabric
+  (2 racks x 4 DUTs x 2 tg_ports = 8 DUTs / 16 tg_ports).
+- `topology-3tier.yaml` — the same rack/DUT block, but the two-tier `core` is
+  split into `spine + agg` (Spine -> Agg -> Leaf -> DUT). The model and
+  algorithms are unchanged.
+- `topology-fullscale.yaml` — a full-scale three-tier fabric
+  (6 racks x 24 DUTs x 8 tg_ports), generated by `examples/gen_fullscale.py`
+  and checked in. Do not hand-edit it; re-running the script produces
+  byte-equivalent output:
+
+  ```bash
+  python examples/gen_fullscale.py
+  ```
+
+---
+
+## Inspecting a topology
+
+### Summary and path (two-tier)
 
 ```bash
 python -m topo_manager summary examples/topology-2tier.yaml
 python -m topo_manager path examples/topology-2tier.yaml --from ixia-1/1 --to dut-A1:Eth0
 ```
 
-實際輸出：
+Actual output:
 
 ```
 拓樸摘要：examples/topology-2tier.yaml（site=lab-a）
@@ -87,14 +199,14 @@ python -m topo_manager path examples/topology-2tier.yaml --from ixia-1/1 --to du
   ixia-1:ixia-1/1 → core-1:1 → core-1:7 → leaf-1-1:1 → leaf-1-1:11 → dut-A1:Eth0
 ```
 
-### 三層範例（Spine → Agg → Leaf → DUT）
+### Summary and path (three-tier)
 
 ```bash
 python -m topo_manager summary examples/topology-3tier.yaml
 python -m topo_manager path examples/topology-3tier.yaml --from ixia-1/1 --to dut-A1:Eth0
 ```
 
-實際輸出：
+Actual output:
 
 ```
 拓樸摘要：examples/topology-3tier.yaml（site=lab-a）
@@ -107,41 +219,38 @@ python -m topo_manager path examples/topology-3tier.yaml --from ixia-1/1 --to du
   ixia-1:ixia-1/1 → spine-1:1 → spine-1:7 → agg-1:1 → agg-1:2 → leaf-1-1:1 → leaf-1-1:11 → dut-A1:Eth0
 ```
 
-兩份範例共用完全相同的 rack/DUT 區塊；三層只是把兩層的 `core` 拆成
-`spine + agg`，模型與演算法完全不變。
+The summary header and labels are emitted in the tool's native locale; the
+numbers and the path are the parts you read.
 
-### 滿規模三層範例（6 rack × 24 DUT × 8 tg_port）
+---
 
-`examples/topology-fullscale.yaml` 由 `examples/gen_fullscale.py` 產生並 check-in
-（勿手動編輯；重跑該腳本會得到位元組等價的輸出）：
+## Session allocation
 
-```bash
-python examples/gen_fullscale.py
-```
+A **session** reserves one physical generator->DUT path and assigns it a
+globally unique VLAN. `allocate` builds the session along the shortest path,
+picks the VLAN, and writes the result to the JSON ledger named by `--state`
+(default `.topo-state/allocations.json`). `list` reads the same ledger;
+`release` frees a named session.
 
-## session 分配（Phase 2）
-
-`allocate` 依最短路徑建立一筆 session，挑一個全域唯一的 VLAN，並把狀態寫到
-`--state` 指定的 JSON ledger（預設 `.topo-state/allocations.json`）。`list` 讀同一
-ledger 列出現有 session，`release` 釋放指定 session。硬衝突（同一 access port
-被兩筆 session 佔用）會被擋下並列出擁有者；共用 trunk 的多筆 session 合法，各自
-使用不同 VLAN。
+A **hard conflict** (the same access port claimed by two sessions) is rejected
+and the owners are listed. Multiple sessions sharing a trunk are legal — each
+uses a different VLAN.
 
 ```bash
-# 分配一筆 session（印出 session_id、VLAN、路徑與 trunk 段）
+# Allocate a session (prints session_id, VLAN, path, and trunk segments)
 python -m topo_manager allocate examples/topology-3tier.yaml \
     --from ixia-1/1 --to dut-A1:Eth0 --state .topo-state/allocations.json
 
-# 列出目前所有 active session（讀同一狀態檔）
+# List all active sessions (reads the same state file)
 python -m topo_manager list examples/topology-3tier.yaml \
     --state .topo-state/allocations.json
 
-# 釋放指定 session
+# Release a named session
 python -m topo_manager release examples/topology-3tier.yaml \
     --session s-0001 --state .topo-state/allocations.json
 ```
 
-`allocate` 實際輸出：
+Actual `allocate` output:
 
 ```
 已分配：
@@ -154,179 +263,353 @@ session s-0001
     agg-1:2 → leaf-1-1:1（VLAN 100）
 ```
 
-### 帳本格式（ledger）
+### Ledger format
 
-狀態檔是一份 JSON ledger，頂層有三個 key：
+The state file is a JSON ledger with three top-level keys:
 
-- `version`：ledger 的 **schema 版本**（整數，目前為 `2`）。load 時以此 key 與
-  程式內建版本比對，不符即明確拒絕。
-- `next_seq`：session 序號的**高水位**（整數）。序號只增不減——釋放最高序號的
-  session 後重啟，下一筆分配不會重用已用過的序號。
-- `sessions`：目前 active 的 session 陣列（各含 `session_id`、`vlan`、端點、
-  `path`、`physical_ports` 與 `trunk_segments`）。
+- `version` — the ledger **schema version** (integer, currently `2`). On load
+  it is compared against the built-in version; a mismatch is rejected cleanly.
+- `next_seq` — the **high-water mark** for session sequence numbers (integer).
+  Sequence numbers only increase — after releasing the highest-numbered session
+  and restarting, the next allocation will not reuse a spent sequence number.
+- `sessions` — the array of currently active sessions (each with `session_id`,
+  `vlan`, endpoints, `path`, `physical_ports`, and `trunk_segments`).
 
-> `access_ports` 不入帳本：它是由 `physical_ports` 扣除 trunk 端節點即時重算的
-> 衍生值（單一真相來源），不受帳本竄改影響。
+> `access_ports` is **not** stored in the ledger. It is a derived value,
+> recomputed on the fly as `physical_ports` minus the trunk-segment endpoints
+> (single source of truth), so it cannot be corrupted by ledger tampering.
 
-跨行程併發安全：`allocate`/`release` 以同目錄的 lock 檔（`<state>.lock`）取跨
-行程排他鎖，鎖內重新讀取最新帳本再決策、save，確保多行程同時分配不會算出重複的
-序號或 VLAN。寫入採「tempfile + fsync + 原子換名 + 父目錄 fsync」，斷電時帳本不是
-舊內容就是新完整內容，不會半截損毀。
+### Concurrency and persistence guarantees
 
-### 唯讀檢視原始帳本（`list --raw`）
+`allocate`/`release` take a cross-process exclusive lock via a sibling lock file
+(`<state>.lock`). Inside the lock they re-read the latest ledger, make the
+decision, and save — so concurrent processes never compute a duplicate sequence
+number or VLAN. Writes use *tempfile + fsync + atomic rename + parent-directory
+fsync*, so on power loss the ledger is either the old content or the new,
+complete content — never a half-written file.
 
-當帳本版本不符、內容不一致，或拓樸 YAML 缺失/損壞導致正常 `list` 無法進行時，用
-`--raw` 直接 dump 原始 JSON（不碰拓樸、不做還原檢查）以便診斷：
+### Inspecting a broken ledger (`list --raw`)
+
+When the ledger version mismatches, the content is inconsistent, or the
+topology YAML is missing/corrupt so a normal `list` cannot proceed, use `--raw`
+to dump the raw JSON directly (it never touches the topology and runs no
+restore checks). The topology argument can be omitted in this mode:
 
 ```bash
-# 原樣 dump 帳本（可省略 topology.yaml）
 python -m topo_manager list --raw --state .topo-state/allocations.json
 ```
 
-## Phase 3：REST API
+---
 
-Phase 3 在 Phase 1/2 之上疊一層**薄層 FastAPI REST 介接**，讓外部系統（如
-ATLAS）能以 HTTP 查詢可用資源、要求 / 釋放 session、檢視完整拓樸。所有分配 /
-硬衝突 / VLAN / 持久化演算法一律**沿用 Phase 2 的 `Allocator` 與
-`JsonSessionStore`**；API 層只負責「HTTP ↔ Pydantic 模型 ↔ allocator 呼叫 ↔
-例外映射成 HTTP 狀態碼」，不重寫任何演算法、不繞過檔鎖。
+## Pushing VLAN config to fanout switches
 
-### 安裝
+Once a session is allocated, `topo-manager` can push the matching VLAN
+configuration to the real fanout switches over SSH. Each session is isolated by
+a single outer **S-VLAN** using the 802.1Q `dot1q-tunnel` (QinQ) model.
+
+### The QinQ / dot1q-tunnel model
+
+- Every fanout needs the global `dot1q-tunnel` master switch enabled once (see
+  `setup` below).
+- **Edge ports** — ports that face DUT traffic ports or the generator. They are
+  configured as **access ports** that tag ingress untagged frames with the
+  session's S-VLAN as their native VLAN, plus `dot1q-tunnel mode access`. In
+  the topology, an edge port is any port **not listed** in `links`.
+- **Interconnect (uplink) ports** — the fanout-to-fanout links. They are
+  **trunk uplinks** that carry the tagged S-VLANs between fanouts, with
+  `dot1q-tunnel mode uplink`.
+
+Which port is edge vs. interconnect is derived from the session's path and
+trunk segments, not hard-coded: the trunk-segment endpoints are interconnect
+ports; every other node on the path is an edge port.
+
+### Device commands the driver issues
+
+The driver was validated against an **Edgecore ECS5550-54X** (netmiko
+`device_type = cisco_ios`). The exact commands it emits are:
+
+- **Global (once per fanout):**
+  - `dot1q-tunnel system-tunnel-control`
+- **Edge port (facing DUT / generator), with the session VLAN:**
+  - `switchport mode access`
+  - `switchport native vlan <vlan>`
+  - `switchport dot1q-tunnel mode access`
+- **Interconnect port (fanout-to-fanout uplink), with the session VLAN:**
+  - `switchport mode trunk`
+  - `switchport allowed vlan add <vlan> tagged`
+  - `switchport dot1q-tunnel mode uplink`
+
+The edge access VLAN is set dynamically per session: it is the session's own
+S-VLAN. On this hardware the correct command is `switchport native vlan` (the
+`switchport access vlan` form does not exist on the device).
+
+### Subcommands: plan / probe / apply / verify / setup
+
+Dry-run is the **default** for every writing command. Nothing is written to a
+device unless you pass `--apply`.
+
+**`plan`** — pure computation, never connects. Shows per-fanout
+interface -> VLAN -> commands for a session. Use `--session` for an existing
+session, or `--from`/`--to` to preview a not-yet-allocated one (the two are
+mutually exclusive):
 
 ```bash
-pip install -e ".[dev]"   # 現在含 fastapi / uvicorn / httpx
+python -m topo_manager plan examples/topology-3tier.yaml --session s-0001
+python -m topo_manager plan examples/topology-3tier.yaml --from ixia-1/1 --to dut-A1:Eth0
 ```
 
-### 設定（環境變數）
+**`probe`** — read-only connect to a fanout and print `show version` and
+`show vlan`, for diagnostics. Does not take a topology:
 
-| 環境變數 | 預設 | 意義 |
+```bash
+python -m topo_manager probe --fanout core-1
+```
+
+**`apply`** — push a session. Dry-run by default; `--apply` actually connects
+and writes. On `--apply` the deployer takes a pre-write snapshot (skipping items
+already satisfied), pushes the rest, then reads back to verify; a read-back
+mismatch is reported and already-applied interconnect ports are best-effort
+rolled back:
+
+```bash
+# Preview (dry-run)
+python -m topo_manager apply examples/topology-3tier.yaml --session s-0001
+# Actually write to the device
+python -m topo_manager apply examples/topology-3tier.yaml --session s-0001 --apply
+```
+
+**`verify`** — read back from the fanout(s) and report whether the session is
+fully deployed. With `--apply`, it re-pushes any missing items (useful for
+detecting a switch that lost its config after a reboot):
+
+```bash
+python -m topo_manager verify examples/topology-3tier.yaml --session s-0001
+python -m topo_manager verify examples/topology-3tier.yaml --session s-0001 --apply
+```
+
+**`setup`** — push the global `dot1q-tunnel system-tunnel-control` master
+switch (idempotent). It does not take a topology. With no `--fanout` it iterates
+every fanout in the credentials; `--fanout` targets one. Dry-run by default:
+
+```bash
+# Preview on all fanouts
+python -m topo_manager setup
+# Enable on one fanout for real
+python -m topo_manager setup --fanout core-1 --apply
+```
+
+### Fanout credentials
+
+Connection details (`host`, `username`, `password`, `device_type`,
+`interface_template`) are resolved with the priority **env > JSON file >
+built-in defaults**, per field. Credentials are **never** committed.
+
+Environment variables (used for a single device, or to override fields in the
+JSON file):
+
+| Variable | Default | Meaning |
 | --- | --- | --- |
-| `TOPO_MANAGER_TOPOLOGY` | （無預設，**必填**） | 拓樸 YAML 路徑 |
-| `TOPO_MANAGER_STATE` | `.topo-state/allocations.json` | session ledger 路徑 |
-| `TOPO_MANAGER_VLAN_MIN` | `100` | VLAN pool 下界 |
-| `TOPO_MANAGER_VLAN_MAX` | `3000` | VLAN pool 上界 |
-| `TOPO_MANAGER_HOST` | `0.0.0.0` | `topo-manager-api` 綁定 host |
-| `TOPO_MANAGER_PORT` | `8000` | `topo-manager-api` 綁定 port |
+| `TOPO_FANOUT_HOST` | (none, required) | Reachable device address |
+| `TOPO_FANOUT_USERNAME` | (none, required) | Login username |
+| `TOPO_FANOUT_PASSWORD` | (none, required) | Login password |
+| `TOPO_FANOUT_DEVICE_TYPE` | `cisco_ios` | netmiko device_type |
+| `TOPO_FANOUT_INTERFACE_TEMPLATE` | `Eth1/{port}` | port -> interface name template (must contain `{port}`) |
 
-缺 `TOPO_MANAGER_TOPOLOGY`、拓樸不合法、或 VLAN 範圍非法時，app 於**啟動期即
-fail-fast**（印單行 stderr、非零 exit code，不冒 traceback），而非每個請求回 500。
+Or a gitignored JSON file (default name `fanout-credentials.json`, or any path
+passed with `--credentials`). A template, `fanout-credentials.example.json`, is
+checked in:
 
-### 啟動（兩種等價方式）
+```json
+{
+  "fanouts": {
+    "example-fanout": {
+      "host": "192.0.2.1",
+      "username": "CHANGE_ME",
+      "password": "CHANGE_ME",
+      "device_type": "cisco_ios",
+      "interface_template": "Eth1/{port}"
+    }
+  }
+}
+```
+
+When the credentials describe more than one fanout, `--fanout <name>` is
+required to select one (for `probe` and single-device `setup`).
+
+> **Safety note:** `release` frees a session in the ledger but does **not**
+> revert edge ports on the device — that is intentional product behavior. The
+> edge-port revert commands exist only in the live test teardown path, not in
+> the normal release flow.
+
+---
+
+## REST API
+
+The REST API is a thin FastAPI layer over the same allocation engine, letting
+an external system (such as ATLAS) query available resources, request/release
+sessions, and inspect the full topology over HTTP. It reuses the exact same
+`Allocator` and `JsonSessionStore` — the API layer only maps HTTP <-> Pydantic
+models <-> allocator calls <-> exceptions-to-status-codes. It does not rewrite
+any algorithm or bypass the file lock.
+
+### Configuration (environment variables)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TOPO_MANAGER_TOPOLOGY` | (none, **required**) | Topology YAML path |
+| `TOPO_MANAGER_STATE` | `.topo-state/allocations.json` | Session ledger path |
+| `TOPO_MANAGER_VLAN_MIN` | `100` | VLAN pool lower bound |
+| `TOPO_MANAGER_VLAN_MAX` | `3000` | VLAN pool upper bound |
+| `TOPO_MANAGER_HOST` | `0.0.0.0` | `topo-manager-api` bind host |
+| `TOPO_MANAGER_PORT` | `8000` | `topo-manager-api` bind port |
+
+If `TOPO_MANAGER_TOPOLOGY` is missing, the topology is invalid, or the VLAN
+range is illegal, the app **fails fast at startup** (one stderr line, non-zero
+exit code, no traceback) rather than returning 500 on every request.
+
+### Starting the server (two equivalent ways)
 
 ```bash
 export TOPO_MANAGER_TOPOLOGY=examples/topology-3tier.yaml
 export TOPO_MANAGER_STATE=.topo-state/allocations.json
 
-# 方式 A：uvicorn 直接指向 app factory（讀環境變數建 app）
+# Method A: point uvicorn at the app factory (builds the app from env vars)
 uvicorn "topo_manager.api:create_app" --factory --host 0.0.0.0 --port 8000
 
-# 方式 B：便利入口（封裝 uvicorn.run，讀環境變數）
+# Method B: the convenience entry point (wraps uvicorn.run, reads env vars)
 topo-manager-api
 ```
 
-> **部署注意（主執行緒限制）**：Phase 2 的檔鎖以 `signal.SIGALRM` 實作取鎖
-> 逾時，而 `signal` 只能在**主執行緒**設定。因此 app 的 ASGI 事件迴圈必須跑在
-> 主執行緒（uvicorn 單行程預設即如此）。請**勿**以「把事件迴圈放到背景執行緒」
-> 的多執行緒 worker 模式部署，否則寫入端點（POST/DELETE）取鎖時會失敗。需要
-> 多核時以多行程（如多個 uvicorn/gunicorn worker process，各自擁有主執行緒）
-> 水平擴充即可，跨行程一致性由 Phase 2 檔鎖保證。
+Yes — once started, `topo-manager-api` is a long-running resident service.
 
-> **延遲特性（liveness / 事件迴圈凍結）**：寫入端點（POST/DELETE）的 `async`
-> handler 直接在主執行緒事件迴圈呼叫 `allocator.allocate/release`，其中
-> `fcntl.flock(LOCK_EX)` 是**阻塞**系統呼叫，整段「取鎖 → 鎖內 reload → 決策
-> → save → 釋鎖」同步佔住事件迴圈，期間（持鎖/等鎖至多一個 Phase 2 SIGALRM
-> 逾時週期，預設 10 秒）**整個行程不處理任何其他請求，含唯讀端點**。單行程下
-> 這讓 API 寫入被完全序列化，與檔鎖語意一致；但若有並行的 CLI（或另一 API
-> 行程）持鎖，本行程的回應能力會被凍結到逾時。這是 signal 式檔鎖的**必然取捨
-> 而非 bug**：要避免 signal 限制就得把 handler 丟到 worker thread，而那會讓
-> signal 取鎖失敗（見上）。要水平擴充請以**多行程**部署（各自擁有主執行緒、
-> 跨行程一致性由檔鎖保證），**不可**用多執行緒 worker。
+> **Deployment constraint (main thread):** the file lock implements its
+> acquisition timeout with `signal.SIGALRM`, and `signal` can only be set on the
+> **main thread**. The ASGI event loop must therefore run on the main thread
+> (single-process uvicorn does this by default). Do **not** deploy with a
+> multi-threaded worker model that moves the event loop onto a background
+> thread, or the writing endpoints (POST/DELETE) will fail to acquire the lock.
+> To use multiple cores, scale out horizontally with multiple processes (e.g.
+> several uvicorn/gunicorn worker processes, each with its own main thread);
+> cross-process consistency is guaranteed by the file lock.
 
-### 文件（OpenAPI）
+> **Liveness characteristic (event-loop blocking):** the write endpoints'
+> `async` handlers call `allocator.allocate/release` directly on the main-thread
+> event loop, where `fcntl.flock(LOCK_EX)` is a **blocking** system call. The
+> whole "acquire lock -> reload under lock -> decide -> save -> release"
+> sequence holds the event loop synchronously; during that window (at most one
+> lock-acquisition timeout, default 10 s) the process serves **no other
+> request, including read-only ones**. In a single process this serializes API
+> writes, consistent with the lock semantics; but if a concurrent CLI (or
+> another API process) holds the lock, this process's responsiveness is frozen
+> until the timeout. This is the inherent trade-off of a signal-based file lock,
+> not a bug. To scale, use **multiple processes**, never multi-threaded workers.
 
-啟動後：
+### Documentation (OpenAPI)
 
-- Swagger UI：`http://<host>:8000/docs`
-- OpenAPI schema：`http://<host>:8000/openapi.json`
+Once running:
 
-### 端點與 curl 範例
+- Swagger UI: `http://<host>:8000/docs`
+- OpenAPI schema: `http://<host>:8000/openapi.json`
+
+### Endpoints and curl examples
 
 ```bash
-# 1) 取得完整拓樸（供視覺化重建）
+# 1) Get the full topology (for visualization/reconstruction)
 curl -s localhost:8000/topology
 
-# 2) 取得可用 generator / DUT port 清單（排除已被 active session 佔用）
+# 2) Get available generator/DUT ports (excluding those held by active sessions)
 curl -s localhost:8000/resources/available
 
-# 3) 分配一筆 session（201 + session 摘要，status=allocated）
+# 3) Allocate a session (201 + session summary, status=allocated)
 curl -s -X POST localhost:8000/sessions \
     -H 'Content-Type: application/json' \
     -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"}'
 
-# 4) 列出目前所有 active session
+# 4) List all active sessions
 curl -s localhost:8000/sessions
 
-# 5) 釋放一筆 session（200 + 被釋放 session 摘要，status=released）
+# 5) Release a session (200 + released session summary, status=released)
 curl -s -X DELETE localhost:8000/sessions/s-0001
 ```
 
-硬衝突範例（對同一 `(generator_port, dut_port)` 重複分配，access port 被佔用）
-會回 **409** 與結構化錯誤：
+Allocating the same `(generator_port, dut_port)` twice (the access port is
+already held) returns **409** with a structured error:
 
 ```bash
 curl -s -X POST localhost:8000/sessions \
     -H 'Content-Type: application/json' \
     -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"}'
 # => HTTP 409
-# {"error": {"type": "HardConflictError", "message": "硬衝突：下列 access port ..."}}
+# {"error": {"type": "HardConflictError", "message": "..."}}
 ```
 
-錯誤回應一律為統一結構 `{"error": {"type": ..., "message": ...}}`，**不含
-traceback**。狀態碼映射：硬衝突 / VLAN 耗盡 → 409、session 找不到 / 無路徑 →
-404、ledger I/O / 取鎖故障 → 503、**請求期拓樸漂移** → 503（見下）、請求輸入
-錯（缺欄位 / 空字串 / 多餘欄位）→ 400、非預期錯 → 500（固定訊息）。
+Error responses always use the uniform shape
+`{"error": {"type": ..., "message": ...}}` with **no traceback**. Status-code
+mapping:
 
-> **請求期拓樸漂移（讀端點回 503，讀寫不對稱）**：讀端點
-> （`GET /sessions`、`GET /resources/available`）**每請求重讀拓樸 YAML 並
-> 重建 allocator** 以取最新快照；寫端點（POST/DELETE）則共用**啟動期**建立的
-> 單例 allocator，不每請求重讀 YAML。因此若拓樸檔在**啟動之後**被改壞、刪除或
-> 權限變更：
+- hard conflict / VLAN pool exhausted -> **409**
+- session not found / no path -> **404**
+- ledger I/O or lock-acquisition failure -> **503**
+- request-time topology drift -> **503** (see below)
+- bad request input (missing field / empty string / extra field) -> **400**
+- unexpected error -> **500** (fixed message)
+
+> **Request-time topology drift (read endpoints return 503; read/write
+> asymmetry):** the read endpoints (`GET /sessions`, `GET /resources/available`)
+> **re-read the topology YAML and rebuild the allocator on every request** to
+> get the latest snapshot; the write endpoints (POST/DELETE) share the singleton
+> allocator built **at startup** and do not re-read the YAML per request. So if
+> the topology file is broken, deleted, or has its permissions changed *after*
+> startup:
 >
-> - **讀端點**重讀會丟環境性 `TopologyError`（檔案 / 解析 / 驗證 / 參照 /
->   建圖），一律映射為 **503**（服務暫時不可用、**修檔後可重試**），而非 500
->   `InternalError`——後者會誤導成程式 bug，實際是「拓樸檔被動過」這個可回報、
->   使用者可自行修復的狀況。
-> - **寫端點**吃啟動快照，**不受影響**，照常服務。
+> - **Read endpoints** hit an environmental `TopologyError` on re-read (file /
+>   parse / validation / reference / graph build), all mapped to **503**
+>   (temporarily unavailable, **retriable after fixing the file**) rather than a
+>   misleading 500 `InternalError`.
+> - **Write endpoints** use the startup snapshot and are **unaffected**.
 >
-> 這是刻意設計的讀寫不對稱：啟動期 fail-fast 只保證啟動時拓樸合法，請求期的
-> 拓樸漂移由讀端點以 503 回報。注意僅「請求期拓樸載入 / 建圖失敗」這類環境性
-> 錯誤映射 503；業務錯誤不受影響（無路徑 / session 找不到仍 404、硬衝突 / VLAN
-> 耗盡仍 409、`ConfigError` 設定非法仍 500）。
+> This read/write asymmetry is deliberate: startup fail-fast guarantees the
+> topology is valid *at startup*, and request-time drift is reported by the read
+> endpoints as 503. Only environmental "request-time topology load/graph-build
+> failure" maps to 503; business errors are unaffected (no path / session not
+> found still 404, hard conflict / VLAN exhausted still 409, illegal
+> `ConfigError` still 500).
 
-### 回應欄位：access port 如何推導
+### Response fields: deriving access ports
 
-`SessionResponse` 平鋪 Phase 2 `Session` 的欄位（`session_id`、`vlan`、端點、
-`path`、`physical_ports`、`trunk_segments`）外加頂層 `status`。與帳本一致，
-回應**不**另帶 `access_ports`；若需要，可由
-`physical_ports − {所有 trunk_segments 的 a_node/b_node}` 自行推導。
+`SessionResponse` flattens the session fields (`session_id`, `vlan`, endpoints,
+`path`, `physical_ports`, `trunk_segments`) plus a top-level `status`.
+Consistent with the ledger, the response does **not** carry `access_ports`; if
+you need them, derive as
+`physical_ports − {all trunk_segments' a_node/b_node}`.
 
-### 與 CLI 的一致性
+### Consistency with the CLI
 
-API 與 CLI 指向**同一** `--state` / `TOPO_MANAGER_STATE` 時，透過 Phase 2 的
-檔鎖（`<state>.lock`）保證並行一致：API 的 POST/DELETE 與 CLI 的
-`allocate`/`release` 互斥序列化，鎖內重讀最新帳本再決策。API 層**不繞過
-檔鎖**、不自建記憶體快取代替 allocator 決策。
+When the API and CLI point at the **same** `--state` / `TOPO_MANAGER_STATE`, the
+file lock (`<state>.lock`) guarantees concurrent consistency: the API's
+POST/DELETE and the CLI's `allocate`/`release` are mutually exclusive and
+serialized, each re-reading the latest ledger under the lock. The API layer does
+not bypass the file lock or substitute an in-memory cache for the allocator's
+decisions.
 
-## 通用多層約束（設計重點）
+---
 
-工具不把「層數」寫死，也不靠 `role` 字串判斷方向或層級：
+## Design guarantees (universal multi-tier)
 
-- `fanout.role`（`core` / `spine` / `agg` / `leaf` 等）只是自由字串標籤與摘要
-  分組鍵，不參與任何方向或層級判斷邏輯。
-- 邊的**方向**由接線拓樸相對於 generator 的距離動態推導；**tier 層級**另由
-  「收縮同一台 fanout 的所有 port 為超節點」的收縮圖多源 BFS 計算。兩者分離。
-- 因此同一套演算法可自然處理兩層、三層乃至更多層（上方 `tiers` 鍵集合分別為
-  `{0,1,2,3}` 與 `{0,1,2,3,4}`），新增一層只需在 YAML 多描述一層連線。
+The tool does not hard-code the number of tiers, and it does not use the `role`
+string to decide direction or layer:
 
-節點 id 一律為 `<裝置>:<port>`；每台 fanout 另有一個虛擬中樞 `<裝置>:#core`
-做設備內部連通，摘要與路徑輸出都會排除它。
+- `fanout.role` (`core` / `spine` / `agg` / `leaf`, etc.) is only a free-form
+  label and a summary grouping key. It takes no part in any direction or
+  tier-level logic.
+- Edge **direction** is derived from each link's distance to the generator;
+  **tier level** is computed separately by a multi-source BFS on a contracted
+  graph (all ports of one fanout contracted into a super-node). The two are
+  independent.
+- The same algorithm therefore handles two, three, or more tiers naturally (the
+  `tiers` key sets above are `{0,1,2,3}` and `{0,1,2,3,4}`); adding a tier only
+  means describing one more layer of links in the YAML.
+
+Every node id is `<device>:<port>`. Each fanout also has a virtual hub
+`<device>:#core` for intra-device connectivity, which the summary and path
+outputs exclude.
