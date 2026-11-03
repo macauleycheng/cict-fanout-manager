@@ -8,3 +8,7 @@ __pycache__/
 
 # Workflow pipeline 中間產物（需求/設計草稿/審查/計畫等過程檔，不進版控）
 .agents/
+
+# Phase 4 fanout 連線憑證（含真實 host/帳密，絕不進版控；僅 *.example.json 入版控）
+fanout-credentials.json
+*.secret.json

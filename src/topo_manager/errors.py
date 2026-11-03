@@ -14,6 +14,11 @@
   - 0.3.0  Phase 2 Hardening 新增 ConfigError（設定/參數非法，CLI 以既有
            except TopologyError 攔截）；SessionStoreError docstring 補充
            store 層讀寫 I/O 失敗亦屬此類。
+  - 0.4.0  Phase 4 fanout SSH 下發層新增 6 個子類
+           （DriverDependencyError / DriverConnectionError /
+           DriverParseError / PortMappingError / ReadBackMismatchError /
+           ApplyError），皆繼承 TopologyError，CLI 以既有 except TopologyError
+           自動攔截（不改 cli.py）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -128,4 +133,59 @@ class ConfigError(TopologyError):
     （``--vlan-min``/``--vlan-max``）超出 802.1Q 可用範圍、或 ``list``（非
     ``--raw``）未提供必要的 topology.yaml。屬 ``TopologyError`` 家族，CLI 以
     既有 ``except TopologyError`` 攔截、印單一錯誤區塊、回非零、無 traceback。
+    """
+
+
+class DriverDependencyError(TopologyError):
+    """fanout 下發層所需的選用相依（netmiko）未安裝時觸發（Phase 4，§9）。
+
+    觸發條件：實際要建立 SSH 連線時 ``import netmiko`` 失敗（本專案將 netmiko
+    延遲 import 於 driver 連線函式內，純邏輯/設定/CLI 路徑不觸發）。可復原性：
+    使用者安裝選用相依（``pip install topo-manager[drivers]``）後即可重試。
+    訊息應指明缺少 netmiko 與安裝方式，並保留 ``__cause__``（ImportError）。
+    """
+
+
+class DriverConnectionError(TopologyError):
+    """對 fanout 設備建立/維持 SSH 連線失敗時觸發（Phase 4，§9）。
+
+    觸發條件：netmiko 連線逾時、認證失敗、連線中斷或底層傳輸例外。可復原性：
+    使用者修正連線設定（host/username/password/可達性）後可重試。訊息應含目標
+    host 與底層原因，並保留 ``__cause__``。
+    """
+
+
+class DriverParseError(TopologyError):
+    """解析設備 CLI 輸出（如 show vlan）失敗時觸發（Phase 4，§9）。
+
+    觸發條件：設備回傳的文字不符預期格式、欄位缺漏或無法對映到 VlanState。
+    可復原性：多屬設備型號/韌體差異，需調整解析器；屬可回報失敗而非程式 bug。
+    訊息應含無法解析的指令與片段摘要。
+    """
+
+
+class PortMappingError(TopologyError):
+    """拓樸 port 無法對映為合法設備介面名時觸發（Phase 4，§5、§9）。
+
+    觸發條件：以 interface_template 套出的介面名不符設備介面命名規則
+    （fail-closed：模組常數正則不符即拒絕，不臆測）。可復原性：使用者修正
+    interface_template 或拓樸 port。訊息應含原始 port、套出的介面名與期望格式。
+    """
+
+
+class ReadBackMismatchError(TopologyError):
+    """下發後回讀（read-back）驗證與期望狀態不符時觸發（Phase 4，§7.3、§9）。
+
+    觸發條件：apply 後重新讀取設備 VLAN 狀態，期望的 (interface, vlan, tagged)
+    成員仍有缺漏。可復原性：可重試下發或人工檢查設備；屬可回報失敗。訊息應
+    逐條列出缺漏的 (interface, vlan) 成員。
+    """
+
+
+class ApplyError(TopologyError):
+    """下發 VLAN 設定指令至設備失敗時觸發（Phase 4，§9）。
+
+    觸發條件：送出設定指令時設備回報錯誤、拒絕或連線中斷，導致本批變更未能
+    完整套用。可復原性：使用者修正設定/權限後可重試。訊息應含失敗的設備與
+    底層原因，並保留 ``__cause__``。
     """
