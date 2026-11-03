@@ -57,6 +57,30 @@ Two console scripts are installed:
 
 ---
 
+## Two independent entry points
+
+The tool ships **two separate executables** (both installed by
+`pip install -e .`), and they are independent:
+
+| Entry point | What it is | Interface |
+| --- | --- | --- |
+| `topo-manager` (or `python -m topo_manager`) | A one-shot CLI command — runs a single subcommand, prints the result, and exits | CLI subcommands only (no HTTP server) |
+| `topo-manager-api` (or `uvicorn ... --factory`) | A long-running REST API server | HTTP endpoints only |
+
+- The **CLI does not start a server** and the **API server does not expose the
+  CLI subcommands** — they are launched differently and do different things.
+- **Pushing VLAN config to fanout switches** (`plan` / `probe` / `apply` /
+  `verify` / `setup`) is **CLI-only**; the REST API has no device-push endpoints.
+- Both act on the **same underlying allocator and the same JSON ledger**: point
+  the CLI's `--state` and the server's `TOPO_MANAGER_STATE` at the same file and
+  they share state. Concurrent use (CLI + API, or multiple processes) is kept
+  consistent by a cross-process file lock (see
+  [Concurrency and persistence guarantees](#concurrency-and-persistence-guarantees)).
+
+Typical usage: automation (e.g. ATLAS) drives the **REST API**; humans use the
+**CLI** for inspection, troubleshooting, and fanout device pushes — both against
+the same state file.
+
 ## CLI overview
 
 The CLI uses a subcommand interface. Most subcommands take a single positional
