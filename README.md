@@ -74,11 +74,18 @@ The tool ships **two separate executables** (both installed by
   it is not a third entry point.
 - **Pushing VLAN config to fanout switches** (`plan` / `probe` / `apply` /
   `verify` / `setup`) is **CLI-only**; the REST API has no device-push endpoints.
+  This also applies to the interconnect feature: the REST API covers
+  [interconnect ledger operations](#interconnect-endpoints) (create/release/
+  list/plan), but `apply`, `park`, `release --apply`, and `verify` for
+  interconnect stay **CLI-only** too.
 - Both act on the **same underlying allocator and the same JSON ledger**: point
   the CLI's `--state` and the server's `TOPO_MANAGER_STATE` at the same file and
   they share state. Concurrent use (CLI + API, or multiple processes) is kept
   consistent by a cross-process file lock (see
   [Concurrency and persistence guarantees](#concurrency-and-persistence-guarantees)).
+  The interconnect ledger is a **separate** file (CLI `--state` / server
+  `TOPO_MANAGER_IC_STATE`); the CLI and the API share consistency on it the
+  same way, through the same file-lock mechanism.
 
 Typical usage: automation (e.g. ATLAS) drives the **REST API**; humans use the
 **CLI** for inspection, troubleshooting, and fanout device pushes — both against
@@ -599,6 +606,10 @@ python -m topo_manager interconnect release topo.yaml --session ic-0001 --apply
 
 `interconnect setup` is an alias of `interconnect park`.
 
+The same ledger operations (summary, create, list, release from the ledger,
+plan) are also available over HTTP; see [Interconnect endpoints](#interconnect-endpoints).
+Device push stays in the CLI.
+
 ### Parking, release and dry-run
 
 - **Parking** is the idle state of an interconnect port: administratively
@@ -646,9 +657,12 @@ skipping it).
 - QinQ is not used: QinQ access ports cannot exchange packets with each other,
   and the interconnect fanout has no uplink port, so each link is a separate
   access VLAN instead.
-- The feature is CLI-only; there is no REST API or Web UI for it.
 - Reading back a port takes a few `show` commands, so a large `park` takes
   time; use `--fanout` or `--ports` to narrow it.
+- Ledger operations (create/release/list/plan) are available over the
+  [REST API](#interconnect-endpoints); device push (`apply`, `park`,
+  `release --apply`, `verify`) stays **CLI-only**, and there is no Web UI tab
+  for interconnect.
 
 ---
 
@@ -669,12 +683,27 @@ any algorithm or bypass the file lock.
 | `TOPO_MANAGER_STATE` | `.topo-state/allocations.json` | Session ledger path |
 | `TOPO_MANAGER_VLAN_MIN` | `100` | VLAN pool lower bound |
 | `TOPO_MANAGER_VLAN_MAX` | `3000` | VLAN pool upper bound |
+| `TOPO_MANAGER_IC_STATE` | `.topo-state/interconnect.json` | Interconnect ledger path (separate from `TOPO_MANAGER_STATE`) |
+| `TOPO_MANAGER_IC_VLAN_MIN` | `100` | Interconnect VLAN pool lower bound |
+| `TOPO_MANAGER_IC_VLAN_MAX` | `3000` | Interconnect VLAN pool upper bound |
 | `TOPO_MANAGER_HOST` | `0.0.0.0` | `topo-manager-api` bind host |
 | `TOPO_MANAGER_PORT` | `8000` | `topo-manager-api` bind port |
 
-If `TOPO_MANAGER_TOPOLOGY` is missing, the topology is invalid, or the VLAN
+If `TOPO_MANAGER_TOPOLOGY` is missing, the topology is invalid, or a VLAN
 range is illegal, the app **fails fast at startup** (one stderr line, non-zero
-exit code, no traceback) rather than returning 500 on every request.
+exit code, no traceback) rather than returning 500 on every request. The
+interconnect VLAN range is validated only when the topology has an
+`interconnect:` section.
+
+The interconnect variables mirror the CLI's `interconnect ... --state`,
+`--vlan-min` and `--vlan-max` options and have the same defaults. They do not
+change the meaning of the existing variables: `TOPO_MANAGER_STATE` and
+`TOPO_MANAGER_VLAN_*` still only apply to traffic sessions. The two ledgers have
+different formats, so never point both variables at the same file (the
+interconnect endpoints answer 503 if they find a traffic ledger there). The
+interconnect VLAN pool must match the `--vlan-min`/`--vlan-max` the CLI uses on
+the same ledger; a session whose VLAN falls outside the pool is rejected with
+503 when the ledger is loaded.
 
 ### Starting the server (two equivalent ways)
 
@@ -696,14 +725,17 @@ Yes — once started, `topo-manager-api` is a long-running resident service.
 > **main thread**. The ASGI event loop must therefore run on the main thread
 > (single-process uvicorn does this by default). Do **not** deploy with a
 > multi-threaded worker model that moves the event loop onto a background
-> thread, or the writing endpoints (POST/DELETE) will fail to acquire the lock.
+> thread, or the writing endpoints (POST/DELETE on `/sessions` and on
+> `/interconnect/sessions`) will fail to acquire the lock. All interconnect
+> handlers are declared `async def` for the same reason.
 > To use multiple cores, scale out horizontally with multiple processes (e.g.
 > several uvicorn/gunicorn worker processes, each with its own main thread);
 > cross-process consistency is guaranteed by the file lock.
 
 > **Liveness characteristic (event-loop blocking):** the write endpoints'
-> `async` handlers call `allocator.allocate/release` directly on the main-thread
-> event loop, where `fcntl.flock(LOCK_EX)` is a **blocking** system call. The
+> `async` handlers (traffic `POST/DELETE /sessions` and interconnect
+> `POST/DELETE /interconnect/sessions`) call the allocator's
+> `allocate/release` directly on the main-thread event loop, where `fcntl.flock(LOCK_EX)` is a **blocking** system call. The
 > whole "acquire lock -> reload under lock -> decide -> save -> release"
 > sequence holds the event loop synchronously; during that window (at most one
 > lock-acquisition timeout, default 10 s) the process serves **no other
@@ -801,6 +833,168 @@ serialized, each re-reading the latest ledger under the lock. The API layer does
 not bypass the file lock or substitute an in-memory cache for the allocator's
 decisions.
 
+### Interconnect endpoints
+
+The same server also exposes the [interconnect fanout](#interconnect-fanout)
+feature over REST, so an external system can create and release interconnect
+sessions without the CLI. The endpoints work on the **interconnect ledger only**
+(`TOPO_MANAGER_IC_STATE`, see [Configuration](#configuration-environment-variables)),
+which is separate from the traffic ledger.
+
+> **Scope: ledger operations only.** The REST API never connects to a device.
+> Pushing the configuration to the interconnect fanout (`apply`, `park`,
+> `release --apply`, `verify`) is **CLI-only**, just like pushing VLAN config for
+> traffic sessions. `DELETE` is the equivalent of `release --ledger-only`: it
+> removes the session from the ledger and leaves the device untouched.
+
+| Method and path | CLI equivalent | Success | Purpose |
+| --- | --- | --- | --- |
+| `GET /interconnect/summary` | `summary` | 200 | Groups, the DUTs in each group (`d0`..`d3`) and the ports used on each interconnect fanout |
+| `GET /interconnect/resources/available` | (new) | 200 | Per group: which ports are free (`occupied_by`) and which fixed-pairing links can still be built |
+| `GET /interconnect/sessions` | `list` | 200 | All active sessions, ordered by `session_id` |
+| `POST /interconnect/sessions` | `allocate` | 201 | Create a session; the response lists every link with its VLAN and both ports |
+| `DELETE /interconnect/sessions/{session_id}` | `release --ledger-only` | 200 | Remove a session from the ledger (any phase); the response carries a `warning` |
+| `POST /interconnect/plan` | `plan --group ...` | 200 | Preview the commands a new request would need. No side effect: nothing is reserved or written |
+| `GET /interconnect/sessions/{session_id}/plan?action=apply\|release` | `plan --session [--release]` | 200 | Commands for an existing session |
+| `GET /interconnect/plan/park?fanout=&ports=` | `plan --park` | 200 | Parking baseline, optionally narrowed with `fanout` and repeated `ports` |
+
+#### Creating a session
+
+The body takes a `group` plus **either** `duts` with a `profile` **or** `pairs`;
+the rules are the same as the CLI's `--group`, `--duts`, `--profile` and `--pair`:
+
+- `duts` (2 to 4 names, in the order you want) needs a `profile` of `mesh`,
+  `line` or `ring`. `ring` needs at least 3 DUTs.
+- `pairs` is a list of `{"a": "dut:port", "b": "dut:port"}` objects. `port` is
+  either the DUT's interconnect port name or `p0`..`p3`. `p3` is only reachable
+  this way. `pairs` cannot be combined with `profile`.
+- Giving both `duts` and `pairs`, or neither, is a 400 error.
+
+```bash
+# Four DUTs as a ring
+curl -s -X POST localhost:8000/interconnect/sessions \
+    -H 'Content-Type: application/json' \
+    -d '{"group": "A-g1", "duts": ["dut-A1", "dut-A2", "dut-A3", "dut-A4"], "profile": "ring"}'
+
+# One explicit port pair (p3 is not in the fixed pairing table)
+curl -s -X POST localhost:8000/interconnect/sessions \
+    -H 'Content-Type: application/json' \
+    -d '{"group": "A-g1", "pairs": [{"a": "dut-A1:p3", "b": "dut-A2:p3"}]}'
+```
+
+Response (201):
+
+```json
+{
+  "session_id": "ic-0001",
+  "group": "A-g1",
+  "fanout": "ic-1-1",
+  "profile": "explicit",
+  "duts": ["dut-A1", "dut-A2"],
+  "phase": "allocated",
+  "links": [
+    {"vlan": 100, "a_dut": "dut-A1", "a_port": "Eth11", "a_node": "ic-1-1:4",
+     "b_dut": "dut-A2", "b_port": "Eth11", "b_node": "ic-1-1:8", "kind": "explicit"}
+  ],
+  "status": "allocated",
+  "warning": null
+}
+```
+
+Several sessions can live in the same group as long as they use different
+ports: for example one session on `dut-A1`/`dut-A2` and another on
+`dut-A3`/`dut-A4`. A request that needs a port that another session holds is
+refused with 409 and nothing is written; release the other session first, after
+which the same ports can be requested again.
+
+#### Listing, planning and releasing
+
+```bash
+# Summary, free resources and active sessions
+curl -s localhost:8000/interconnect/summary
+curl -s localhost:8000/interconnect/resources/available
+curl -s localhost:8000/interconnect/sessions
+
+# Preview the commands (nothing is reserved; VLANs shown are illustrative)
+curl -s -X POST localhost:8000/interconnect/plan \
+    -H 'Content-Type: application/json' \
+    -d '{"group": "A-g2", "duts": ["dut-A5", "dut-A6"], "profile": "mesh"}'
+
+# Commands for an existing session, and the parking baseline for one fanout
+curl -s 'localhost:8000/interconnect/sessions/ic-0001/plan?action=release'
+curl -s 'localhost:8000/interconnect/plan/park?fanout=ic-1-1&ports=1&ports=2'
+
+# Release from the ledger (the device is not touched)
+curl -s -X DELETE localhost:8000/interconnect/sessions/ic-0001
+```
+
+A `plan` response lists the command batches per interconnect fanout, in the
+order they would be sent:
+
+```json
+{
+  "session_id": "(preview)",
+  "action": "apply",
+  "vlans": [100],
+  "fanouts": [{"fanout": "ic-1-1", "batches": [["interface ethernet 1/17", "shutdown", "..."], ["..."]]}],
+  "notes": ["..."],
+  "preview": {"session_id": "(preview)", "status": "preview", "links": ["..."]}
+}
+```
+
+`POST /interconnect/plan` uses POST only to carry a request body. Like the CLI's
+`plan`, it does not check port conflicts or VLAN exhaustion, and the VLANs are
+numbered from the bottom of the pool. The plan endpoints never read the
+credentials file and never open a connection; they use the default interface
+name template, so a fanout with a custom `interface_template` in the CLI
+credentials may show different interface names in the CLI's own `plan`.
+
+#### Errors
+
+Errors use the same `{"error": {"type": ..., "message": ...}}` shape as the rest
+of the API, with no traceback.
+
+| Status | `error.type` | When |
+| --- | --- | --- |
+| 400 | `InterconnectRequestError` | Unknown group or DUT, DUTs from different groups, duplicate DUT or port, a 2-DUT `ring`, unknown profile or port, malformed pair, `duts`/`pairs`/`profile` combined wrongly, unknown fanout or port in `plan/park` |
+| 400 | `ValidationError` | Missing or empty `group`, wrong types, extra fields, bad `action` or `ports` query values |
+| 404 | `InterconnectSessionNotFoundError` | `DELETE` or a session `plan` for a `session_id` that does not exist |
+| 404 | `InterconnectNotConfiguredError` | The topology has no `interconnect:` section |
+| 409 | `InterconnectConflictError` | A port is already held by another session (the message lists the owners) |
+| 409 | `VlanPoolExhaustedError` | The interconnect VLAN pool has too few free VLANs |
+| 503 | `SessionStoreError` | The interconnect ledger cannot be read or written, is not an interconnect ledger, or the lock could not be taken |
+| 500 | `InternalError` | Unexpected error (fixed message) |
+
+If the topology has no `interconnect:` section the server still starts and the
+traffic endpoints and the Web UI work as usual; every `/interconnect/...` call
+answers 404:
+
+```bash
+curl -s localhost:8000/interconnect/summary
+# => HTTP 404
+# {"error": {"type": "InterconnectNotConfiguredError", "message": "..."}}
+```
+
+The interconnect ledger is not read at startup, so a broken interconnect ledger
+does not stop the traffic endpoints; it shows up as 503 on the interconnect
+endpoints only.
+
+#### Consistency with the CLI
+
+The CLI and the server can use the same interconnect ledger (`--state` and
+`TOPO_MANAGER_IC_STATE`). Both take the same file lock (`<ledger>.lock`) and
+reload the ledger under it, so a session created through one is visible through
+the other and conflicts are detected across processes. The main-thread
+deployment constraint and the event-loop blocking behavior described under
+[Starting the server](#starting-the-server-two-equivalent-ways) apply to the
+interconnect `POST` and `DELETE` endpoints as well.
+
+The REST `DELETE` does not take the device lock that the CLI holds while it
+configures a device. Do not release a session over REST while a CLI
+`interconnect apply --apply` or `release --apply` for the same session is
+running; if the device is left configured without a ledger entry, clean it up
+with `interconnect park --apply`.
+
 ---
 
 ## Web UI
@@ -862,6 +1056,9 @@ Consequently, **pushing VLAN config to fanout switches** (`apply` / `verify` /
 `setup`) is **not** in the Web UI — those remain **CLI-only**, consistent with
 [Two independent entry points](#two-independent-entry-points). The UI can show
 and request/release sessions, but device pushes stay on the CLI.
+The [interconnect endpoints](#interconnect-endpoints) are likewise not used by
+the UI: there is no interconnect tab, and the five endpoints above are the only
+ones the page calls.
 
 Writes triggered from the UI (allocate / release) go through the same POST /
 DELETE handlers as the REST API, so the main-thread deployment constraint and

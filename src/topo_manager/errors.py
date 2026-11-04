@@ -20,6 +20,9 @@
            ApplyError），皆繼承 TopologyError，CLI 以既有 except TopologyError
            自動攔截（不改 cli.py）。
 
+  - 0.5.0  互聯 REST 新增 InterconnectNotConfiguredError（繼承
+           InterconnectLayoutError），對應拓樸無 interconnect 區段時 REST
+           端點的 404（互聯 REST 設計 §2）。
 Copyright (c) 2026 topo-manager。
 """
 
@@ -218,3 +221,9 @@ class InterconnectConflictError(HardConflictError):
 
 class InterconnectSessionNotFoundError(SessionNotFoundError):
     """查無指定的互聯 session（``ic-NNNN``）時觸發（§7）。"""
+class InterconnectNotConfiguredError(InterconnectLayoutError):
+    """拓樸沒有 interconnect 區段，卻呼叫互聯功能時觸發（REST 層用，對應 404）。
+    觸發條件：REST 互聯端點在啟動時載入的拓樸沒有 ``interconnect`` 區段。繼承
+    ``InterconnectLayoutError``（屬 ``TopologyError`` 家族）；REST 錯誤映射以
+    精確類別查表，故本類別對應 404，而父類別不加映射以免改變打流側行為。
+    """

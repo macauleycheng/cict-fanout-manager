@@ -12,6 +12,11 @@
   - 0.4.1  Phase 3 審查 Issue 1：請求期拓樸漂移（讀路徑 build_allocator 重讀
            YAML 失敗）五個環境性 TopologyError 子類映射成 503（而非 500），
            與啟動期 fail-fast / 寫路徑吃單例的語意分離。
+  - 0.5.0  互聯 REST：映射表新增 InterconnectRequestError(400) /
+           InterconnectConflictError(409) / InterconnectSessionNotFoundError
+           (404) / InterconnectNotConfiguredError(404)。因 status_for 以
+           type(exc) 精確查表，子類必須顯式列出；InterconnectLayoutError 刻意
+           不映射（避免改變打流側拓樸漂移時的既有行為）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -29,6 +34,10 @@ from topo_manager.api.schemas import ErrorDetail, ErrorResponse
 from topo_manager.errors import (
     ConfigError,
     HardConflictError,
+    InterconnectConflictError,
+    InterconnectNotConfiguredError,
+    InterconnectRequestError,
+    InterconnectSessionNotFoundError,
     PathLookupError,
     SessionNotFoundError,
     SessionStoreError,
@@ -67,6 +76,11 @@ _STATUS_BY_EXC: Dict[Type[TopologyError], int] = {
     TopologyReferenceError: 503,
     TopologyGraphError: 503,
     ConfigError: 500,
+    # 互聯 REST（精確查表，子類須顯式列出）。
+    InterconnectRequestError: 400,
+    InterconnectConflictError: 409,
+    InterconnectSessionNotFoundError: 404,
+    InterconnectNotConfiguredError: 404,
 }
 
 # 非預期例外（程式 bug）對外的固定訊息（不外洩內部細節，設計 §6.4）。

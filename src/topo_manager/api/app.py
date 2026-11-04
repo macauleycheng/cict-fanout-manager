@@ -15,6 +15,11 @@ settings / shared allocator / topology 存入 ``app.state`` 供 routes 取用。
   - 0.5.0  Web UI：於 include_router 之後呼叫 register_ui(app) 掛 /static 與
            GET /（僅用既有五個端點、不新增後端邏輯，設計 §1）。_API_VERSION
            維持 "0.4.0"（API 契約未變；UI 版本僅記於 HISTORY）。
+  - 0.6.0  互聯 REST：新增 app.state.ic_graph（啟動時建立，無 interconnect
+           區段時為 None，不影響既有端點）並掛 ic_routes.router；
+           _API_VERSION 由 "0.4.0" 升為 "0.5.0"（OpenAPI 契約新增互聯端點，
+           屬 semver minor；此 0.6.0 為本模組 HISTORY 標號，與 _API_VERSION
+           是兩套計數）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -25,19 +30,23 @@ from typing import Optional
 
 from fastapi import FastAPI
 
-from topo_manager.api import routes
+from topo_manager.api import ic_routes, routes
 from topo_manager.api.deps import Settings, build_allocator
 from topo_manager.api.errors import register_exception_handlers
+from topo_manager.api.ic_deps import build_ic_startup_graph
 from topo_manager.api.ui import register_ui
 from topo_manager.loader import load_topology
 
 # app metadata（設計 §5.6）。
 _API_TITLE = "topo-manager API"
-_API_VERSION = "0.4.0"
+_API_VERSION = "0.5.0"
 _API_DESCRIPTION = (
-    "topo-manager 的 REST 介接層（Phase 3）：查詢可用資源、要求 / 釋放 "
-    "session、檢視完整拓樸。所有分配 / 衝突 / VLAN / 持久化演算法沿用 "
-    "Phase 2 的 Allocator 與 JsonSessionStore；本層為薄層 HTTP 包裝。"
+    "topo-manager 的 REST 介接層：查詢可用資源、要求 / 釋放 session、檢視完整 "
+    "拓樸，並提供互聯 fanout 的帳本層操作（建立 / 釋放 / 列出 / 計畫查詢）。 "
+    "所有分配 / 衝突 / VLAN / 持久化演算法沿用既有 Allocator / "
+    "InterconnectAllocator 與其 JsonSessionStore / IcSessionStore；本層為薄層 "
+    "HTTP 包裝。互聯的設備下發（apply / park / 帶設備的 release / verify）僅限 "
+    "CLI，REST 不提供、不連任何設備。"
 )
 
 
@@ -76,8 +85,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.settings = settings
     app.state.topology = topology
     app.state.allocator = allocator
+    # 互聯小圖：無 interconnect 區段時為 None（降級，app 照常啟動，既有端點
+    # 完全不受影響）；啟動期不讀互聯帳本（互聯帳本故障不得拖垮打流側 API）。
+    app.state.ic_graph = build_ic_startup_graph(settings, topology)
 
     app.include_router(routes.router)
+    app.include_router(ic_routes.router)
     # Web UI 靜態服務：於 include_router 之後掛 /static 與 GET /（設計 §1.1/§1.4）。
     # register_ui 純靜態、不碰 app.state / allocator / topology，不參與 fail-fast。
     register_ui(app)

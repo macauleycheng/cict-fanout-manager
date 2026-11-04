@@ -117,7 +117,7 @@ def test_openapi(api_client: Tuple[TestClient, Path]) -> None:
     assert "/sessions" in paths
     assert "/sessions/{session_id}" in paths
     assert body["info"]["title"] == "topo-manager API"
-    assert body["info"]["version"] == "0.4.0"
+    assert body["info"]["version"] == "0.5.0"
 
 
 # ----------------------------------------------------------------------

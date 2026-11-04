@@ -9,6 +9,10 @@ CLI 指向同一帳本、同一 pool 時行為一致。設定 / 參數層的錯�
 歷史（HISTORY）：
   - 0.4.0  Phase 3 初版，建立 Settings（from_env）與 build_allocator
            factory（與 cli._build_allocator 等價，設計 §4.1/§4.4）。
+  - 0.5.0  互聯 REST：Settings 新增選填的 ic_state_path / ic_vlan_min /
+           ic_vlan_max 與環境變數 TOPO_MANAGER_IC_STATE /
+           TOPO_MANAGER_IC_VLAN_MIN / TOPO_MANAGER_IC_VLAN_MAX（既有欄位與
+           環境變數語意不變）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -26,12 +30,19 @@ from topo_manager.store import JsonSessionStore
 _DEFAULT_STATE_PATH = ".topo-state/allocations.json"
 _DEFAULT_VLAN_MIN = 100
 _DEFAULT_VLAN_MAX = 3000
+# 互聯側預設值（與 interconnect/cli.py 對齊；互聯帳本與打流側帳本分開）。
+_DEFAULT_IC_STATE_PATH = ".topo-state/interconnect.json"
+_DEFAULT_IC_VLAN_MIN = 100
+_DEFAULT_IC_VLAN_MAX = 3000
 
 # 環境變數名稱（設計 §4.1）。
 _ENV_TOPOLOGY = "TOPO_MANAGER_TOPOLOGY"
 _ENV_STATE = "TOPO_MANAGER_STATE"
 _ENV_VLAN_MIN = "TOPO_MANAGER_VLAN_MIN"
 _ENV_VLAN_MAX = "TOPO_MANAGER_VLAN_MAX"
+_ENV_IC_STATE = "TOPO_MANAGER_IC_STATE"
+_ENV_IC_VLAN_MIN = "TOPO_MANAGER_IC_VLAN_MIN"
+_ENV_IC_VLAN_MAX = "TOPO_MANAGER_IC_VLAN_MAX"
 
 
 class Settings:
@@ -42,6 +53,8 @@ class Settings:
       - state_path：session ledger 路徑（預設 ``.topo-state/allocations.json``）。
       - vlan_min：VLAN pool 下界（預設 100）。
       - vlan_max：VLAN pool 上界（預設 3000）。
+      - ic_state_path：互聯帳本路徑（預設 ``.topo-state/interconnect.json``）。
+      - ic_vlan_min / ic_vlan_max：互聯 VLAN pool（預設 100 / 3000）。
     """
 
     def __init__(
@@ -50,6 +63,9 @@ class Settings:
         state_path: str = _DEFAULT_STATE_PATH,
         vlan_min: int = _DEFAULT_VLAN_MIN,
         vlan_max: int = _DEFAULT_VLAN_MAX,
+        ic_state_path: str = _DEFAULT_IC_STATE_PATH,
+        ic_vlan_min: int = _DEFAULT_IC_VLAN_MIN,
+        ic_vlan_max: int = _DEFAULT_IC_VLAN_MAX,
     ) -> None:
         """以顯式參數建立設定（測試注入用，設計 §10.1）。
 
@@ -57,11 +73,16 @@ class Settings:
           - topology_path：拓樸 YAML 路徑（必填）。
           - state_path：session ledger 路徑（預設 CLI 慣例路徑）。
           - vlan_min / vlan_max：VLAN pool 端點（預設 100 / 3000）。
+          - ic_state_path：互聯帳本路徑（預設 CLI 慣例路徑）。
+          - ic_vlan_min / ic_vlan_max：互聯 VLAN pool 端點（預設 100 / 3000）。
         """
         self.topology_path = topology_path
         self.state_path = state_path
         self.vlan_min = vlan_min
         self.vlan_max = vlan_max
+        self.ic_state_path = ic_state_path
+        self.ic_vlan_min = ic_vlan_min
+        self.ic_vlan_max = ic_vlan_max
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -71,7 +92,9 @@ class Settings:
         ``TOPO_MANAGER_STATE``（預設 ``.topo-state/allocations.json``）、
         ``TOPO_MANAGER_VLAN_MIN``（預設 100）、``TOPO_MANAGER_VLAN_MAX``
         （預設 3000）。VLAN 的 ``int()`` 轉換失敗亦丟 ``ConfigError``
-        （不冒 ``ValueError``）。
+        （不冒 ``ValueError``）。互聯側另讀 ``TOPO_MANAGER_IC_STATE``（預設
+        ``.topo-state/interconnect.json``）、``TOPO_MANAGER_IC_VLAN_MIN`` /
+        ``TOPO_MANAGER_IC_VLAN_MAX``（預設 100 / 3000）。
 
         回傳：
           - 由環境變數組出的 ``Settings``。
@@ -88,12 +111,18 @@ class Settings:
         state_path = os.environ.get(_ENV_STATE, _DEFAULT_STATE_PATH)
         vlan_min = cls._parse_vlan_env(_ENV_VLAN_MIN, _DEFAULT_VLAN_MIN)
         vlan_max = cls._parse_vlan_env(_ENV_VLAN_MAX, _DEFAULT_VLAN_MAX)
+        ic_state_path = os.environ.get(_ENV_IC_STATE, _DEFAULT_IC_STATE_PATH)
+        ic_vlan_min = cls._parse_vlan_env(_ENV_IC_VLAN_MIN, _DEFAULT_IC_VLAN_MIN)
+        ic_vlan_max = cls._parse_vlan_env(_ENV_IC_VLAN_MAX, _DEFAULT_IC_VLAN_MAX)
 
         return cls(
             topology_path=topology_path,
             state_path=state_path,
             vlan_min=vlan_min,
             vlan_max=vlan_max,
+            ic_state_path=ic_state_path,
+            ic_vlan_min=ic_vlan_min,
+            ic_vlan_max=ic_vlan_max,
         )
 
     @staticmethod

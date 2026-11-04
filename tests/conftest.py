@@ -14,6 +14,10 @@
            RuntimeError，Issue 3）fixture 與 _start_faulty_write_live_server
            輔助。
 
+  - 0.5.0  互聯 REST：新增 ic_small_path / ic_api_client /
+           ic_no_section_api_client（TestClient）與 ic_live_server /
+           ic_no_section_live_server（主執行緒子行程 live-server，
+           _start_ic_live_server 帶互聯帳本與 VLAN 池環境變數）。
 Copyright (c) 2026 topo-manager。
 """
 
@@ -277,6 +281,127 @@ def fullscale_live_server(examples_dir: Path, tmp_path: Path):
     """fullscale 主執行緒 live-server fixture（AC-15 煙測用）。"""
     topology_path = examples_dir / "topology-fullscale.yaml"
     proc, server = _start_live_server(topology_path, tmp_path)
+    try:
+        yield server
+    finally:
+        _stop_live_server(proc, server)
+
+# ----------------------------------------------------------------------
+# 互聯 REST 測試 fixtures（不連任何設備；狀態檔一律在 tmp_path）
+# ----------------------------------------------------------------------
+@pytest.fixture
+def ic_small_path(examples_dir: Path) -> Path:
+    """回傳互聯小規模範例拓樸（4 組 × 4 DUT）的絕對路徑。"""
+    return examples_dir / "topology-interconnect-small.yaml"
+
+
+@pytest.fixture
+def ic_api_client(ic_small_path: Path, tmp_path: Path):
+    """以互聯小拓樸建 app，回 (TestClient, 互聯帳本 Path)。
+
+    僅供讀端點、plan、請求驗證與可 monkeypatch 的錯誤路徑使用（寫入端點的
+    SIGALRM 取鎖需主執行緒，改用 ic_live_server）。
+    """
+    from fastapi.testclient import TestClient
+
+    from topo_manager.api import create_app
+    from topo_manager.api.deps import Settings
+
+    ic_state = tmp_path / "state" / "interconnect.json"
+    settings = Settings(
+        topology_path=str(ic_small_path),
+        state_path=str(tmp_path / "state" / "allocations.json"),
+        ic_state_path=str(ic_state),
+    )
+    return TestClient(create_app(settings)), ic_state
+
+
+@pytest.fixture
+def ic_no_section_api_client(three_tier_path: Path, tmp_path: Path):
+    """以沒有 interconnect 區段的 3tier 拓樸建 app，回 TestClient。"""
+    from fastapi.testclient import TestClient
+
+    from topo_manager.api import create_app
+    from topo_manager.api.deps import Settings
+
+    settings = Settings(
+        topology_path=str(three_tier_path),
+        state_path=str(tmp_path / "state" / "allocations.json"),
+        ic_state_path=str(tmp_path / "state" / "interconnect.json"),
+    )
+    return TestClient(create_app(settings))
+
+
+def _start_ic_live_server(
+    topology_path: Path,
+    tmp_path: Path,
+    ic_state: Path = None,
+    extra_env: dict = None,
+) -> Tuple[subprocess.Popen, _LiveServer]:
+    """啟動帶互聯帳本環境變數的主執行緒 uvicorn 子行程，回 (proc, _LiveServer)。
+
+    骨架同 ``_start_live_server``（不改動既有函式）；額外設定
+    ``TOPO_MANAGER_IC_STATE``（預設 ``tmp_path/state/interconnect.json``）與
+    ``extra_env``。回傳握把的 ``ic_state_path`` 屬性指向互聯帳本。
+    """
+    port = _free_port()
+    state = tmp_path / "state" / "allocations.json"
+    if ic_state is None:
+        ic_state = tmp_path / "state" / "interconnect.json"
+    env = dict(os.environ)
+    env["TOPO_MANAGER_TOPOLOGY"] = str(topology_path)
+    env["TOPO_MANAGER_STATE"] = str(state)
+    env["TOPO_MANAGER_IC_STATE"] = str(ic_state)
+    env["TOPO_MANAGER_HOST"] = "127.0.0.1"
+    env["TOPO_MANAGER_PORT"] = str(port)
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "from topo_manager.api.server import run; run()"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = "http://127.0.0.1:{0}".format(port)
+    client = httpx.Client(base_url=base_url, timeout=10.0)
+    deadline = time.time() + 15.0
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            output = (
+                proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
+            )
+            raise RuntimeError("ic live-server 啟動失敗：\n{0}".format(output))
+        try:
+            response = client.get("/openapi.json")
+            if response.status_code == 200:
+                ready = True
+                break
+        except httpx.HTTPError:
+            time.sleep(0.2)
+    if not ready:
+        proc.terminate()
+        raise RuntimeError("ic live-server 等待就緒逾時")
+    server = _LiveServer(base_url, state, client)
+    server.ic_state_path = ic_state
+    server.topology_path = topology_path
+    return proc, server
+
+
+@pytest.fixture
+def ic_live_server(ic_small_path: Path, tmp_path: Path):
+    """互聯小拓樸的主執行緒 live-server fixture（互聯寫入端點整合測試）。"""
+    proc, server = _start_ic_live_server(ic_small_path, tmp_path)
+    try:
+        yield server
+    finally:
+        _stop_live_server(proc, server)
+
+
+@pytest.fixture
+def ic_no_section_live_server(three_tier_path: Path, tmp_path: Path):
+    """沒有互聯區段的 3tier 主執行緒 live-server fixture。"""
+    proc, server = _start_ic_live_server(three_tier_path, tmp_path)
     try:
         yield server
     finally:
