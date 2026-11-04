@@ -254,6 +254,46 @@ topo-manager/
 - `DELETE /api/sessions/{id}` → 釋放資源、清 VLAN
 - `GET  /api/topology` → 完整拓樸（給視覺化）
 
+### 互聯 REST（帳本層，API 0.5.0）
+互聯功能（§12）同樣提供 REST，與打流側對等，但**只做帳本層**：不連任何設備。
+設備下發（apply、park、verify、帶設備的 release）僅限 CLI，這是刻意的範圍界線。
+所有端點掛在 `/interconnect` 之下，為 `InterconnectAllocator` 的薄層（HTTP、
+Pydantic、例外映射），不重寫配對、衝突與 VLAN 邏輯：
+- `GET    /interconnect/summary` → 組、組內 DUT 編號（d0..d3）、各互聯 fanout 的 port 使用
+- `GET    /interconnect/resources/available` → 每組目前未佔用的 il_port 與可建的 link
+- `GET    /interconnect/sessions` → 列出 active 互聯 session
+- `POST   /interconnect/sessions` → 建立 session；請求為 `group` 加「`duts` + `profile`」
+  或「明確 `pairs`」二選一（語意同 CLI 的 `--group/--duts/--profile/--pair`）；
+  回應含 `session_id`、每條 link 的 VLAN 與兩端 port
+- `DELETE /interconnect/sessions/{session_id}` → 釋放，等同 `release --ledger-only`（不連設備）
+- `POST   /interconnect/plan`、`GET /interconnect/sessions/{session_id}/plan`、
+  `GET /interconnect/plan/park` → 純計算「若下發會下哪些指令」，不連線、不入帳
+
+設計重點：
+- **帳本與環境變數**：互聯帳本獨立於打流側。`TOPO_MANAGER_IC_STATE`（預設
+  `.topo-state/interconnect.json`）、`TOPO_MANAGER_IC_VLAN_MIN` / `TOPO_MANAGER_IC_VLAN_MAX`
+  （預設 100 / 3000）。API 與 CLI 指向同一檔案時，靠既有檔鎖保持一致。
+- **主執行緒**：寫入端點與打流側相同，宣告為 `async def` 在主執行緒事件迴圈執行
+  （`store.locked()` 用 SIGALRM 取鎖，只能在主執行緒）。allocator 每請求新建，並在鎖內
+  重載帳本。取捨：取鎖等待期間（最長一個逾時，預設 10 秒）事件迴圈被卡住，連打流側
+  與唯讀端點也無法回應；擴充請用多行程，不可用多執行緒 worker。
+- **拓樸沒有 interconnect 區段**：app 照常啟動，既有端點不受影響；互聯端點回 404
+  （`InterconnectNotConfiguredError`，說明此拓樸沒有互聯區段），不回 500。
+- **錯誤映射**（沿用 `{"error": {"type", "message"}}`）：
+
+| 例外 | HTTP |
+| --- | --- |
+| `InterconnectRequestError`（跨組、未知 DUT、2 台 ring、重複 port、二選一違反）、請求驗證失敗 | 400 |
+| `InterconnectConflictError`（port 衝突）、`VlanPoolExhaustedError` | 409 |
+| `InterconnectSessionNotFoundError`、`InterconnectNotConfiguredError` | 404 |
+| `SessionStoreError`（帳本 I/O、取鎖逾時） | 503 |
+| 其他非預期例外 | 500（固定訊息，不含 traceback） |
+
+  `InterconnectLayoutError`（拓樸互聯區段不合法）**刻意不映射**：載入時已 fail-fast，
+  請求期理論上不會觸發；若觸發則落 500，避免改變打流側拓樸漂移時的既有映射。
+  `status_for` 以精確型別查表，故各子類皆顯式列出。
+- **版本**：新增端點屬 API 契約擴充，`_API_VERSION` 由 0.4.0 升為 0.5.0。
+
 ### 檔案匯出
 - `GET /api/resources/export?format=yaml` 匯出同等內容成檔，供 ATLAS 直接讀。
 
@@ -390,6 +430,7 @@ port 回到測前狀態（4093 未被修改）。以 `pytest -s` 執行可印出
 - slow protocol（LACP / LLDP / STP）透通須在 switch 端自行設定，本系統不設定
   也不驗證 `l2protocol-tunnel`。
 - 不使用 QinQ：QinQ access port 之間無法互通，且互聯 fanout 沒有 uplink port。
-- 僅 CLI，沒有 REST / Web UI。
+- REST 僅做帳本層（見 §9「互聯 REST」），設備下發（apply / park / verify）僅限
+  CLI；沒有 Web UI 頁籤。
 - 每個 port 需數次 `show` 讀回，大範圍 park 較慢，可用 `--fanout` / `--ports`
   縮小範圍。
