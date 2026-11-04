@@ -65,10 +65,13 @@ The tool ships **two separate executables** (both installed by
 | Entry point | What it is | Interface |
 | --- | --- | --- |
 | `topo-manager` (or `python -m topo_manager`) | A one-shot CLI command — runs a single subcommand, prints the result, and exits | CLI subcommands only (no HTTP server) |
-| `topo-manager-api` (or `uvicorn ... --factory`) | A long-running REST API server | HTTP endpoints only |
+| `topo-manager-api` (or `uvicorn ... --factory`) | A long-running REST API server (also serves a browser [Web UI](#web-ui) on the side) | HTTP endpoints only |
 
 - The **CLI does not start a server** and the **API server does not expose the
   CLI subcommands** — they are launched differently and do different things.
+  The API server additionally serves a lightweight browser [Web UI](#web-ui)
+  at its root URL, but that UI is still a client of the same HTTP endpoints —
+  it is not a third entry point.
 - **Pushing VLAN config to fanout switches** (`plan` / `probe` / `apply` /
   `verify` / `setup`) is **CLI-only**; the REST API has no device-push endpoints.
 - Both act on the **same underlying allocator and the same JSON ledger**: point
@@ -615,6 +618,74 @@ POST/DELETE and the CLI's `allocate`/`release` are mutually exclusive and
 serialized, each re-reading the latest ledger under the lock. The API layer does
 not bypass the file lock or substitute an in-memory cache for the allocator's
 decisions.
+
+---
+
+## Web UI
+
+The same `topo-manager-api` server that exposes the REST API also serves a
+lightweight browser UI on the side — open the server's root URL (`GET /`) in a
+browser and you get a visual front end over the exact same engine and the exact
+same JSON ledger as the REST API. It is not a second service: the Web UI, the
+REST endpoints, and `/docs` are all served by one `topo-manager-api` (uvicorn)
+process, sharing one state.
+
+### Opening it
+
+Start the server exactly as in [Starting the server](#starting-the-server-two-equivalent-ways)
+(either `topo-manager-api` or `uvicorn "topo_manager.api:create_app" --factory`),
+then point a browser at the server's root URL:
+
+```
+http://<host>:<port>/
+```
+
+where `<host>`/`<port>` are `TOPO_MANAGER_HOST` / `TOPO_MANAGER_PORT` (default
+`0.0.0.0:8000`, so typically `http://localhost:8000/`). On one running server:
+
+- `/` — the Web UI
+- `/docs` — the Swagger / OpenAPI documentation (see [Documentation](#documentation-openapi))
+
+### What it does
+
+The UI is read-and-request oriented, mirroring what the REST API offers:
+
+- **Topology view** — renders the fabric as a layered graph (generators on the
+  left, fanout tiers in the middle, DUTs on the right). The layering is derived
+  at runtime from the links (distance from the generators), not from the
+  `role` label, so it draws two-tier, three-tier, and larger fabrics the same
+  way. Hovering a device shows its connected ports.
+- **Session highlight** — clicking a session highlights its end-to-end path
+  (nodes and edges) on the topology graph; clicking it again clears the
+  selection.
+- **Filter sessions** — a text box filters the active-session list by id, VLAN,
+  or port.
+- **Create a session** — pick a generator port and a DUT port and allocate. The
+  dropdowns list **only currently available ports** (those not already held by
+  an active session), so you cannot pick a port that is taken.
+- **Release a session** — release the selected session from its detail panel.
+- **Auto-refresh (optional)** — a checkbox re-polls the server every 10 seconds;
+  a manual **Refresh** button is always available.
+- **Friendly errors** — API errors (e.g. a hard conflict on allocate) are shown
+  as a readable banner rather than a raw status code or traceback.
+
+### Scope: five endpoints, no new backend
+
+The Web UI is a pure client of the **same five REST endpoints** documented in
+[Endpoints and curl examples](#endpoints-and-curl-examples) (`GET /topology`,
+`GET /resources/available`, `GET /sessions`, `POST /sessions`,
+`DELETE /sessions/{id}`). It adds no new backend logic and no new endpoints.
+
+Consequently, **pushing VLAN config to fanout switches** (`apply` / `verify` /
+`setup`) is **not** in the Web UI — those remain **CLI-only**, consistent with
+[Two independent entry points](#two-independent-entry-points). The UI can show
+and request/release sessions, but device pushes stay on the CLI.
+
+Writes triggered from the UI (allocate / release) go through the same POST /
+DELETE handlers as the REST API, so the main-thread deployment constraint and
+the single-process serialization behavior described under
+[Starting the server](#starting-the-server-two-equivalent-ways) apply unchanged
+— the UI does not add a separate write path or bypass the file lock.
 
 ---
 
