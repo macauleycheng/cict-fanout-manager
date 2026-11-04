@@ -26,6 +26,9 @@
            帶 EDGE role，去重鍵維持 (fanout,interface,vlan)、同鍵異 role 丟
            ``PortMappingError`` fail-closed；``diff_expected_vs_actual`` 依 role
            分流判定。import ``PortRole_E``。純邏輯，不 import netmiko。
+  - 0.5.1  設備下發 REST：新增純函式 ``required_fanouts``（session 路徑上屬於
+           拓樸 fanout 集合者），供 REST 在連線前核對 credentials 是否涵蓋；
+           不改 ``plan_changes`` 與其他既有函式。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -33,7 +36,7 @@ Copyright (c) 2026 topo-manager。
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Mapping, Optional
+from typing import Container, Dict, List, Mapping, Optional
 
 from topo_manager.drivers.base import (
     PortRole_E,
@@ -256,3 +259,32 @@ def diff_expected_vs_actual(
         if not satisfied:
             missing.append(change)
     return missing
+
+
+def required_fanouts(session: "object", known_fanouts: Container[str]) -> List[str]:
+    """回傳 session 路徑上所有屬於拓樸 fanout 集合的 fanout 名（純邏輯）。
+
+    將 session 路徑上的裝置（trunk 兩端節點與 ``_derive_edge_nodes`` 邊緣節點）
+    與拓樸的 fanout 名集合取交集；generator／DUT 等非 fanout 節點被排除。
+    重用 ``_split_node`` 與 ``plan_changes`` 相同的節點推導，不改其行為。
+
+    INPUT：
+      - session：一筆 Session（具 ``trunk_segments``，可選 ``path``）。
+      - known_fanouts：拓樸中的 fanout 裝置名集合（僅做 ``in`` 判斷）。
+
+    OUTPUT：無。
+
+    RETURN：
+      - 排序且去重的 fanout 名清單（List[str]）。
+    """
+    nodes: List[str] = []
+    for segment in session.trunk_segments:
+        nodes.append(segment.a_node)
+        nodes.append(segment.b_node)
+    nodes.extend(_derive_edge_nodes(session))
+    names = set()
+    for node_id in nodes:
+        dev = _split_node(node_id)[0]
+        if dev in known_fanouts:
+            names.add(dev)
+    return sorted(names)

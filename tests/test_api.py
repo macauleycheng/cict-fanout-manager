@@ -466,3 +466,51 @@ def test_build_allocator_bad_vlan(three_tier_path: Path, tmp_path: Path) -> None
     )
     with pytest.raises(ConfigError):
         build_allocator(settings)
+
+
+# ----------------------------------------------------------------------
+# 設備下發 REST 的 OpenAPI 契約（預設關閉時與既有逐位元一致）
+# ----------------------------------------------------------------------
+_PUSH_PATHS = [
+    ("/sessions/{session_id}/apply", "post"),
+    ("/sessions/{session_id}/verify", "get"),
+    ("/fanouts/setup", "post"),
+    ("/interconnect/sessions/{session_id}/apply", "post"),
+    ("/interconnect/sessions/{session_id}/verify", "get"),
+    ("/interconnect/park", "post"),
+    ("/interconnect/sessions/{session_id}/release-device", "post"),
+]
+
+
+def test_openapi_unchanged_when_push_disabled(
+    api_client: Tuple[TestClient, Path],
+) -> None:
+    """未啟用：版本 0.5.0、路徑集合不含 7 個下發路徑、description 仍含「僅限 CLI」。"""
+    client, _ = api_client
+    body = client.get("/openapi.json").json()
+    assert body["info"]["version"] == "0.5.0"
+    assert "僅限 CLI" in body["info"]["description"]
+    assert "X-API-Token" not in body["info"]["description"]
+    for path, _method in _PUSH_PATHS:
+        assert path not in body["paths"]
+
+
+def test_openapi_when_push_enabled(three_tier_path: Path, tmp_path: Path) -> None:
+    """啟用：版本 0.6.0、含 7 個下發路徑且各自文件化 401／404／409／502／504。"""
+    from topo_manager.api import create_app
+    from topo_manager.api.deps import Settings
+
+    settings = Settings(
+        topology_path=str(three_tier_path),
+        state_path=str(tmp_path / "state" / "allocations.json"),
+        enable_device_push=True,
+        api_token="t",
+    )
+    body = TestClient(create_app(settings)).get("/openapi.json").json()
+    assert body["info"]["version"] == "0.6.0"
+    assert "僅限 CLI" not in body["info"]["description"]
+    assert "X-API-Token" in body["info"]["description"]
+    for path, method in _PUSH_PATHS:
+        responses = body["paths"][path][method]["responses"]
+        for code in ("401", "404", "409", "502", "504"):
+            assert code in responses, (path, code)

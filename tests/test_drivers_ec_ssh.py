@@ -608,3 +608,57 @@ def test_show_dot1q_tunnel_command_has_no_pipe_filter() -> None:
 
     assert _SHOW_DOT1Q_TUNNEL in conn.sent_commands
     assert all("| include" not in cmd for cmd in conn.sent_commands)
+
+
+# ----------------------------------------------------------------------
+# 設備下發 REST：逾時類例外改丟 DeviceTimeoutError（0.5.2）
+# ----------------------------------------------------------------------
+class ReadTimeout(Exception):
+    """替身：類別名與 netmiko 4.x send_command 逾時例外 ReadTimeout 相同。"""
+
+
+class NetmikoAuthenticationException(Exception):
+    """替身：類別名與 netmiko 認證失敗例外相同。"""
+
+
+class ConnectionException(Exception):
+    """替身：類別名與 netmiko ConnectionException 相同。"""
+
+
+def _connect_raising(exc: Exception) -> None:
+    def _factory(**kwargs):
+        raise exc
+
+    EcSshDriver(
+        host="fanout-x", username="u", password="super-secret-pw", connection_factory=_factory
+    ).connect()
+
+
+def test_netmiko_timeout_raises_device_timeout_error() -> None:
+    """NetmikoTimeoutException → DeviceTimeoutError，且仍是 DriverConnectionError。"""
+    from topo_manager.errors import DeviceTimeoutError
+
+    with pytest.raises(DeviceTimeoutError) as info:
+        _connect_raising(NetmikoTimeoutException("timed out"))
+    assert isinstance(info.value, DriverConnectionError)
+    assert isinstance(info.value.__cause__, NetmikoTimeoutException)
+    assert "fanout-x" in str(info.value)
+    assert "super-secret-pw" not in str(info.value)
+
+
+def test_read_timeout_raises_device_timeout_error() -> None:
+    """ReadTimeout（netmiko 4.x send_command 逾時）同樣是 DeviceTimeoutError。"""
+    from topo_manager.errors import DeviceTimeoutError
+
+    with pytest.raises(DeviceTimeoutError):
+        _connect_raising(ReadTimeout("read timed out"))
+
+
+@pytest.mark.parametrize("exc_class", [NetmikoAuthenticationException, ConnectionException])
+def test_auth_and_connection_errors_stay_plain_connection_error(exc_class) -> None:
+    """認證失敗與 ConnectionException 不是逾時：維持純 DriverConnectionError。"""
+    from topo_manager.errors import DeviceTimeoutError
+
+    with pytest.raises(DriverConnectionError) as info:
+        _connect_raising(exc_class("boom"))
+    assert not isinstance(info.value, DeviceTimeoutError)

@@ -20,6 +20,10 @@ VLAN 成員時 PVID 自動改成剩餘成員）。使「指令順序正確性」
 歷史（HISTORY）：
   - 0.1.0  互聯 fanout 初版。
   - 0.2.0  新增 FakeEcSwitch 設備狀態機（含 hybrid + 4093 tagged 初始狀態）。
+  - 0.3.0  設備下發 REST：新增 FakeTrafficSwitch（打流側 show vlan／
+           show dot1q-tunnel 假設備）、FakeSwitchFarm（依 host 配發假設備，並
+           可注入認證失敗／逾時／ReadTimeout／靜默忽略設定等失敗模式）與
+           以 netmiko 例外類別名命名的替身例外。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -329,3 +333,154 @@ class FakeEcSwitch:
                 "Ports/Port Channels : {0}".format(members),
             ]
         )
+
+
+# ======================================================================
+# 設備下發 REST 用假設備（絕不連真實設備）
+# ======================================================================
+class NetmikoAuthenticationException(Exception):
+    """替身：類別名與 netmiko 的認證失敗例外相同，供 driver 以名辨識。"""
+
+
+class NetmikoTimeoutException(Exception):
+    """替身：類別名與 netmiko 的連線逾時例外相同。"""
+
+
+class ReadTimeout(Exception):
+    """替身：類別名與 netmiko 4.x send_command 逾時例外相同。"""
+
+
+class FakeTrafficSwitch:
+    """打流側假 netmiko connection：回應 ``show vlan`` 與 ``show dot1q-tunnel``。
+
+    只模擬 EcSshDriver 下發所需的最小行為：進介面、tagged 成員、native vlan、
+    tunnel mode、全域 tunnel control。``drop_config=True`` 時所有設定指令被靜默
+    忽略（用來製造 read-back 不符）。
+    """
+
+    def __init__(self) -> None:
+        self.tagged: Dict[int, Set[int]] = {}
+        self.tunnel_modes: Dict[int, str] = {}
+        self.tunnel_enabled = False
+        self.drop_config = False
+        self.config_batches: List[List[str]] = []
+        self.connect_count = 0
+
+    def enable(self) -> None:
+        """no-op。"""
+
+    def disconnect(self) -> None:
+        """no-op。"""
+
+    def send_command(self, command: str, **kwargs: object) -> str:
+        """唯讀 show 指令。"""
+        if command == "terminal length 0":
+            return ""
+        if command == "show vlan":
+            return self._show_vlan()
+        if command == "show dot1q-tunnel":
+            return self._show_tunnel()
+        return "% Invalid input detected"
+
+    def send_config_set(
+        self, commands: List[str], config_mode_command: Optional[str] = None, **kwargs: object
+    ) -> str:
+        """設定指令：依序套用到狀態（drop_config 時略過）。"""
+        self.config_batches.append(list(commands))
+        if self.drop_config:
+            return ""
+        port = None
+        for command in commands:
+            match = re.match(r"^interface ethernet 1/(\d+)$", command)
+            if match is not None:
+                port = int(match.group(1))
+                continue
+            if command == "dot1q-tunnel system-tunnel-control":
+                self.tunnel_enabled = True
+                continue
+            if port is None:
+                continue
+            match = re.match(r"^switchport allowed vlan add (\d+) tagged$", command)
+            if match is not None:
+                self.tagged.setdefault(int(match.group(1)), set()).add(port)
+                continue
+            match = re.match(r"^switchport allowed vlan remove (\d+)$", command)
+            if match is not None:
+                self.tagged.get(int(match.group(1)), set()).discard(port)
+                continue
+            if command == "switchport dot1q-tunnel mode access":
+                self.tunnel_modes[port] = "Access"
+            elif command == "switchport dot1q-tunnel mode uplink":
+                self.tunnel_modes[port] = "Uplink"
+            elif command == "no switchport dot1q-tunnel mode":
+                self.tunnel_modes.pop(port, None)
+        return ""
+
+    def _show_vlan(self) -> str:
+        blocks = ["VLAN ID             : 1", "Ports/Port Channels : "]
+        for vlan in sorted(self.tagged):
+            members = " ".join(
+                "Eth1/{0:>2}(S)".format(number) for number in sorted(self.tagged[vlan])
+            )
+            blocks.append("VLAN ID             : {0}".format(vlan))
+            blocks.append("Ports/Port Channels : {0}".format(members))
+        return "\n".join(blocks)
+
+    def _show_tunnel(self) -> str:
+        lines = [
+            "802.1Q Tunnel Status : {0}".format("Enabled" if self.tunnel_enabled else "Disabled")
+        ]
+        for number in sorted(self.tunnel_modes):
+            lines.append("Eth 1/{0:>2} {1} Disabled".format(number, self.tunnel_modes[number]))
+        return "\n".join(lines)
+
+
+class _ReadTimeoutConnection:
+    """連線後每個 send_command 都丟 ReadTimeout 的假 connection。"""
+
+    def enable(self) -> None:
+        """no-op。"""
+
+    def disconnect(self) -> None:
+        """no-op。"""
+
+    def send_command(self, command: str, **kwargs: object) -> str:
+        raise ReadTimeout("read timed out")
+
+
+class FakeSwitchFarm:
+    """依 host 配發假設備的 ``connection_factory``，可注入失敗模式。
+
+    參數：
+      - kind：``"traffic"`` 配 FakeTrafficSwitch；``"ic"`` 配 FakeEcSwitch。
+      - mode：``ok`` | ``auth`` | ``timeout`` | ``readtimeout`` | ``drop``。
+    屬性：
+      - connects：每次 factory 被呼叫時的 host 清單（可斷言「從未連線」）。
+      - switches：host → 假設備。
+    """
+
+    def __init__(self, kind: str, mode: str = "ok") -> None:
+        self.kind = kind
+        self.mode = mode
+        self.connects: List[str] = []
+        self.switches: Dict[str, object] = {}
+
+    def factory(self, **kwargs: object) -> object:
+        """netmiko connection_factory：依模式丟替身例外或回假設備。"""
+        host = str(kwargs.get("host"))
+        self.connects.append(host)
+        if self.mode == "auth":
+            raise NetmikoAuthenticationException("auth failed")
+        if self.mode == "timeout":
+            raise NetmikoTimeoutException("timed out")
+        if self.mode == "readtimeout":
+            return _ReadTimeoutConnection()
+        if host not in self.switches:
+            switch = FakeTrafficSwitch() if self.kind == "traffic" else FakeEcSwitch()
+            if self.mode == "drop":
+                if self.kind == "traffic":
+                    switch.drop_config = True
+                else:
+                    switch.silent_drop = {"no shutdown"}
+            self.switches[host] = switch
+        return self.switches[host]

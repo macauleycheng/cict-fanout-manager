@@ -18,6 +18,14 @@
            ic_no_section_api_client（TestClient）與 ic_live_server /
            ic_no_section_live_server（主執行緒子行程 live-server，
            _start_ic_live_server 帶互聯帳本與 VLAN 池環境變數）。
+  - 0.6.0  設備下發 REST：新增 write_fake_credentials（runtime 產生 tmp
+           credentials，host 為合成的 fake-host-N，絕非真實 IP）、
+           push_api_client（啟用設備下發的 TestClient，供請求驗證測試）與
+           _start_push_live_server / push_live_server / ic_push_live_server
+           （主執行緒 live-server，額外帶 TOPO_MANAGER_ENABLE_DEVICE_PUSH /
+           TOPO_MANAGER_API_TOKEN / TOPO_MANAGER_CREDENTIALS，並以
+           connection_factory 注入 FakeEcSwitch 讓下發端點在子行程內可離線
+           驗證）。
 Copyright (c) 2026 topo-manager。
 """
 
@@ -29,7 +37,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 import httpx
 import pytest
@@ -406,3 +414,221 @@ def ic_no_section_live_server(three_tier_path: Path, tmp_path: Path):
         yield server
     finally:
         _stop_live_server(proc, server)
+
+
+# ----------------------------------------------------------------------
+# 設備下發 REST 測試 fixtures（絕不連真實設備；host 一律是合成字串）
+# ----------------------------------------------------------------------
+
+
+def write_fake_credentials(tmp_path: Path, fanout_names: List[str]) -> Path:
+    """寫 runtime 產生的 tmp credentials（host 為合成 ``fake-host-N``）。
+
+    host／username／password 的值在執行時組字串，不含任何真實 IP 或密碼
+    字面（絕不使用真實設備位址）；檔案只存於 ``tmp_path``，不入版控。
+    """
+    import json as _json
+
+    fanouts = {
+        name: {
+            "host": "fake-host-{0}".format(index),
+            "username": "fake-user-{0}".format(index),
+            "password": "fake-pass-{0}".format(index),
+        }
+        for index, name in enumerate(fanout_names)
+    }
+    path = tmp_path / "fake-credentials.json"
+    path.write_text(_json.dumps({"fanouts": fanouts}), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def push_api_client(three_tier_path: Path, tmp_path: Path):
+    """啟用設備下發的打流 TestClient（僅供請求驗證／401／404 測試，不連線）。
+
+    回 (TestClient, state_path, token)；fanout credentials 指向一個不存在的
+    檔案（絕不可能被成功讀取而連線），用來斷言 401 發生在 credentials 載入
+    之前。
+    """
+    from fastapi.testclient import TestClient
+
+    from topo_manager.api import create_app
+    from topo_manager.api.deps import Settings
+
+    state = tmp_path / "state" / "allocations.json"
+    token = "test-token-xyz"
+    settings = Settings(
+        topology_path=str(three_tier_path),
+        state_path=str(state),
+        enable_device_push=True,
+        api_token=token,
+        credentials_path=str(tmp_path / "does-not-exist.json"),
+    )
+    return TestClient(create_app(settings)), state, token
+
+
+@pytest.fixture
+def ic_push_api_client(ic_small_path: Path, tmp_path: Path):
+    """啟用設備下發的互聯 TestClient（僅供請求驗證測試，不連線）。"""
+    from fastapi.testclient import TestClient
+
+    from topo_manager.api import create_app
+    from topo_manager.api.deps import Settings
+
+    token = "test-token-xyz"
+    settings = Settings(
+        topology_path=str(ic_small_path),
+        state_path=str(tmp_path / "state" / "allocations.json"),
+        ic_state_path=str(tmp_path / "state" / "interconnect.json"),
+        enable_device_push=True,
+        api_token=token,
+        credentials_path=str(tmp_path / "does-not-exist.json"),
+    )
+    return TestClient(create_app(settings)), token
+
+
+# 子行程進入點：啟用設備下發、以假 credentials 與 FakeEcSwitch connection_factory
+# 注入打流／互聯 driver（永不連真實設備），於主執行緒跑真 HTTP（SIGALRM 可用）。
+_PUSH_SERVER_SCRIPT = (
+    "import json, os\n"
+    "import uvicorn\n"
+    "from topo_manager.api import create_app\n"
+    "from topo_manager.api.deps import Settings\n"
+    "from ic_fakes import FakeSwitchFarm\n"
+    "settings = Settings(\n"
+    "    topology_path=os.environ['TOPO_MANAGER_TOPOLOGY'],\n"
+    "    state_path=os.environ['TOPO_MANAGER_STATE'],\n"
+    "    ic_state_path=os.environ.get('TOPO_MANAGER_IC_STATE'),\n"
+    "    enable_device_push=True,\n"
+    "    api_token=os.environ['TOPO_MANAGER_API_TOKEN'],\n"
+    "    credentials_path=os.environ['TOPO_MANAGER_CREDENTIALS'],\n"
+    ")\n"
+    "mode = os.environ.get('PUSH_FAKE_MODE', 'ok')\n"
+    "traffic_farm = FakeSwitchFarm('traffic', mode)\n"
+    "ic_farm = FakeSwitchFarm('ic', mode)\n"
+    "\n"
+    "\n"
+    "def _driver_factory(name, entry):\n"
+    "    from topo_manager.drivers.ec_ssh import EcSshDriver\n"
+    "    return EcSshDriver(\n"
+    "        host=entry.host, username=entry.username, password=entry.password,\n"
+    "        device_type=entry.device_type, interface_template=entry.interface_template,\n"
+    "        connection_factory=traffic_farm.factory,\n"
+    "    )\n"
+    "\n"
+    "\n"
+    "def _ic_driver_factory(name, entry):\n"
+    "    from topo_manager.drivers.ec_ssh_ic import EcSshInterconnectDriver\n"
+    "    return EcSshInterconnectDriver(\n"
+    "        host=entry.host, username=entry.username, password=entry.password,\n"
+    "        device_type=entry.device_type, interface_template=entry.interface_template,\n"
+    "        connection_factory=ic_farm.factory, force_access_mode=True,\n"
+    "    )\n"
+    "\n"
+    "\n"
+    "app = create_app(\n"
+    "    settings, push_driver_factory=_driver_factory,\n"
+    "    ic_push_driver_factory=_ic_driver_factory,\n"
+    ")\n"
+    "uvicorn.run(\n"
+    "    app,\n"
+    "    host=os.environ['TOPO_MANAGER_HOST'],\n"
+    "    port=int(os.environ['TOPO_MANAGER_PORT']),\n"
+    ")\n"
+)
+
+
+def _start_push_live_server(
+    topology_path: Path,
+    tmp_path: Path,
+    fanout_names: List[str],
+    mode: str = "ok",
+) -> Tuple[subprocess.Popen, _LiveServer]:
+    """啟動啟用設備下發、以 FakeSwitchFarm 注入假設備的主執行緒 live-server。
+
+    ``mode``：ok | auth | timeout | readtimeout | drop（見 ic_fakes.FakeSwitchFarm）。
+    """
+    port = _free_port()
+    state = tmp_path / "state" / "allocations.json"
+    ic_state = tmp_path / "state" / "interconnect.json"
+    credentials = write_fake_credentials(tmp_path, fanout_names)
+    env = dict(os.environ)
+    env["TOPO_MANAGER_TOPOLOGY"] = str(topology_path)
+    env["TOPO_MANAGER_STATE"] = str(state)
+    env["TOPO_MANAGER_IC_STATE"] = str(ic_state)
+    env["TOPO_MANAGER_HOST"] = "127.0.0.1"
+    env["TOPO_MANAGER_PORT"] = str(port)
+    env["TOPO_MANAGER_ENABLE_DEVICE_PUSH"] = "1"
+    env["TOPO_MANAGER_API_TOKEN"] = "test-token-xyz"
+    env["TOPO_MANAGER_CREDENTIALS"] = str(credentials)
+    env["PUSH_FAKE_MODE"] = mode
+    # 讓子行程能 `from ic_fakes import FakeEcSwitch`（tests/ 目錄本身）。
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent) + os.pathsep + env.get(
+        "PYTHONPATH", ""
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _PUSH_SERVER_SCRIPT],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = "http://127.0.0.1:{0}".format(port)
+    client = httpx.Client(base_url=base_url, timeout=10.0)
+    deadline = time.time() + 15.0
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            output = (
+                proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
+            )
+            raise RuntimeError("push live-server 啟動失敗：\n{0}".format(output))
+        try:
+            response = client.get("/openapi.json")
+            if response.status_code == 200:
+                ready = True
+                break
+        except httpx.HTTPError:
+            time.sleep(0.2)
+    if not ready:
+        proc.terminate()
+        raise RuntimeError("push live-server 等待就緒逾時")
+    server = _LiveServer(base_url, state, client)
+    server.ic_state_path = ic_state
+    server.topology_path = topology_path
+    server.token = "test-token-xyz"
+    return proc, server
+
+
+@pytest.fixture
+def push_server_factory(tmp_path: Path):
+    """回傳 ``start(topology_path, fanout_names, mode="ok") -> _LiveServer`` 的啟動器。
+
+    fixture 結束時關閉所有已啟動的 live-server 子行程。
+    """
+    started = []
+
+    def _start(topology_path: Path, fanout_names: List[str], mode: str = "ok") -> _LiveServer:
+        proc, server = _start_push_live_server(topology_path, tmp_path, fanout_names, mode)
+        started.append((proc, server))
+        return server
+
+    yield _start
+    for proc, server in started:
+        _stop_live_server(proc, server)
+
+
+_TRAFFIC_FANOUTS = ["spine-1", "agg-1", "agg-2", "leaf-1-1", "leaf-2-1"]
+_IC_FANOUTS = ["core-1", "leaf-1", "leaf-2", "ic-1-1", "ic-2-1"]
+
+
+@pytest.fixture
+def push_live_server(three_tier_path: Path, push_server_factory):
+    """3tier 啟用設備下發的主執行緒 live-server（假設備，mode=ok）。"""
+    return push_server_factory(three_tier_path, _TRAFFIC_FANOUTS)
+
+
+@pytest.fixture
+def ic_push_live_server(ic_small_path: Path, push_server_factory):
+    """互聯小拓樸啟用設備下發的主執行緒 live-server（假設備，mode=ok）。"""
+    return push_server_factory(ic_small_path, _IC_FANOUTS)

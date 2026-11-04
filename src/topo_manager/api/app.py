@@ -20,17 +20,23 @@ settings / shared allocator / topology 存入 ``app.state`` 供 routes 取用。
            _API_VERSION 由 "0.4.0" 升為 "0.5.0"（OpenAPI 契約新增互聯端點，
            屬 semver minor；此 0.6.0 為本模組 HISTORY 標號，與 _API_VERSION
            是兩套計數）。
+  - 0.7.0  設備下發 REST：create_app 新增 keyword-only 的 push_driver_factory /
+           ic_push_driver_factory（測試注入假 driver）；永遠 include
+           push_routes / ic_push_routes，未啟用時 include_in_schema=False
+           （請求命中得結構化 404，OpenAPI 與既有逐位元一致）；啟用時
+           version 為 "0.6.0" 並替換 description 的「僅限 CLI」句。未啟用時
+           version／description 維持 "0.5.0"／原字串（既有測試不變）。
 
 Copyright (c) 2026 topo-manager。
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import FastAPI
 
-from topo_manager.api import ic_routes, routes
+from topo_manager.api import ic_push_routes, ic_routes, push_routes, routes
 from topo_manager.api.deps import Settings, build_allocator
 from topo_manager.api.errors import register_exception_handlers
 from topo_manager.api.ic_deps import build_ic_startup_graph
@@ -50,7 +56,26 @@ _API_DESCRIPTION = (
 )
 
 
-def create_app(settings: Optional[Settings] = None) -> FastAPI:
+# 啟用設備下發時的版本與描述（未啟用沿用上方常數，逐字不變）。
+_API_VERSION_PUSH = "0.6.0"
+_CLI_ONLY_SENTENCE = (
+    "互聯的設備下發（apply / park / 帶設備的 release / verify）僅限 "
+    "CLI，REST 不提供、不連任何設備。"
+)
+_PUSH_SENTENCE = (
+    "設備下發端點（apply / verify / setup / park / release-device）預設關閉，"
+    "需設定 TOPO_MANAGER_ENABLE_DEVICE_PUSH=1 與 TOPO_MANAGER_API_TOKEN，並以 "
+    "X-API-Token header 驗證；這些端點會連線並寫入 fanout，請求期間 server "
+    "事件迴圈會被阻塞。"
+)
+
+
+def create_app(
+    settings: Optional[Settings] = None,
+    *,
+    push_driver_factory: Optional[Callable[[str, object], object]] = None,
+    ic_push_driver_factory: Optional[Callable[[str, object], object]] = None,
+) -> FastAPI:
     """建立並回傳設定完成的 ``FastAPI`` app（唯一 factory，設計 §3、§4.3）。
 
     啟動期 fail-fast：立即載入拓樸並建單例 allocator；拓樸 / 設定 / ledger
@@ -59,6 +84,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     參數：
       - settings：顯式設定（測試注入）；``None`` 時走 ``Settings.from_env()``
         （供 uvicorn ``--factory``）。
+      - push_driver_factory / ic_push_driver_factory：打流／互聯下發的 driver
+        工廠 ``(fanout 名, FanoutEntry) -> driver``（測試注入假 driver；None 時
+        用預設 EcSsh 工廠）。僅在啟用設備下發時生效。
 
     回傳：
       - 已掛 router、註冊 exception handler、且 ``app.state`` 含 settings /
@@ -74,10 +102,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     topology = load_topology(settings.topology_path)
     allocator = build_allocator(settings)
 
+    push_enabled = settings.enable_device_push is True
+    if push_enabled:
+        version = _API_VERSION_PUSH
+        description = _API_DESCRIPTION.replace(_CLI_ONLY_SENTENCE, _PUSH_SENTENCE)
+    else:
+        version = _API_VERSION
+        description = _API_DESCRIPTION
+
     app = FastAPI(
         title=_API_TITLE,
-        version=_API_VERSION,
-        description=_API_DESCRIPTION,
+        version=version,
+        description=description,
     )
 
     # 共用狀態存 app.state：讀路徑用 settings 重建、寫路徑共用 allocator、
@@ -91,6 +127,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app.include_router(routes.router)
     app.include_router(ic_routes.router)
+    # 設備下發 router 永遠掛載：未啟用時 include_in_schema=False，請求命中由
+    # require_device_push 回結構化 404；OpenAPI 與未加此功能時一致。
+    if push_enabled:
+        app.state.push_driver_factory = push_driver_factory
+        app.state.ic_push_driver_factory = ic_push_driver_factory
+    app.include_router(push_routes.router, include_in_schema=push_enabled)
+    app.include_router(ic_push_routes.router, include_in_schema=push_enabled)
     # Web UI 靜態服務：於 include_router 之後掛 /static 與 GET /（設計 §1.1/§1.4）。
     # register_ui 純靜態、不碰 app.state / allocator / topology，不參與 fail-fast。
     register_ui(app)

@@ -67,6 +67,12 @@ netmiko 的連線/認證/逾時例外一律就地捕捉並包成 ``DriverConnect
            'no switchport dot1q-tunnel mode'。以真機 QinQ 邊緣+互聯 live 驗證
            通過（邊緣 Eth1/42、互聯 Eth1/41，VLAN 3999，測後 read-back 確認還原
            為 Normal、無 VLAN 3999 殘留）。
+  - 0.5.2  設備下發 REST：``_reraise_as_connection_error`` 把逾時類例外
+           （NetmikoTimeoutException / NetMikoTimeoutException / 新增的
+           ReadTimeout）改丟 ``DeviceTimeoutError``（繼承 DriverConnectionError，
+           既有 except 與測試不變），認證／ConnectionException 維持
+           DriverConnectionError。行為變更：ReadTimeout 原本 apply 路徑被包成
+           502、verify／setup 路徑落 500，改後一律 504；無既有測試涉及。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -84,6 +90,7 @@ from topo_manager.drivers.base import (
     VlanState,
 )
 from topo_manager.errors import (
+    DeviceTimeoutError,
     DriverConnectionError,
     DriverDependencyError,
     DriverParseError,
@@ -785,6 +792,19 @@ class EcSshDriver(FanoutDriver):
           - 原始例外：非 netmiko 連線類例外原樣重拋。
         """
         exc_class_name = type(exc).__name__
+        # 逾時類（含 netmiko 4.x send_command 的 ReadTimeout）優先判斷，
+        # 丟 DeviceTimeoutError（⊂ DriverConnectionError，REST 對應 504）。
+        netmiko_timeout_errors = {
+            "NetmikoTimeoutException",
+            "NetMikoTimeoutException",
+            "ReadTimeout",
+        }
+        if exc_class_name in netmiko_timeout_errors:
+            raise DeviceTimeoutError(
+                "{0}逾時（fanout {1}）：{2}".format(
+                    action_desc, self._host, exc_class_name
+                )
+            ) from exc
         netmiko_connection_errors = {
             "NetmikoTimeoutException",
             "NetmikoAuthenticationException",

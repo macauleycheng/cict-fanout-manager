@@ -73,7 +73,9 @@ The tool ships **two separate executables** (both installed by
   at its root URL, but that UI is still a client of the same HTTP endpoints —
   it is not a third entry point.
 - **Pushing VLAN config to fanout switches** (`plan` / `probe` / `apply` /
-  `verify` / `setup`) is **CLI-only**; the REST API has no device-push endpoints.
+  `verify` / `setup`) is **CLI-only** by default; the REST API has no device-push
+  endpoints unless you opt in (see
+  [Device push over REST](#device-push-over-rest)).
   This also applies to the interconnect feature: the REST API covers
   [interconnect ledger operations](#interconnect-endpoints) (create/release/
   list/plan), but `apply`, `park`, `release --apply`, and `verify` for
@@ -744,6 +746,9 @@ Yes — once started, `topo-manager-api` is a long-running resident service.
 > another API process) holds the lock, this process's responsiveness is frozen
 > until the timeout. This is the inherent trade-off of a signal-based file lock,
 > not a bug. To scale, use **multiple processes**, never multi-threaded workers.
+> When the opt-in [Device push over REST](#device-push-over-rest) endpoints are
+> enabled, the blocking window grows from a lock wait to a full SSH round-trip
+> (see [Liveness: SSH pushes block the event loop even longer](#liveness-ssh-pushes-block-the-event-loop-even-longer)).
 
 ### Documentation (OpenAPI)
 
@@ -841,10 +846,11 @@ sessions without the CLI. The endpoints work on the **interconnect ledger only**
 (`TOPO_MANAGER_IC_STATE`, see [Configuration](#configuration-environment-variables)),
 which is separate from the traffic ledger.
 
-> **Scope: ledger operations only.** The REST API never connects to a device.
-> Pushing the configuration to the interconnect fanout (`apply`, `park`,
-> `release --apply`, `verify`) is **CLI-only**, just like pushing VLAN config for
-> traffic sessions. `DELETE` is the equivalent of `release --ledger-only`: it
+> **Scope: ledger operations only (by default).** The endpoints in this table
+> never connect to a device. Pushing the configuration to the interconnect
+> fanout (`apply`, `park`, `release --apply`, `verify`) is **CLI-only**, just
+> like pushing VLAN config for traffic sessions, unless you enable the opt-in
+> [Device push over REST](#device-push-over-rest) endpoints. `DELETE` is the equivalent of `release --ledger-only`: it
 > removes the session from the ledger and leaves the device untouched.
 
 | Method and path | CLI equivalent | Success | Purpose |
@@ -994,6 +1000,180 @@ configures a device. Do not release a session over REST while a CLI
 `interconnect apply --apply` or `release --apply` for the same session is
 running; if the device is left configured without a ledger entry, clean it up
 with `interconnect park --apply`.
+
+### Device push over REST
+
+This is now available but off by default, see below: in addition to the
+ledger-only interconnect endpoints above, the server can optionally expose
+seven endpoints that actually connect to fanout switches and write
+configuration, covering both the traffic side and the interconnect side.
+These are **disabled by default** — when disabled, the server, the existing
+endpoints, and the OpenAPI document behave exactly as described earlier in
+this README; the only observable difference is that requests to the seven
+paths below answer a structured 404 instead of Starlette's default "Not
+Found" (see [Enabling it](#enabling-it) below for the exact `error.type`).
+
+#### Enabling it
+
+Two environment variables control this feature:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TOPO_MANAGER_ENABLE_DEVICE_PUSH` | unset (disabled) | `1` enables the seven endpoints below; unset, empty, or `0` keeps them disabled. Any other value (e.g. `true`) **fails fast at startup** rather than being silently treated as disabled. |
+| `TOPO_MANAGER_API_TOKEN` | (none) | The shared secret compared against the `X-API-Token` request header. **Required** when the feature is enabled — if it is unset or empty while `TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`, the app fails to start: one stderr line, non-zero exit code, no traceback. Ignored (not read) when the feature is disabled. |
+| `TOPO_MANAGER_CREDENTIALS` | unset | Optional path to the fanout connection-settings JSON (same file the CLI's `--credentials` reads via `load_fanout_config`); unset uses the CLI's own default lookup (`fanout-credentials.json` in the working directory, overridable with `TOPO_FANOUT_*` env vars). Ignored when the feature is disabled. |
+
+```bash
+export TOPO_MANAGER_TOPOLOGY=examples/topology-3tier.yaml
+export TOPO_MANAGER_ENABLE_DEVICE_PUSH=1
+export TOPO_MANAGER_API_TOKEN="$(openssl rand -hex 32)"
+export TOPO_MANAGER_CREDENTIALS=/etc/topo-manager/fanout-credentials.json
+topo-manager-api
+```
+
+When enabled, `GET /openapi.json`'s `info.version` becomes `0.6.0` (it stays
+`0.5.0` when disabled) and the seven paths below appear in the document.
+
+#### Endpoints and their CLI equivalents
+
+| Method and path | CLI equivalent | Device action |
+| --- | --- | --- |
+| `POST /sessions/{session_id}/apply` | `apply --apply` | Push the traffic session's VLAN/tunnel config and read it back |
+| `GET /sessions/{session_id}/verify` | `verify` | Read-only check of the traffic session against the fanout |
+| `POST /fanouts/setup` | `setup --apply` | Enable the global `dot1q-tunnel system-tunnel-control` switch on one or more fanouts |
+| `POST /interconnect/sessions/{session_id}/apply` | `interconnect apply --apply` | Enable the interconnect session's ports and VLANs |
+| `GET /interconnect/sessions/{session_id}/verify` | `interconnect verify --session` | Read-only check of the interconnect session |
+| `POST /interconnect/park` | `interconnect park --apply` | Return interconnect ports to the parking baseline |
+| `POST /interconnect/sessions/{session_id}/release-device` | `interconnect release --apply` | Two-phase device release (park, clear VLANs, then remove from the ledger) |
+
+The existing `DELETE /interconnect/sessions/{session_id}` is unchanged: it
+stays ledger-only and needs no token. The flow for anything that writes to a
+device is always **create first, then push**: `POST /sessions` or
+`POST /interconnect/sessions` to allocate, then one of the `apply` endpoints
+above to actually configure the device.
+
+#### curl examples (with the required header)
+
+```bash
+TOKEN="$TOPO_MANAGER_API_TOKEN"
+
+# 1) Create a traffic session (ledger only, no device touched yet)
+curl -s -X POST localhost:8000/sessions \
+    -H 'Content-Type: application/json' \
+    -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"}'
+# => {"session_id": "s-0001", ...}
+
+# 2) Push it to the fanout and read back the result
+curl -s -X POST localhost:8000/sessions/s-0001/apply \
+    -H "X-API-Token: $TOKEN"
+
+# 3) Read-only check
+curl -s localhost:8000/sessions/s-0001/verify -H "X-API-Token: $TOKEN"
+
+# 4) Global tunnel setup on every fanout in the credentials file
+curl -s -X POST localhost:8000/fanouts/setup -H "X-API-Token: $TOKEN"
+
+# 5) ... or only on specific fanouts
+curl -s -X POST localhost:8000/fanouts/setup \
+    -H "X-API-Token: $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"fanouts": ["leaf-1-1"]}'
+
+# 6) Interconnect: create, then push
+curl -s -X POST localhost:8000/interconnect/sessions \
+    -H 'Content-Type: application/json' \
+    -d '{"group": "A-g1", "duts": ["dut-A1", "dut-A2"], "profile": "mesh"}'
+# => {"session_id": "ic-0001", ...}
+curl -s -X POST localhost:8000/interconnect/sessions/ic-0001/apply \
+    -H "X-API-Token: $TOKEN"
+curl -s localhost:8000/interconnect/sessions/ic-0001/verify -H "X-API-Token: $TOKEN"
+
+# 7) Park everything not currently held by a session
+curl -s -X POST localhost:8000/interconnect/park -H "X-API-Token: $TOKEN"
+
+# 8) Release a session from both the device and the ledger
+curl -s -X POST localhost:8000/interconnect/sessions/ic-0001/release-device \
+    -H "X-API-Token: $TOKEN"
+```
+
+A request with a missing or wrong token never reaches the ledger or opens a
+connection:
+
+```bash
+curl -s -X POST localhost:8000/sessions/s-0001/apply
+# => HTTP 401
+# {"error": {"type": "ApiTokenError", "message": "..."}}
+```
+
+#### Failure status codes
+
+| Status | `error.type` | When |
+| --- | --- | --- |
+| 404 | `DevicePushDisabledError` | The feature is disabled (`TOPO_MANAGER_ENABLE_DEVICE_PUSH` is not `1`) — distinct from `InterconnectNotConfiguredError` below |
+| 401 | `ApiTokenError` | `X-API-Token` missing or not equal to `TOPO_MANAGER_API_TOKEN` |
+| 400 | `DevicePushRequestError` | `POST /fanouts/setup` body is not valid JSON, fails the schema, is an empty `fanouts` list, or names a fanout not in the credentials file |
+| 400 | `ValidationError` / `InterconnectRequestError` | Bad query parameters on `park` (e.g. non-integer `ports`), or interconnect session-state errors (e.g. apply on a `releasing` session) — same as the existing interconnect endpoints |
+| 404 | `SessionNotFoundError` / `InterconnectSessionNotFoundError` | The `session_id` does not exist |
+| 404 | `InterconnectNotConfiguredError` | The topology has no `interconnect:` section |
+| 409 | `ReadBackMismatchError` | The device's state after a push does not match what was requested |
+| 500 | `ConfigError` | The fanout credentials file is missing/invalid, or a fanout on the session's path has no entry in it (checked before any connection is opened) |
+| 502 | `DriverConnectionError` | Cannot reach the device, or authentication failed |
+| 503 | `SessionStoreError` | Ledger I/O or lock-acquisition failure (same as the existing endpoints) |
+| 504 | `DeviceTimeoutError` | The SSH connection or a command read timed out |
+
+The 409 body's message is a **multi-line text list** of the specific
+mismatched interfaces/VLANs or ports, not a JSON array — it is not meant to be
+parsed. If you need a structured follow-up after a 409 or any other failure,
+call the matching `verify` endpoint.
+
+A successful response always lists a per-fanout result (`ok`, the commands
+sent, the ports touched, and a read-back summary); it is never collapsed into
+a single pass/fail message. If a multi-fanout push fails partway through, the
+already-applied fanouts are rolled back on a best-effort basis before the
+error is returned — call `verify` afterward to confirm the device's actual
+state.
+
+#### Security limitations
+
+This access control is intentionally minimal:
+
+- **Single shared secret, no per-user identity.** Every caller uses the same
+  `TOPO_MANAGER_API_TOKEN`; there is no concept of separate users, scopes, or
+  roles.
+- **No rate limiting.** A compromised or guessed token can be used as fast as
+  the network allows.
+- **Plaintext HTTP, no TLS.** The token and all request/response bodies travel
+  unencrypted unless you put a TLS-terminating reverse proxy in front of the
+  server. Do not expose this feature on an untrusted network without one.
+- **Token length is not kept secret.** `hmac.compare_digest` runs in constant
+  time with respect to the token's *content*, but its running time can still
+  reveal whether the supplied value has the right length. The token is never
+  written to logs or error messages; keeping it out of shell history, process
+  listings and proxy logs is the operator's responsibility.
+
+#### Liveness: SSH pushes block the event loop even longer
+
+The "Liveness characteristic" note under
+[Starting the server](#starting-the-server-two-equivalent-ways) already explains that write endpoints hold the event loop for the
+duration of a lock acquisition (at most one lock timeout, default 10 s). The
+device-push endpoints go further: because the handlers are `async def` and
+call the deployer **synchronously** (no background task, no 202 + polling),
+an `apply`, `verify`, `setup`, `park`, or `release-device` request holds the
+event loop for the **entire SSH round-trip** — connecting, reading current
+state, writing changes, and reading the state back — which is typically much
+longer than a lock wait. During that window the process serves **no other
+request at all, including unrelated read-only endpoints and health checks**.
+If you put a reverse proxy or load balancer in front of the server, its
+request timeout must exceed the longest expected push duration, or it will
+report a failure the push itself might still complete successfully. This
+feature does not change the single-main-thread deployment constraint
+described above: scale out with multiple processes, never multi-threaded
+workers.
+
+> **Note on automated acceptance:** every automated test for this feature
+> (unit tests and the main-thread live-server integration tests) uses a fake,
+> injected driver and never opens a real network connection. No automated test
+> in this repository connects to an actual switch; verifying behavior against
+> real hardware is a separate, manual step performed by the operator.
 
 ---
 

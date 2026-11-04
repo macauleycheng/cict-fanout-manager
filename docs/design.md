@@ -223,6 +223,50 @@ links:
 
 > ⚠️ 下發是對實體設備的高風險動作：預設 dry-run，實際套用需明確確認。
 
+### 7.3 REST 下發介面（預設關閉，API 0.6.0）
+REST 預設只做帳本層；設備下發須明確啟用（`TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`），語意以 CLI 為權威，
+只呼叫既有 `Deployer` / `InterconnectDeployer`，不重寫演算法。流程固定為「先 `POST` 建 session，再 `POST` apply」。
+
+| REST | CLI 對照 | 設備動作 |
+| --- | --- | --- |
+| `POST /sessions/{id}/apply` | `apply --apply` | `Deployer.apply(session, apply=True)` |
+| `GET /sessions/{id}/verify` | `verify` | `Deployer.verify(session)`，唯讀 |
+| `POST /fanouts/setup` | `setup --apply` | `Deployer.setup_tunnel(names, apply=True)`，body 選填 `{"fanouts": [...]}` |
+| `POST /interconnect/sessions/{id}/apply` | `interconnect apply --apply` | `InterconnectDeployer.apply` |
+| `GET /interconnect/sessions/{id}/verify` | `interconnect verify --session` | `verify_session`，唯讀 |
+| `POST /interconnect/park` | `interconnect park --apply` | `park(graph, fanouts, ports, apply=True)` |
+| `POST /interconnect/sessions/{id}/release-device` | `interconnect release --apply` | `release(session, apply=True)` |
+
+`release-device` 另立路徑，不在既有 `DELETE` 上以參數切換副作用：HTTP method 的語意不隨 query 改變是否連設備，
+且既有 `DELETE /interconnect/sessions/{id}` 維持 ledger-only 不變。所有寫設備端點都是 apply 態，沒有 dry-run 參數
+（dry-run 已有既有的 `plan` 端點）。
+
+- **閘門順序**：router 層 dependencies `require_device_push`（未啟用 → 404）→ `require_api_token`（401）→
+  無互聯區段 404 → 參數驗證 → 帳本 → SSH。端點簽章不含 Pydantic body 參數，因為 FastAPI 會在解析 dependencies
+  之前先讀並驗證 body 參數，壞 body 會蓋過 401；唯一需要 body 的 `setup` 於 handler 內手動解析（錯誤為 400
+  `DevicePushRequestError`，空 body 等於全部 fanout）。
+- **未啟用時**：router 永遠掛載但 `include_in_schema=False`，請求命中得結構化 404（`error.type` 為
+  `DevicePushDisabledError`，與「拓樸無互聯區段」的 `InterconnectNotConfiguredError` 區分），OpenAPI、版本
+  （0.5.0）與 description 與未加此功能時逐位元一致。啟用時版本為 0.6.0。細微差異：僅 POST 的新路徑若收到
+  `GET`，因路徑已匹配而回 405。
+- **每請求重建 allocator**：打流 `apply` / `verify` 以 `build_allocator` 重讀帳本，不用啟動單例的快照，
+  才找得到 server 啟動後由其他行程寫入的 session，也不會對已釋放的 session 下發。互聯側另在 `device_locked()` 內
+  由 `InterconnectDeployer` 重讀帳本並檢查 phase。
+- **credentials**：由 `TOPO_MANAGER_CREDENTIALS`（預設同 CLI）每請求載入，不快取。`planner.plan_changes` 會靜默略過
+  沒有 credentials 的 fanout，自動化呼叫端會誤以為已下發，所以 REST 在連線之前以 `required_fanouts` 核對 session 路徑上的
+  fanout 都有 credentials，缺漏即 `ConfigError`（500）。互聯側由 `_require_configured` 負責。
+- **deployer 建構**：打流 `Deployer(driver_factory, config)`；互聯 `InterconnectDeployer(factory, config, store=IcSessionStore(...),
+  allocator=..., force_access_mode=True)`，與 CLI 的 `_build_deployer` 一致。預設 driver 工廠複製 CLI 的薄 glue，並在函式內延遲
+  import `drivers`，未啟用時不會匯入設備層。
+- **driver 注入點**：`create_app(settings, *, push_driver_factory=None, ic_push_driver_factory=None)`，工廠簽章
+  `(fanout 名, FanoutEntry) -> driver`，供測試注入假 driver（不 patch import 路徑）。自動化測試不連真實設備。
+- **同步執行**：handler 為 `async def`，在請求內同步完成 SSH，不用 threadpool、背景工作或 202。SIGALRM 檔鎖需主執行緒。
+  代價是 SSH 期間事件迴圈被阻塞（見 README liveness 章節）。
+- **錯誤解包**：`Deployer.apply` 與 `InterconnectDeployer` 的 `_with_hint` 會把連線類例外包成 `ApplyError`，直接映射會讓逾時
+  永遠得不到 504。`translate_device_errors` 沿 `__cause__` 最多追 3 層（實測最大包裝深度 2，再留 1 層）：
+  `DeviceTimeoutError` → 504、`DriverConnectionError` → 502；`DriverDependencyError` / `ConfigError` / `PortMappingError`
+  還原為原例外（500，屬服務配置缺陷）；其餘 `ApplyError`（設備拒絕指令）維持 502。
+
 ---
 
 ## 8. 系統架構（Python / FastAPI）
@@ -256,7 +300,7 @@ topo-manager/
 
 ### 互聯 REST（帳本層，API 0.5.0）
 互聯功能（§12）同樣提供 REST，與打流側對等，但**只做帳本層**：不連任何設備。
-設備下發（apply、park、verify、帶設備的 release）僅限 CLI，這是刻意的範圍界線。
+設備下發（apply、park、verify、帶設備的 release）預設僅限 CLI，這是刻意的範圍界線；可選擇啟用的 REST 下發見下方「設備下發 REST」。
 所有端點掛在 `/interconnect` 之下，為 `InterconnectAllocator` 的薄層（HTTP、
 Pydantic、例外映射），不重寫配對、衝突與 VLAN 邏輯：
 - `GET    /interconnect/summary` → 組、組內 DUT 編號（d0..d3）、各互聯 fanout 的 port 使用
@@ -293,6 +337,43 @@ Pydantic、例外映射），不重寫配對、衝突與 VLAN 邏輯：
   請求期理論上不會觸發；若觸發則落 500，避免改變打流側拓樸漂移時的既有映射。
   `status_for` 以精確型別查表，故各子類皆顯式列出。
 - **版本**：新增端點屬 API 契約擴充，`_API_VERSION` 由 0.4.0 升為 0.5.0。
+
+### 設備下發 REST（API 0.6.0，預設關閉）
+在互聯 REST 之外，可選擇啟用 7 個會連線並寫入 fanout 的端點（端點與 CLI 對照見 §7.3）。
+啟用條件：`TOPO_MANAGER_ENABLE_DEVICE_PUSH=1` 且同時設定 `TOPO_MANAGER_API_TOKEN`；只接受 `1`，
+`0` / 未設 / 空字串為關閉，其他值（如 `true`）啟動期即報錯，避免被默默當成關閉。
+啟用但未設 token：`Settings.__init__` 丟 `ConfigError`，`topo-manager-api` 以單行 stderr、exit 1 結束，無 traceback。
+
+**存取控制**（僅套用於這 7 個端點，既有端點不需 token、行為不變）：
+- 以 `X-API-Token` header 對比 `TOPO_MANAGER_API_TOKEN`，使用 `hmac.compare_digest` 並以 UTF-8 bytes 比較
+  （`str` 版對非 ASCII 會 `TypeError` 而變 500）。缺漏與錯誤回相同的 401 訊息，不含任何 token 內容。
+- token 驗證先於 query / body 驗證、帳本與 SSH：缺或錯的 token 立即 401，不讀 body、不碰帳本、不連 SSH。
+- 未啟用時連 token 都不比對，一律 404，不洩漏 token 是否正確。
+- 限制：單一共用密鑰、沒有使用者身分、沒有速率限制、HTTP 明文無 TLS（需要時由前置反向代理處理）；token 長度不視為機密。
+
+**新例外與狀態碼**（皆繼承 `TopologyError`，`status_for` 以精確型別查表）：
+
+| 例外 | HTTP | 條件 |
+| --- | --- | --- |
+| `DevicePushDisabledError` | 404 | 功能未啟用 |
+| `ApiTokenError` | 401 | token 缺漏或錯誤 |
+| `DevicePushRequestError` | 400 | `setup` 的 body 非法、`fanouts` 為空、未知 fanout 名 |
+| `DriverConnectionError` | 502 | 連不上或認證失敗 |
+| `DeviceTimeoutError` | 504 | SSH 逾時 |
+| `ReadBackMismatchError` | 409 | apply 後 read-back 不符；message 逐項列出不符的介面與 VLAN |
+| `DriverParseError`、`ApplyError`（設備拒絕指令） | 502 | 設備回應無法解析或拒絕指令 |
+
+`DeviceTimeoutError` 繼承 `DriverConnectionError` 而非與之並列：既有的 `except DriverConnectionError` 與測試不需修改，
+REST 因精確查表仍可分流為 504。`ec_ssh` 的 `_reraise_as_connection_error` 把 `NetmikoTimeoutException` 與 netmiko 4.x
+`send_command` 的 `ReadTimeout` 都歸為逾時（`ReadTimeout` 原本在 apply 路徑為 502、verify / setup 路徑落 500）。
+
+**回應形狀**：成功回應逐 fanout 列出 `ok`、`commands`、`ports` 與 `readback`（`verified` / `checked` / `missing`），
+只列有變更的 fanout。`verify` 不符仍是 HTTP 200 且 `ok=false`（GET 回報現況）；apply / release 的 read-back 不符才是 409。
+409 的不符清單是 message 內的多行文字（driver 例外只攜帶格式化字串），要結構化資料請在失敗後呼叫 `verify`。
+互聯 `verify` 的 `problems` 為扁平字串清單，不逐 fanout 解析。`setup` 讀回非 Enabled 視為 read-back 不符（409），與 CLI 只印狀態不同。
+失敗後設備狀態可能部分改變（打流側對先前成功的 fanout 只做盡力回滾），建議以 `GET .../verify` 確認。
+
+**版本**：啟用時 `_API_VERSION` 為 0.6.0，未啟用維持 0.5.0（契約只在啟用時擴張，既有測試不需修改）。
 
 ### 檔案匯出
 - `GET /api/resources/export?format=yaml` 匯出同等內容成檔，供 ATLAS 直接讀。

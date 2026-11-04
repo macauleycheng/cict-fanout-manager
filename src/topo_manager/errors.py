@@ -23,6 +23,11 @@
   - 0.5.0  互聯 REST 新增 InterconnectNotConfiguredError（繼承
            InterconnectLayoutError），對應拓樸無 interconnect 區段時 REST
            端點的 404（互聯 REST 設計 §2）。
+  - 0.6.0  設備下發 REST 新增 4 個子類：DevicePushDisabledError（功能未啟用，
+           404）、ApiTokenError（X-API-Token 缺漏或錯誤，401）、
+           DevicePushRequestError（下發端點輸入非法，400）、
+           DeviceTimeoutError（繼承 DriverConnectionError，SSH 逾時，504）。
+
 Copyright (c) 2026 topo-manager。
 """
 
@@ -226,4 +231,36 @@ class InterconnectNotConfiguredError(InterconnectLayoutError):
     觸發條件：REST 互聯端點在啟動時載入的拓樸沒有 ``interconnect`` 區段。繼承
     ``InterconnectLayoutError``（屬 ``TopologyError`` 家族）；REST 錯誤映射以
     精確類別查表，故本類別對應 404，而父類別不加映射以免改變打流側行為。
+    """
+
+
+class DevicePushDisabledError(TopologyError):
+    """設備下發 REST 端點未啟用時觸發（REST 層用，對應 404）。
+
+    觸發條件：未設 ``TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`` 卻請求下發端點。
+    ``error.type`` 與「拓樸沒有互聯區段」的 ``InterconnectNotConfiguredError``
+    不同，供呼叫端區分。
+    """
+
+
+class ApiTokenError(TopologyError):
+    """``X-API-Token`` header 缺漏或與 ``TOPO_MANAGER_API_TOKEN`` 不符時觸發（401）。
+
+    訊息不區分缺漏與錯誤，也不含任何 token 內容。
+    """
+
+
+class DevicePushRequestError(TopologyError):
+    """設備下發端點的輸入不合法時觸發（對應 400）。
+
+    觸發條件：``POST /fanouts/setup`` 的 body 非合法 JSON／不符 schema、
+    ``fanouts`` 為空陣列，或指名了 credentials 中不存在的 fanout。
+    """
+
+
+class DeviceTimeoutError(DriverConnectionError):
+    """對 fanout 設備的 SSH 連線或讀寫逾時時觸發（對應 504）。
+
+    繼承 ``DriverConnectionError``：既有 ``except DriverConnectionError``
+    與測試行為不變；REST 映射以 ``type(exc)`` 精確查表，故仍分流為 504。
     """

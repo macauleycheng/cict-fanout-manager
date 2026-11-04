@@ -339,3 +339,42 @@ def test_diff_edge_missing_without_access() -> None:
     )
     missing = diff_expected_vs_actual(expected, actual)
     assert [c.interface for c in missing] == ["Eth1/1"]
+
+
+# ----------------------------------------------------------------------
+# required_fanouts（設備下發 REST 連線前核對 credentials）
+# ----------------------------------------------------------------------
+def test_required_fanouts_returns_sorted_known_fanouts(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """路徑上屬於 known_fanouts 的 fanout，排序且去重。"""
+    from topo_manager.drivers.planner import required_fanouts
+
+    _allocator, session = _three_tier_session(three_tier_path, tmp_path)
+    known = {"spine-1", "agg-1", "agg-2", "leaf-1-1", "leaf-2-1"}
+    names = required_fanouts(session, known)
+    assert names == sorted(set(names))
+    assert {"spine-1", "agg-1", "leaf-1-1"} <= set(names)
+
+
+def test_required_fanouts_excludes_unknown_and_non_fanout_nodes(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """不在 known_fanouts 的 fanout 被排除；generator／DUT 節點永遠不會出現。"""
+    from topo_manager.drivers.planner import required_fanouts
+
+    _allocator, session = _three_tier_session(three_tier_path, tmp_path)
+    assert required_fanouts(session, {"spine-1"}) == ["spine-1"]
+    assert required_fanouts(session, {"zzz-not-on-path"}) == []
+
+
+def test_required_fanouts_empty_when_no_fanout_on_path() -> None:
+    """路徑上沒有任何已知 fanout（僅 generator／DUT）→ 空清單。"""
+    from types import SimpleNamespace
+
+    from topo_manager.drivers.planner import required_fanouts
+
+    session = SimpleNamespace(
+        trunk_segments=[], path=["ixia-1:1", "dut-A1:Eth0"], vlan=100
+    )
+    assert required_fanouts(session, {"spine-1"}) == []

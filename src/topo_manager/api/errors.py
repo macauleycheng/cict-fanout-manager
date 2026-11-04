@@ -17,6 +17,11 @@
            (404) / InterconnectNotConfiguredError(404)。因 status_for 以
            type(exc) 精確查表，子類必須顯式列出；InterconnectLayoutError 刻意
            不映射（避免改變打流側拓樸漂移時的既有行為）。
+  - 0.6.0  設備下發 REST：映射表新增 DevicePushDisabledError(404) /
+           ApiTokenError(401) / DevicePushRequestError(400) /
+           DriverConnectionError(502) / DeviceTimeoutError(504) /
+           DriverParseError(502) / ReadBackMismatchError(409) / ApplyError(502)。
+           這些例外原本 REST 不可能拋出，既有端點行為不變。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -32,13 +37,21 @@ from fastapi.responses import JSONResponse
 
 from topo_manager.api.schemas import ErrorDetail, ErrorResponse
 from topo_manager.errors import (
+    ApiTokenError,
+    ApplyError,
     ConfigError,
+    DevicePushDisabledError,
+    DevicePushRequestError,
+    DeviceTimeoutError,
+    DriverConnectionError,
+    DriverParseError,
     HardConflictError,
     InterconnectConflictError,
     InterconnectNotConfiguredError,
     InterconnectRequestError,
     InterconnectSessionNotFoundError,
     PathLookupError,
+    ReadBackMismatchError,
     SessionNotFoundError,
     SessionStoreError,
     TopologyError,
@@ -81,6 +94,15 @@ _STATUS_BY_EXC: Dict[Type[TopologyError], int] = {
     InterconnectConflictError: 409,
     InterconnectSessionNotFoundError: 404,
     InterconnectNotConfiguredError: 404,
+    # 設備下發 REST（精確查表）。
+    DevicePushDisabledError: 404,
+    ApiTokenError: 401,
+    DevicePushRequestError: 400,
+    DriverConnectionError: 502,
+    DeviceTimeoutError: 504,
+    DriverParseError: 502,
+    ReadBackMismatchError: 409,
+    ApplyError: 502,
 }
 
 # 非預期例外（程式 bug）對外的固定訊息（不外洩內部細節，設計 §6.4）。

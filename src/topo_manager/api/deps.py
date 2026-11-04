@@ -13,6 +13,11 @@ CLI 指向同一帳本、同一 pool 時行為一致。設定 / 參數層的錯�
            ic_vlan_max 與環境變數 TOPO_MANAGER_IC_STATE /
            TOPO_MANAGER_IC_VLAN_MIN / TOPO_MANAGER_IC_VLAN_MAX（既有欄位與
            環境變數語意不變）。
+  - 0.6.0  設備下發 REST：Settings 新增 enable_device_push / api_token /
+           credentials_path 與環境變數 TOPO_MANAGER_ENABLE_DEVICE_PUSH /
+           TOPO_MANAGER_API_TOKEN / TOPO_MANAGER_CREDENTIALS；啟用卻無 token
+           時 __init__ 丟 ConfigError（啟動期 fail-fast）。預設全部關閉，既有
+           行為不變。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -20,6 +25,7 @@ Copyright (c) 2026 topo-manager。
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 from topo_manager.allocator import Allocator
 from topo_manager.errors import ConfigError
@@ -43,6 +49,10 @@ _ENV_VLAN_MAX = "TOPO_MANAGER_VLAN_MAX"
 _ENV_IC_STATE = "TOPO_MANAGER_IC_STATE"
 _ENV_IC_VLAN_MIN = "TOPO_MANAGER_IC_VLAN_MIN"
 _ENV_IC_VLAN_MAX = "TOPO_MANAGER_IC_VLAN_MAX"
+# 設備下發 REST（預設關閉）。
+_ENV_ENABLE_DEVICE_PUSH = "TOPO_MANAGER_ENABLE_DEVICE_PUSH"
+_ENV_API_TOKEN = "TOPO_MANAGER_API_TOKEN"
+_ENV_CREDENTIALS = "TOPO_MANAGER_CREDENTIALS"
 
 
 class Settings:
@@ -55,6 +65,9 @@ class Settings:
       - vlan_max：VLAN pool 上界（預設 3000）。
       - ic_state_path：互聯帳本路徑（預設 ``.topo-state/interconnect.json``）。
       - ic_vlan_min / ic_vlan_max：互聯 VLAN pool（預設 100 / 3000）。
+      - enable_device_push：是否啟用設備下發端點（預設 False）。
+      - api_token：下發端點的共用密鑰（啟用時必填；不得出現在 log／訊息）。
+      - credentials_path：fanout 連線設定檔路徑（None＝與 CLI 相同預設）。
     """
 
     def __init__(
@@ -66,6 +79,9 @@ class Settings:
         ic_state_path: str = _DEFAULT_IC_STATE_PATH,
         ic_vlan_min: int = _DEFAULT_IC_VLAN_MIN,
         ic_vlan_max: int = _DEFAULT_IC_VLAN_MAX,
+        enable_device_push: bool = False,
+        api_token: Optional[str] = None,
+        credentials_path: Optional[str] = None,
     ) -> None:
         """以顯式參數建立設定（測試注入用，設計 §10.1）。
 
@@ -75,6 +91,12 @@ class Settings:
           - vlan_min / vlan_max：VLAN pool 端點（預設 100 / 3000）。
           - ic_state_path：互聯帳本路徑（預設 CLI 慣例路徑）。
           - ic_vlan_min / ic_vlan_max：互聯 VLAN pool 端點（預設 100 / 3000）。
+          - enable_device_push：是否啟用設備下發端點（預設 False）。
+          - api_token：下發端點共用密鑰（啟用時須為非空字串）。
+          - credentials_path：fanout 連線設定檔路徑（None 走 CLI 預設）。
+
+        例外：
+          - ConfigError：啟用設備下發但 api_token 未設或為空字串。
         """
         self.topology_path = topology_path
         self.state_path = state_path
@@ -83,6 +105,28 @@ class Settings:
         self.ic_state_path = ic_state_path
         self.ic_vlan_min = ic_vlan_min
         self.ic_vlan_max = ic_vlan_max
+        self.enable_device_push = enable_device_push
+        self.api_token = api_token
+        self.credentials_path = credentials_path
+        self._validate_device_push(enable_device_push, api_token)
+
+    @staticmethod
+    def _validate_device_push(enable: bool, token: Optional[str]) -> None:
+        """啟用設備下發卻沒有 token 時 fail-fast（不印出任何 token 內容）。
+
+        參數：
+          - enable：是否啟用。
+          - token：共用密鑰。
+
+        例外：
+          - ConfigError：enable 為真且 token 為 None 或空字串。
+        """
+        if enable and (token is None or token == ""):
+            raise ConfigError(
+                "{0}=1 但未設定 {1}；拒絕啟動".format(
+                    _ENV_ENABLE_DEVICE_PUSH, _ENV_API_TOKEN
+                )
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -115,6 +159,15 @@ class Settings:
         ic_vlan_min = cls._parse_vlan_env(_ENV_IC_VLAN_MIN, _DEFAULT_IC_VLAN_MIN)
         ic_vlan_max = cls._parse_vlan_env(_ENV_IC_VLAN_MAX, _DEFAULT_IC_VLAN_MAX)
 
+        enable_device_push = cls._parse_enable_env()
+        # 未啟用時 token／credentials 變數被忽略（不影響既有行為）。
+        api_token = os.environ.get(_ENV_API_TOKEN) if enable_device_push else None
+        credentials_path = (
+            os.environ.get(_ENV_CREDENTIALS) if enable_device_push else None
+        )
+        if credentials_path == "":
+            credentials_path = None
+
         return cls(
             topology_path=topology_path,
             state_path=state_path,
@@ -123,6 +176,32 @@ class Settings:
             ic_state_path=ic_state_path,
             ic_vlan_min=ic_vlan_min,
             ic_vlan_max=ic_vlan_max,
+            enable_device_push=enable_device_push,
+            api_token=api_token,
+            credentials_path=credentials_path,
+        )
+
+    @staticmethod
+    def _parse_enable_env() -> bool:
+        """讀取 ``TOPO_MANAGER_ENABLE_DEVICE_PUSH``：'1' 啟用；未設／空／'0' 關閉。
+
+        其他值（如 'true'）丟 ``ConfigError``，避免被默默當成關閉而使維運誤以為已啟用。
+
+        回傳：
+          - 是否啟用設備下發。
+
+        例外：
+          - ConfigError：值不是 '1'、'0' 或空。
+        """
+        raw = os.environ.get(_ENV_ENABLE_DEVICE_PUSH)
+        if raw is None or raw == "" or raw == "0":
+            return False
+        if raw == "1":
+            return True
+        raise ConfigError(
+            "環境變數 {0} 只接受 '1'（啟用）或 '0'／未設（關閉），實得 '{1}'".format(
+                _ENV_ENABLE_DEVICE_PUSH, raw
+            )
         )
 
     @staticmethod
