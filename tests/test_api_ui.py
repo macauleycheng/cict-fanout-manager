@@ -12,10 +12,17 @@ UI 路由唯讀、永不觸及 Phase 2 signal 檔鎖，故 TestClient 足矣（�
   5. OpenAPI 仍只列五個業務路徑、且**不**含 ``/`` 或 ``/static``（新增斷言）。
   6. 資料層 BFS mirror（AC-6）：以 2tier/3tier 的 ``GET /topology`` payload
      重建多源 BFS 分層，驗 generator 為 tier 0、DUT 為最大 tier、中間層序正確。
+  7. 前端純函式 mirror（審查 Issue 6/7）：以真實 session payload 複刻 app.js 的
+     ``devOf``/``portOf``、``computeHighlightedEdgeKeys``、``edgePortsOf``，並把
+     ``edgePortsOf`` 綁到後端 ``routes._occupied_access_ports`` 的 access-port
+     推導上（契約測試），防兩份平行實作漂移。
 
 歷史（HISTORY）：
   - 0.5.0  Web UI 初版，建立靜態服務整合測試與 2tier/3tier BFS mirror 測試
            （設計 §9）。
+  - 0.5.1  審查 Issue 6/7：補 devOf/portOf、computeHighlightedEdgeKeys、
+           edgePortsOf 的 Python mirror 測試，並與後端 _occupied_access_ports
+           對照固定契約（用真實 session payload 複刻 JS 邏輯並斷言）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -233,3 +240,204 @@ def test_bfs_tiers_three_tier(api_client: Tuple[TestClient, Path]) -> None:
     max_tier = max(tiers.values())
     for name in dut_names:
         assert tiers[name] == max_tier == 4
+
+
+# ----------------------------------------------------------------------
+# 前端純函式 mirror 測試（審查 Issue 6/7）：以純 Python 複刻 app.js 的三個
+# 純函式（devOf/portOf、computeHighlightedEdgeKeys、edgePortsOf），用真實
+# session payload 斷言其輸出，把「前端與後端對同一語意的兩份實作」綁在一起。
+# ----------------------------------------------------------------------
+
+
+def _dev_of(node_id: str) -> str:
+    """app.js devOf 的 Python mirror：取首個 ':' 前的 device 段。
+
+    與 app.js 一致：找不到 ':' 時回整串（對齊 Python ``split(':', 1)[0]``），
+    port 段可含 '/'、不含 ':'。
+
+    參數：
+      - node_id：節點 id（``"<dev>:<port>"`` 或裸名）。
+
+    回傳：
+      - device 段字串。
+    """
+    idx = node_id.find(":")
+    if idx == -1:
+        return node_id
+    return node_id[:idx]
+
+
+def _port_of(node_id: str) -> str:
+    """app.js portOf 的 Python mirror：取首個 ':' 後的 port 段（可含 '/'）。
+
+    參數：
+      - node_id：節點 id（``"<dev>:<port>"``）。
+
+    回傳：
+      - port 段字串（無 ':' 時回整串，與 JS slice(indexOf+1) 等價）。
+    """
+    idx = node_id.find(":")
+    return node_id[idx + 1:]
+
+
+def _edge_key(node_a: str, node_b: str) -> str:
+    """app.js edgeKey 的 Python mirror：兩節點 id 排序後以 '|' 連接（無向）。"""
+    return "|".join(sorted([node_a, node_b]))
+
+
+def _compute_highlighted_edge_keys(path):
+    """app.js computeHighlightedEdgeKeys 的 Python mirror。
+
+    沿 path 相鄰節點配對；同一 device 的連續 hop（設備內佈線，無跨設備邊）
+    跳過；其餘以 ``_edge_key`` 產生無向邊鍵集合。
+
+    參數：
+      - path：session 的 ``path`` 節點 id 序列。
+
+    回傳：
+      - 高亮邊鍵的 set。
+    """
+    keys = set()
+    for i in range(len(path) - 1):
+        a = path[i]
+        b = path[i + 1]
+        if _dev_of(a) == _dev_of(b):
+            continue
+        keys.add(_edge_key(a, b))
+    return keys
+
+
+def _edge_ports_of(session: dict):
+    """app.js edgePortsOf 的 Python mirror：physical_ports 扣除所有 trunk 兩端。
+
+    參數：
+      - session：``GET /sessions`` 形狀的 session dict（具 ``physical_ports``
+        與 ``trunk_segments[].a_node/b_node``）。
+
+    回傳：
+      - access port 節點 id 的 list（保序，與 JS 一致）。
+    """
+    trunk_ends = set()
+    for segment in session.get("trunk_segments", []):
+        trunk_ends.add(segment["a_node"])
+        trunk_ends.add(segment["b_node"])
+    result = []
+    for node in session.get("physical_ports", []):
+        if node not in trunk_ends:
+            result.append(node)
+    return result
+
+
+def _real_session_payloads(topology_path: Path, tmp_path: Path):
+    """以 Allocator 在真實拓樸上建數筆 session，回 ``GET /sessions`` 形狀的 dict 清單。
+
+    直接走 Phase 2 Allocator（與 test_allocator 相同手法）再經公開
+    ``SessionResponse`` 平鋪，取得與 ``GET /sessions`` 等值的真實 payload
+    （含跨 spine/agg 的 trunk 段與設備內 hop），供前端純函式 mirror 斷言。
+
+    參數：
+      - topology_path：範例拓樸 YAML 路徑。
+      - tmp_path：pytest tmp 目錄（放獨立狀態檔）。
+
+    回傳：
+      - (payloads, sessions) 二元組：payloads 為 dict 清單（mirror 用），
+        sessions 為 Phase 2 ``Session`` 清單（後端契約對照用）。
+    """
+    from topo_manager.allocator import Allocator
+    from topo_manager.api.schemas import SessionResponse
+    from topo_manager.loader import load_topology
+    from topo_manager.store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "mirror-state" / "allocations.json")
+    allocator = Allocator(load_topology(topology_path), store)
+    allocator.allocate("ixia-1/1", "dut-A1:Eth0")
+    allocator.allocate("ixia-1/2", "dut-A2:Eth0")
+    allocator.allocate("trex-1/0", "dut-B1:Eth0")
+
+    sessions = allocator.list_sessions()
+    payloads = [
+        SessionResponse.from_session(session, "active").model_dump()
+        for session in sessions
+    ]
+    return payloads, sessions
+
+
+def test_dev_port_of_mirror() -> None:
+    """devOf/portOf mirror：含 '/' 的 port 與裸名輸入皆對齊 JS 行為（Issue 4/6）。"""
+    # port 含 '/'：只在首個 ':' 切，port 段保留 '/'。
+    assert _dev_of("ixia-1:ixia-1/1") == "ixia-1"
+    assert _port_of("ixia-1:ixia-1/1") == "ixia-1/1"
+    # 一般節點。
+    assert _dev_of("leaf-1-1:11") == "leaf-1-1"
+    assert _port_of("leaf-1-1:11") == "11"
+    # 裸名（無 ':'）：回整串（與 Python split(':', 1)[0] 對齊，非 slice(0,-1)）。
+    assert _dev_of("ixia-1/1") == "ixia-1/1"
+
+
+def test_highlighted_edge_keys_skips_intra_device_hops(
+    api_client: Tuple[TestClient, Path], three_tier_path: Path, tmp_path: Path
+) -> None:
+    """computeHighlightedEdgeKeys mirror：設備內 hop 不產生跨設備邊（Issue 6）。
+
+    用真實 3tier session payload，驗高亮邊鍵集合：
+      - 不含任何 ``devOf(a) == devOf(b)`` 的設備內 hop；
+      - 每個鍵對應一條跨設備邊，數量 = path 中跨設備相鄰對數。
+    """
+    payloads, _ = _real_session_payloads(three_tier_path, tmp_path)
+    assert payloads, "預期至少建出一筆 session"
+
+    for session in payloads:
+        path = session["path"]
+        keys = _compute_highlighted_edge_keys(path)
+
+        # 以獨立方式重算「跨設備相鄰對」，與 mirror 結果比對。
+        expected_pairs = []
+        for i in range(len(path) - 1):
+            if _dev_of(path[i]) != _dev_of(path[i + 1]):
+                expected_pairs.append((path[i], path[i + 1]))
+
+        assert len(keys) == len(expected_pairs)
+        for a, b in expected_pairs:
+            assert _edge_key(a, b) in keys
+            # 高亮鍵兩端必為不同 device（設備內 hop 已被跳過）。
+            dev_a, dev_b = _edge_key(a, b).split("|")
+            assert _dev_of(dev_a) != _dev_of(dev_b)
+
+
+def test_edge_ports_of_matches_backend_occupied_access_ports(
+    api_client: Tuple[TestClient, Path], three_tier_path: Path, tmp_path: Path
+) -> None:
+    """edgePortsOf mirror == 後端 _occupied_access_ports 推導（契約測試，Issue 6/7）。
+
+    前端 ``edgePortsOf``（physical_ports 扣 trunk 兩端）與後端
+    ``routes._occupied_access_ports`` 是對同一「access port」語意的兩份平行實作。
+    以真實 session payload 分別跑兩者，斷言：
+      - 單筆 session 的前端 access-port 集合 == 後端對該 session 推導出的 access
+        port（其值在 occupied 對照中皆指向該 session_id）；
+      - 全體 session 的前端 access-port 聯集 == 後端 ``occupied_ports`` 的鍵集。
+    """
+    from topo_manager.api.routes import _occupied_access_ports
+
+    payloads, sessions = _real_session_payloads(three_tier_path, tmp_path)
+    assert payloads, "預期至少建出一筆 session"
+
+    backend_occupied = _occupied_access_ports(sessions)
+
+    frontend_union = set()
+    for session in payloads:
+        frontend_access = _edge_ports_of(session)
+        frontend_union.update(frontend_access)
+
+        # 前端為該 session 推出的每個 access port，後端對照皆應指向同一 owner。
+        for node in frontend_access:
+            assert backend_occupied.get(node) == session["session_id"]
+
+        # trunk 兩端節點不得出現在前端 access-port（已被扣除）。
+        trunk_ends = set()
+        for segment in session["trunk_segments"]:
+            trunk_ends.add(segment["a_node"])
+            trunk_ends.add(segment["b_node"])
+        assert trunk_ends.isdisjoint(set(frontend_access))
+
+    # 全體聯集與後端 occupied 鍵集一致（兩份平行實作綁定、防漂移）。
+    assert frontend_union == set(backend_occupied.keys())

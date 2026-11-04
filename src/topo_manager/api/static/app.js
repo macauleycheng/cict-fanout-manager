@@ -27,7 +27,13 @@ var SVG_NS = "http://www.w3.org/2000/svg";
  * ------------------------------------------------------------------ */
 
 function devOf(nodeId) {
-    return nodeId.slice(0, nodeId.indexOf(":"));
+    var idx = nodeId.indexOf(":");
+    /* 無冒號（裸名，如 CLI 建的 session port）時回整串，對齊 Python 以首個
+     * 冒號切出 device 段的語意；避免 slice(0, -1) 砍掉最後一字的靜默錯值。 */
+    if (idx === -1) {
+        return nodeId;
+    }
+    return nodeId.slice(0, idx);
 }
 
 function portOf(nodeId) {
@@ -43,8 +49,11 @@ var state = {
     sessions: [],          /* raw GET /sessions .sessions list */
     available: null,       /* raw GET /resources/available payload */
     selectedId: null,      /* currently highlighted session_id, or null */
-    autoTimer: null        /* setInterval handle for auto-refresh */
+    autoRefresh: false,    /* whether auto-refresh is currently enabled */
+    autoTimer: null        /* setTimeout handle for the next auto-refresh tick */
 };
+
+var AUTO_REFRESH_INTERVAL_MS = 10000;
 
 /* ------------------------------------------------------------------ *
  * API fetch wrapper (design §6).
@@ -948,7 +957,10 @@ function friendlyMessage(err) {
         case "VlanPoolExhaustedError":
             return "No free VLAN left in the pool; release a session and retry.";
         case "PathLookupError":
-            return "No physical path between the selected generator and DUT ports.";
+            /* 後端此型別涵蓋「無實體路徑／找不到 port／裸名不唯一／dev:port
+             * 格式錯／找不到 DUT」等多種成因，不限於無路徑；用中性文案避免誤導。 */
+            return "Cannot allocate: check the selected ports are still "
+                + "available and connected.";
         case "ValidationError":
             return "Invalid selection.";
         case "SessionStoreError":
@@ -959,6 +971,11 @@ function friendlyMessage(err) {
         case "TopologyReferenceError":
         case "TopologyGraphError":
             return "Topology temporarily unavailable; fix the file and retry.";
+        case "ConfigError":
+        case "InternalError":
+            /* 後端這兩型 message 為中文原文（如「內部錯誤，請聯絡維運」）；英文
+             * UI 不外露後端原文，回通案文案以保持語言一致。 */
+            return "Server error; please retry or contact operations.";
         case "Network":
             return "Cannot reach server.";
         default:
@@ -990,19 +1007,29 @@ function clearError() {
  * ------------------------------------------------------------------ */
 
 function refreshAll() {
+    /* 任一讀取（topology / sessions / available）失敗即視為「讀取降級」，統一
+     * disable allocate——以陳舊資料送出的 Allocate 極可能撞 404/409（設計 Issue 5）。 */
+    var readFailed = false;
+
     var topoP = apiFetch("GET", "/topology").then(
         function (data) { state.topology = data; },
-        function (err) { showError(err.type, "Failed to load topology: " + friendlyMessage(err)); }
+        function (err) {
+            readFailed = true;
+            showError(err.type, "Failed to load topology: " + friendlyMessage(err));
+        }
     );
     var sessP = apiFetch("GET", "/sessions").then(
         function (data) { state.sessions = (data && data.sessions) || []; },
-        function (err) { showError(err.type, "Failed to load sessions: " + friendlyMessage(err)); }
+        function (err) {
+            readFailed = true;
+            showError(err.type, "Failed to load sessions: " + friendlyMessage(err));
+        }
     );
     var availP = apiFetch("GET", "/resources/available").then(
         function (data) { state.available = data; },
         function (err) {
+            readFailed = true;
             showError(err.type, "Failed to load resources: " + friendlyMessage(err));
-            document.getElementById("btn-allocate").disabled = true;
         }
     );
 
@@ -1016,7 +1043,51 @@ function refreshAll() {
         renderCreateControls();
         renderSessionList();
         renderDetail();
+        /* 任一讀取失敗時鎖住 allocate；renderCreateControls 內已依 available
+         * 重算 enable 狀態，故此處於其後覆寫以確保降級時一律 disable。 */
+        if (readFailed) {
+            document.getElementById("btn-allocate").disabled = true;
+        }
     });
+}
+
+/* ------------------------------------------------------------------ *
+ * Auto-refresh: self-scheduling timer (design Issue 1).
+ *
+ * setInterval(refreshAll, 10s) would fire the next tick even if the current
+ * refreshAll is still in flight, causing re-entrancy and a render race (a
+ * late-returning older round overwriting newer data). Instead we schedule the
+ * NEXT tick only after the current refreshAll settles, so at most one
+ * refreshAll runs at a time regardless of how slow a round is.
+ * ------------------------------------------------------------------ */
+
+function startAutoRefresh() {
+    if (state.autoRefresh) {
+        return;
+    }
+    state.autoRefresh = true;
+    scheduleAutoRefresh();
+}
+
+function stopAutoRefresh() {
+    state.autoRefresh = false;
+    if (state.autoTimer !== null) {
+        clearTimeout(state.autoTimer);
+        state.autoTimer = null;
+    }
+}
+
+function scheduleAutoRefresh() {
+    if (!state.autoRefresh) {
+        return;
+    }
+    state.autoTimer = setTimeout(function () {
+        state.autoTimer = null;
+        /* Chain the next tick onto completion (success or failure) of this
+         * round so rounds never overlap. refreshAll always resolves (each GET
+         * has its own catch), so the finally-equivalent then runs either way. */
+        refreshAll().then(scheduleAutoRefresh, scheduleAutoRefresh);
+    }, AUTO_REFRESH_INTERVAL_MS);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1030,10 +1101,9 @@ function wire() {
 
     document.getElementById("chk-autorefresh").addEventListener("change", function (evt) {
         if (evt.target.checked) {
-            state.autoTimer = setInterval(refreshAll, 10000);
-        } else if (state.autoTimer) {
-            clearInterval(state.autoTimer);
-            state.autoTimer = null;
+            startAutoRefresh();
+        } else {
+            stopAutoRefresh();
         }
     });
 
