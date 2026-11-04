@@ -15,6 +15,8 @@
 歷史（HISTORY）：
   - 0.1.0  FEAT-001 初版，建立 Endpoint/Generator/Fanout/Dut/Rack/
            Link/Topology 模型與 §3.3/§3.4 驗證規則。
+  - 0.2.0  互聯 fanout：新增 IcFanout、InterconnectSection；Topology 新增
+           選填 interconnect 欄位（exclude=True，不影響序列化輸出）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -211,6 +213,39 @@ class Link(BaseModel):
     b: Endpoint
 
 
+class IcFanout(BaseModel):
+    """互聯 fanout 設備（與打流側 fanout 完全分離，互聯設計 §2.2）。
+
+    欄位：
+      - name：裝置名，全域唯一（唯一性由 interconnect 驗證檢查）。
+      - port_count：實體 port 總數，須 > 0；合法 port 為 1..port_count。
+      - rack：選填，所屬 rack 名；有填則該 fanout 上所有組須屬此 rack。
+      - mgmt_ip：選填，僅記錄。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    port_count: int = Field(gt=0)
+    rack: Optional[str] = None
+    mgmt_ip: Optional[str] = None
+
+
+class InterconnectSection(BaseModel):
+    """拓樸 YAML 頂層選填的 ``interconnect`` 區段（互聯設計 §2.2）。
+
+    欄位：
+      - fanouts：互聯 fanout 清單，至少 1 台。
+      - links：互聯 link 清單，至少 1 條；a 端為 DUT il_port、b 端為互聯
+        fanout port（方向由 interconnect 驗證檢查）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fanouts: List[IcFanout] = Field(min_length=1)
+    links: List[Link] = Field(min_length=1)
+
+
 class Topology(BaseModel):
     """整份拓樸的頂層模型（設計 §3.1）。
 
@@ -221,6 +256,8 @@ class Topology(BaseModel):
       - fanouts：扇出裝置清單。
       - racks：機櫃清單。
       - links：實體連線清單（可為空 list，但鍵須存在）。
+      - interconnect：選填互聯區段；預設 None，``exclude=True`` 使
+        ``model_dump``/API 輸出與無此區段時完全相同。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -231,3 +268,6 @@ class Topology(BaseModel):
     fanouts: List[Fanout]
     racks: List[Rack]
     links: List[Link]
+    interconnect: Optional[InterconnectSection] = Field(
+        default=None, exclude=True
+    )

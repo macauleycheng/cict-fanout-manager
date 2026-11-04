@@ -36,6 +36,8 @@ fcntl / pathlib / contextlib），不引入任何新相依。
   - 0.3.1  修補 locked() 臨界區（yield 前）的 _ensure_dir_durable 呼叫，將其
            OSError 就地包成 SessionStoreError（保留 chaining），避免裸 OSError
            穿透 CLI 冒 traceback（FR-H1.5/FR-H3.3/NFR-H5）。
+  - 0.4.0  互聯 fanout：locked() 加 lock_suffix 參數（預設值行為不變）；
+           save() 的原子寫入段抽成 _write_atomic(payload)，供互聯 store 重用。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -193,7 +195,9 @@ class JsonSessionStore:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def locked(self, timeout: int = 10) -> Iterator[None]:
+    def locked(
+        self, timeout: int = 10, lock_suffix: str = ".lock"
+    ) -> Iterator[None]:
         """取得 ledger 的跨行程排他鎖，離開時釋放（#1）。
 
         以 ``fcntl.flock(fd, LOCK_EX)`` 阻塞取鎖，並用 ``signal.SIGALRM`` 設
@@ -214,7 +218,7 @@ class JsonSessionStore:
         OSError 包成 ``SessionStoreError``，故臨界區內的 save 失敗以
         ``SessionStoreError`` 形式穿透。
         """
-        lock_path = str(self._path) + ".lock"
+        lock_path = str(self._path) + lock_suffix
         try:
             fd = self._open_lock_fd(lock_path)
         except OSError as exc:
@@ -417,6 +421,15 @@ class JsonSessionStore:
             ledger.model_dump(), ensure_ascii=False, indent=2
         )
 
+        self._write_atomic(payload)
+
+    def _write_atomic(self, payload: str) -> None:
+        """以 tempfile + fsync + os.replace + 父目錄 fsync 原子寫入 payload。
+
+        從 ``save()`` 抽出的行為不變重構，供互聯 store 重用。寫入任一步的
+        OSError 一律包成 ``SessionStoreError``（保留 chaining），失敗前清除
+        殘留 temp 檔。
+        """
         tmp_path: Optional[Path] = None
         try:
             self._ensure_dir_durable(self._path.parent)

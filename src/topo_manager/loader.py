@@ -18,6 +18,8 @@
 歷史（HISTORY）：
   - 0.1.0  FEAT-002 初版，建立 load_topology 與 _check_referential_integrity
            （設計 §4.1~§4.3、FR-2、FR-4 載入面、FR-6.1）。
+  - 0.2.0  互聯 fanout：參照完整性檢查之後，若存在 interconnect 區段則呼叫
+           validate_interconnect（lazy import 避免循環）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -98,6 +100,12 @@ def load_topology(path: Union[str, Path]) -> Topology:
 
     # 階段 4：參照完整性檢查（跨模型的全域一致性）。
     _check_referential_integrity(topology)
+
+    # 階段 5：互聯區段語意驗證（僅當區段存在；lazy import 避免循環相依）。
+    if topology.interconnect is not None:
+        from topo_manager.interconnect.layout import validate_interconnect
+
+        validate_interconnect(topology)
 
     return topology
 

@@ -189,3 +189,32 @@ class ApplyError(TopologyError):
     完整套用。可復原性：使用者修正設定/權限後可重試。訊息應含失敗的設備與
     底層原因，並保留 ``__cause__``。
     """
+
+
+class InterconnectLayoutError(TopologyReferenceError):
+    """互聯 fanout 區段語意驗證失敗時觸發（互聯設計 §2.3、§7）。
+
+    觸發條件：interconnect 區段的命名空間、port、端點方向、組（group）規則
+    違反，或對沒有 interconnect 區段的拓樸建立互聯 allocator。訊息含 link
+    序號、名稱與期望值。
+    """
+
+
+class InterconnectRequestError(TopologyError):
+    """互聯 allocator 的輸入錯誤或 session 狀態不允許時觸發（§5.4、§7）。
+
+    觸發條件：組/DUT/profile/port 對不合法，或對非 releasing 的 session
+    執行 commit_release。訊息點名輸入值。
+    """
+
+
+class InterconnectConflictError(HardConflictError):
+    """互聯 port 層級硬衝突（§5.2、§7）。
+
+    繼承 ``HardConflictError``，使既有 ``except HardConflictError`` 行為保留。
+    訊息逐條列出被佔用的 port 與擁有者 session_id。
+    """
+
+
+class InterconnectSessionNotFoundError(SessionNotFoundError):
+    """查無指定的互聯 session（``ic-NNNN``）時觸發（§7）。"""
