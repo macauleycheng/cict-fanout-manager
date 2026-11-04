@@ -105,6 +105,7 @@ python -m topo_manager <command> <topology.yaml> [options]
 | `apply` | Push a session to the fanout(s) (dry-run unless `--apply`) | `--session`, `--credentials`, `--fanout`, `--apply` |
 | `verify` | Read back and verify a session is deployed; `--apply` re-pushes gaps | `--session`, `--credentials`, `--fanout`, `--apply` |
 | `setup` | Push the global `dot1q-tunnel` master switch (dry-run unless `--apply`) | `--credentials`, `--fanout`, `--apply` |
+| `interconnect` | DUT-to-DUT links on a separate fanout set (nested subcommands, see [Interconnect fanout](#interconnect-fanout)) | `summary`, `allocate`, `release`, `list`, `plan`, `park`, `apply`, `verify` |
 
 Common option reference:
 
@@ -467,6 +468,187 @@ required to select one (for `probe` and single-device `setup`).
 > revert edge ports on the device — that is intentional product behavior. The
 > edge-port revert commands exist only in the live test teardown path, not in
 > the normal release flow.
+
+---
+
+## Interconnect fanout
+
+Besides the traffic-generation fabric, a lab often needs the DUTs of one group
+wired to **each other** (for example four DUTs forming a mesh, a line or a
+ring). The interconnect feature builds those DUT-to-DUT links on a **separate
+set of fanout switches** that is never shared with the traffic-generation
+fanouts. One interconnect fanout can serve several groups, so the switch is
+shared instead of dedicated to one group.
+
+Each link is an **802.1Q access VLAN**: the two fanout ports that face the two
+DUTs are put into one dedicated VLAN as untagged members, and every link gets
+its own VLAN from the pool. The feature is fully separate from the
+traffic-generation side: it has its own graph, its own ledger and its own
+subcommands, and the existing commands, outputs and ledger are unchanged.
+
+### YAML `interconnect:` section
+
+The section is optional. DUTs that take part carry three extra fields: `group`
+(a label shared by the four DUTs of one set), `slot` (1..4, orders the DUTs
+inside the group) and `il_ports` (their four interconnect ports, in order
+`p0..p3`).
+
+```yaml
+racks:
+  - name: rack-1
+    duts:
+      - name: dut-A1
+        model: modelA
+        tg_ports: [Eth0, Eth1]
+        il_ports: [Eth8, Eth9, Eth10, Eth11]
+        slot: 1
+        group: A-g1
+      # ... slots 2..4 of group A-g1 ...
+interconnect:
+  fanouts:
+    - name: ic-1
+      port_count: 48
+      rack: rack-1
+  links:                       # DUT il_port <-> interconnect fanout port
+    - a: {dev: dut-A1, port: Eth8}
+      b: {dev: ic-1, port: 1}
+    # ... 16 links per group ...
+```
+
+Every `il_port` of a group member must be linked to exactly one port of the
+group's interconnect fanout, and a fanout port may be used only once. A
+48-port fanout therefore carries three groups. Two generated examples ship in
+`examples/` (`topology-interconnect-small.yaml` and
+`topology-interconnect-fullscale.yaml`); they are produced by
+`python examples/gen_interconnect.py` and checked in, so re-running the script
+gives byte-identical output.
+
+### Pairing table and profiles
+
+Inside a group the ports used between two DUTs are fixed. DUT `i` reaches
+neighbour `j` through the port whose index is the rank of `j` among the other
+members of the group:
+
+| DUTs | port on the first DUT | port on the second DUT |
+| --- | --- | --- |
+| d0-d1 | p0 | p0 |
+| d0-d2 | p1 | p0 |
+| d0-d3 | p2 | p0 |
+| d1-d2 | p1 | p1 |
+| d1-d3 | p2 | p1 |
+| d2-d3 | p2 | p2 |
+
+`p3` is not used by the table. It is reserved for explicit port pairs. The
+pairing depends only on the two DUTs, not on which other DUTs were selected.
+
+A **profile** expands the chosen DUTs (2 to 4, in the order given) into links:
+
+- `mesh`: every pair (1 link for 2 DUTs, 3 for 3 DUTs, 6 for 4 DUTs).
+- `line`: consecutive pairs in the order given.
+- `ring`: `line` plus a closing link between the last and the first DUT. A ring
+  of 2 DUTs is rejected, and a ring of 3 DUTs equals a mesh.
+
+For anything the table does not cover, name the ports explicitly with
+`--pair dut-A1:p3=dut-A2:p3` (repeatable; a port is either the `il_port` name
+or `p0..p3`).
+
+### Conflicts and several sessions per group
+
+Conflicts are decided **by port only**. Two sessions of the same group may run
+at the same time as long as they use different fanout ports, for example
+`{d0,d1}` and `{d2,d3}` as two independent two-DUT sessions. A four-DUT ring
+chosen as `d0,d1,d2,d3` uses the d0-d1 ports and therefore conflicts with a
+`{d0,d1}` session, whereas the same four DUTs chosen as `d0,d2,d1,d3` use
+other ports and can coexist with it. Reserving whole DUTs is left to the
+scheduler (such as ATLAS); this tool does not enforce it.
+
+### CLI
+
+All subcommands live under `interconnect`:
+
+```bash
+# Summary of the interconnect graph (fanouts, groups, DUTs, links)
+python -m topo_manager interconnect summary topo.yaml
+
+# Allocate a session: 4 DUTs as a ring, or 2 DUTs as a mesh, or explicit pairs
+python -m topo_manager interconnect allocate topo.yaml --group A-g1 \
+    --duts dut-A1,dut-A2,dut-A3,dut-A4 --profile ring
+python -m topo_manager interconnect allocate topo.yaml --group A-g1 \
+    --pair dut-A1:p3=dut-A2:p3
+
+# List active sessions (--raw dumps the ledger without loading the topology)
+python -m topo_manager interconnect list topo.yaml
+python -m topo_manager interconnect list --raw
+
+# Show the commands without connecting or reserving anything
+python -m topo_manager interconnect plan topo.yaml --session ic-0001
+python -m topo_manager interconnect plan topo.yaml --session ic-0001 --release
+python -m topo_manager interconnect plan topo.yaml --park --fanout ic-1
+
+# Put the interconnect ports into the parking state (dry-run unless --apply)
+python -m topo_manager interconnect park topo.yaml --fanout ic-1 --apply
+
+# Configure a session on the device, then read it back
+python -m topo_manager interconnect apply topo.yaml --session ic-0001 --apply
+python -m topo_manager interconnect verify topo.yaml --session ic-0001
+python -m topo_manager interconnect verify topo.yaml --parked
+
+# Release a session
+python -m topo_manager interconnect release topo.yaml --session ic-0001 --apply
+```
+
+`interconnect setup` is an alias of `interconnect park`.
+
+### Parking, release and dry-run
+
+- **Parking** is the idle state of an interconnect port: administratively
+  down, native VLAN 1, member of VLAN 1 only, so a DUT sees the link as down.
+  `park` restores that state for the ports named by the topology's interconnect
+  links (never the whole switch), skips ports owned by an active session and
+  clears leftover pool VLANs. VLANs outside the pool are never touched.
+- `apply` configures a session in two stages. The ports are first configured
+  while still shut down and read back; only if the read-back matches are they
+  brought up and read back again. A mismatch therefore never leaves a half-open
+  link. Every command is idempotent, so a failed run can simply be repeated.
+- `release` also has two stages: the session is first marked `releasing` in the
+  ledger (its ports and VLANs stay reserved), then the ports are parked and the
+  VLAN definitions removed, and only then is the session removed from the
+  ledger. If a step fails the session stays `releasing`; run the same command
+  again. `release --ledger-only` skips the device and only edits the ledger
+  (the device then needs `park --apply` to clean up).
+- Every subcommand that writes the device is a **dry-run unless `--apply`** is
+  given, and a dry-run never connects.
+
+### State file and locks
+
+Interconnect sessions are stored in their own file, `interconnect.json`
+(default `.topo-state/interconnect.json`, override with `--state`), so the
+traffic-generation ledger is not affected. A ledger lock serializes ledger
+updates and a separate device lock serializes commands that write the device.
+The pool is `--vlan-min`/`--vlan-max` (default `100`/`3000`).
+
+### Credentials
+
+Credentials use the same mechanism as [Fanout
+credentials](#fanout-credentials). The interconnect fanout names from the
+topology must appear under `fanouts` in the credentials JSON file; an
+interconnect fanout without an entry is an error (the command fails instead of
+skipping it).
+
+### Known limitations
+
+- Preserving an inner VLAN tag sent by the DUT is not verified: the links are
+  plain access VLANs, which are expected to drop or retag nothing the DUT
+  already tags, but this has not been tested on a device.
+- Slow protocols (LACP, LLDP, STP) are not passed through by default. If they
+  must reach the other DUT, enable the transparent forwarding on the switch
+  yourself; the tool neither configures nor verifies `l2protocol-tunnel`.
+- QinQ is not used: QinQ access ports cannot exchange packets with each other,
+  and the interconnect fanout has no uplink port, so each link is a separate
+  access VLAN instead.
+- The feature is CLI-only; there is no REST API or Web UI for it.
+- Reading back a port takes a few `show` commands, so a large `park` takes
+  time; use `--fanout` or `--ports` to narrow it.
 
 ---
 
