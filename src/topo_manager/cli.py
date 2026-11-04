@@ -45,6 +45,9 @@ SessionStoreError，皆為其子類，自動一併攔截），印到 stderr 的�
            handler，於 _COMMANDS 註冊；_print_plan_result 每個 change 加印其
            role（邊緣/互聯）；_print_verify_result 診斷字串改中性詞（期望設定）。
            既有 9 子命令、_build_allocator、main() 的 except 不動。
+  - 0.6.0  互聯 fanout：新增 ``interconnect`` 子命令群（巢狀 summary/allocate/
+           release/list/plan/park/apply/verify，由 interconnect.cli 註冊與
+           分派，lazy import）與 _cmd_interconnect；既有子命令與輸出不變。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -185,6 +188,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_credentials_arg(setup_parser)
     _add_fanout_arg(setup_parser)
     _add_apply_flag(setup_parser)
+
+    # interconnect <子命令>（互聯 fanout；巢狀子命令由 interconnect.cli 註冊）
+    ic_parser = subparsers.add_parser(
+        "interconnect", help="互聯 fanout（DUT 與 DUT 之間）管理。"
+    )
+    from topo_manager.interconnect.cli import register_interconnect_parsers
+
+    register_interconnect_parsers(ic_parser)
 
     return parser
 
@@ -786,6 +797,13 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_interconnect(args: argparse.Namespace) -> int:
+    """執行 ``interconnect`` 子命令群：延遲 import 並交給 interconnect.cli 分派。"""
+    from topo_manager.interconnect.cli import dispatch
+
+    return dispatch(args)
+
+
 # 子命令名 → 處理函式的分派表（新增子命令只需在此註冊）。
 _COMMANDS = {
     "summary": _cmd_summary,
@@ -798,6 +816,7 @@ _COMMANDS = {
     "apply": _cmd_apply,
     "verify": _cmd_verify,
     "setup": _cmd_setup,
+    "interconnect": _cmd_interconnect,
 }
 
 

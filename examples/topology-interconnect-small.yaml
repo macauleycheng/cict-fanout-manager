@@ -1,0 +1,846 @@
+# 互聯 fanout 小規模範例拓樸（互聯設計 §9）—— 由 examples/gen_interconnect.py 產生。
+#
+# 請勿手動編輯；如需調整，改 gen_interconnect.py 後重跑：
+#     python examples/gen_interconnect.py
+#
+# 規模：2 rack × 2 組 × 4 DUT（16 DUT）；每 rack 一台互聯 fanout（48 port，承載
+# 32 port，未滿載）。打流側為精簡樹狀（1 core / 每 rack 1 leaf）。
+version: 1
+site: lab-interconnect-small
+generators:
+- name: ixia-1
+  type: ixia
+  ports:
+  - ixia-1/1
+  - ixia-1/2
+  - ixia-1/3
+  - ixia-1/4
+fanouts:
+- name: core-1
+  role: core
+  port_count: 24
+- name: leaf-1
+  role: leaf
+  port_count: 32
+- name: leaf-2
+  role: leaf
+  port_count: 32
+racks:
+- name: rack-1
+  duts:
+  - name: dut-A1
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 1
+    group: A-g1
+  - name: dut-A2
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 2
+    group: A-g1
+  - name: dut-A3
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 3
+    group: A-g1
+  - name: dut-A4
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 4
+    group: A-g1
+  - name: dut-A5
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 1
+    group: A-g2
+  - name: dut-A6
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 2
+    group: A-g2
+  - name: dut-A7
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 3
+    group: A-g2
+  - name: dut-A8
+    model: modelA
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 4
+    group: A-g2
+- name: rack-2
+  duts:
+  - name: dut-B1
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 1
+    group: B-g1
+  - name: dut-B2
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 2
+    group: B-g1
+  - name: dut-B3
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 3
+    group: B-g1
+  - name: dut-B4
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 4
+    group: B-g1
+  - name: dut-B5
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 1
+    group: B-g2
+  - name: dut-B6
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 2
+    group: B-g2
+  - name: dut-B7
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 3
+    group: B-g2
+  - name: dut-B8
+    model: modelB
+    tg_ports:
+    - Eth0
+    - Eth1
+    il_ports:
+    - Eth8
+    - Eth9
+    - Eth10
+    - Eth11
+    slot: 4
+    group: B-g2
+links:
+- a:
+    dev: ixia-1
+    port: ixia-1/1
+  b:
+    dev: core-1
+    port: 1
+- a:
+    dev: ixia-1
+    port: ixia-1/2
+  b:
+    dev: core-1
+    port: 2
+- a:
+    dev: ixia-1
+    port: ixia-1/3
+  b:
+    dev: core-1
+    port: 3
+- a:
+    dev: ixia-1
+    port: ixia-1/4
+  b:
+    dev: core-1
+    port: 4
+- a:
+    dev: leaf-1
+    port: 1
+  b:
+    dev: core-1
+    port: 5
+- a:
+    dev: dut-A1
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 11
+- a:
+    dev: dut-A1
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 12
+- a:
+    dev: dut-A2
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 13
+- a:
+    dev: dut-A2
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 14
+- a:
+    dev: dut-A3
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 15
+- a:
+    dev: dut-A3
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 16
+- a:
+    dev: dut-A4
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 17
+- a:
+    dev: dut-A4
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 18
+- a:
+    dev: dut-A5
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 19
+- a:
+    dev: dut-A5
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 20
+- a:
+    dev: dut-A6
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 21
+- a:
+    dev: dut-A6
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 22
+- a:
+    dev: dut-A7
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 23
+- a:
+    dev: dut-A7
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 24
+- a:
+    dev: dut-A8
+    port: Eth0
+  b:
+    dev: leaf-1
+    port: 25
+- a:
+    dev: dut-A8
+    port: Eth1
+  b:
+    dev: leaf-1
+    port: 26
+- a:
+    dev: leaf-2
+    port: 1
+  b:
+    dev: core-1
+    port: 6
+- a:
+    dev: dut-B1
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 11
+- a:
+    dev: dut-B1
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 12
+- a:
+    dev: dut-B2
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 13
+- a:
+    dev: dut-B2
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 14
+- a:
+    dev: dut-B3
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 15
+- a:
+    dev: dut-B3
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 16
+- a:
+    dev: dut-B4
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 17
+- a:
+    dev: dut-B4
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 18
+- a:
+    dev: dut-B5
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 19
+- a:
+    dev: dut-B5
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 20
+- a:
+    dev: dut-B6
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 21
+- a:
+    dev: dut-B6
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 22
+- a:
+    dev: dut-B7
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 23
+- a:
+    dev: dut-B7
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 24
+- a:
+    dev: dut-B8
+    port: Eth0
+  b:
+    dev: leaf-2
+    port: 25
+- a:
+    dev: dut-B8
+    port: Eth1
+  b:
+    dev: leaf-2
+    port: 26
+interconnect:
+  fanouts:
+  - name: ic-1-1
+    port_count: 48
+    rack: rack-1
+  - name: ic-2-1
+    port_count: 48
+    rack: rack-2
+  links:
+  - a:
+      dev: dut-A1
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 1
+  - a:
+      dev: dut-A1
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 2
+  - a:
+      dev: dut-A1
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 3
+  - a:
+      dev: dut-A1
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 4
+  - a:
+      dev: dut-A2
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 5
+  - a:
+      dev: dut-A2
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 6
+  - a:
+      dev: dut-A2
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 7
+  - a:
+      dev: dut-A2
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 8
+  - a:
+      dev: dut-A3
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 9
+  - a:
+      dev: dut-A3
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 10
+  - a:
+      dev: dut-A3
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 11
+  - a:
+      dev: dut-A3
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 12
+  - a:
+      dev: dut-A4
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 13
+  - a:
+      dev: dut-A4
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 14
+  - a:
+      dev: dut-A4
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 15
+  - a:
+      dev: dut-A4
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 16
+  - a:
+      dev: dut-A5
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 17
+  - a:
+      dev: dut-A5
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 18
+  - a:
+      dev: dut-A5
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 19
+  - a:
+      dev: dut-A5
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 20
+  - a:
+      dev: dut-A6
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 21
+  - a:
+      dev: dut-A6
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 22
+  - a:
+      dev: dut-A6
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 23
+  - a:
+      dev: dut-A6
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 24
+  - a:
+      dev: dut-A7
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 25
+  - a:
+      dev: dut-A7
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 26
+  - a:
+      dev: dut-A7
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 27
+  - a:
+      dev: dut-A7
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 28
+  - a:
+      dev: dut-A8
+      port: Eth8
+    b:
+      dev: ic-1-1
+      port: 29
+  - a:
+      dev: dut-A8
+      port: Eth9
+    b:
+      dev: ic-1-1
+      port: 30
+  - a:
+      dev: dut-A8
+      port: Eth10
+    b:
+      dev: ic-1-1
+      port: 31
+  - a:
+      dev: dut-A8
+      port: Eth11
+    b:
+      dev: ic-1-1
+      port: 32
+  - a:
+      dev: dut-B1
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 1
+  - a:
+      dev: dut-B1
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 2
+  - a:
+      dev: dut-B1
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 3
+  - a:
+      dev: dut-B1
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 4
+  - a:
+      dev: dut-B2
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 5
+  - a:
+      dev: dut-B2
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 6
+  - a:
+      dev: dut-B2
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 7
+  - a:
+      dev: dut-B2
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 8
+  - a:
+      dev: dut-B3
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 9
+  - a:
+      dev: dut-B3
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 10
+  - a:
+      dev: dut-B3
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 11
+  - a:
+      dev: dut-B3
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 12
+  - a:
+      dev: dut-B4
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 13
+  - a:
+      dev: dut-B4
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 14
+  - a:
+      dev: dut-B4
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 15
+  - a:
+      dev: dut-B4
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 16
+  - a:
+      dev: dut-B5
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 17
+  - a:
+      dev: dut-B5
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 18
+  - a:
+      dev: dut-B5
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 19
+  - a:
+      dev: dut-B5
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 20
+  - a:
+      dev: dut-B6
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 21
+  - a:
+      dev: dut-B6
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 22
+  - a:
+      dev: dut-B6
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 23
+  - a:
+      dev: dut-B6
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 24
+  - a:
+      dev: dut-B7
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 25
+  - a:
+      dev: dut-B7
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 26
+  - a:
+      dev: dut-B7
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 27
+  - a:
+      dev: dut-B7
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 28
+  - a:
+      dev: dut-B8
+      port: Eth8
+    b:
+      dev: ic-2-1
+      port: 29
+  - a:
+      dev: dut-B8
+      port: Eth9
+    b:
+      dev: ic-2-1
+      port: 30
+  - a:
+      dev: dut-B8
+      port: Eth10
+    b:
+      dev: ic-2-1
+      port: 31
+  - a:
+      dev: dut-B8
+      port: Eth11
+    b:
+      dev: ic-2-1
+      port: 32
