@@ -71,15 +71,23 @@ The tool ships **two separate executables** (both installed by
   CLI subcommands** — they are launched differently and do different things.
   The API server additionally serves a lightweight browser [Web UI](#web-ui)
   at its root URL, but that UI is still a client of the same HTTP endpoints —
-  it is not a third entry point.
+  it is not a third entry point. The Web UI is **read-only until you paste an
+  API token** into its header field; without a token it only lists and inspects
+  sessions. With a valid token it unlocks write actions that go through the
+  token-guarded REST endpoints (see
+  [Web UI with token-unlocked write operations](#web-ui-with-token-unlocked-write-operations)).
 - **Pushing VLAN config to fanout switches** (`plan` / `probe` / `apply` /
   `verify` / `setup`) is **CLI-only** by default; the REST API has no device-push
   endpoints unless you opt in (see
-  [Device push over REST](#device-push-over-rest)).
+  [Device push over REST](#device-push-over-rest)). Once opted in, those
+  endpoints — and the combined allocate-and-apply / release-and-remove endpoints
+  the token-unlocked [Web UI](#web-ui-with-token-unlocked-write-operations) calls
+  — are reachable over HTTP behind the API token.
   This also applies to the interconnect feature: the REST API covers
   [interconnect ledger operations](#interconnect-endpoints) (create/release/
-  list/plan), but `apply`, `park`, `release --apply`, and `verify` for
-  interconnect stay **CLI-only** too.
+  list/plan), while `apply`, `park`, `release --apply`, and `verify` for
+  interconnect stay **CLI-only** unless device push is enabled, in which case the
+  token-guarded REST endpoints cover them too.
 - Both act on the **same underlying allocator and the same JSON ledger**: point
   the CLI's `--state` and the server's `TOPO_MANAGER_STATE` at the same file and
   they share state. Concurrent use (CLI + API, or multiple processes) is kept
@@ -1031,8 +1039,10 @@ export TOPO_MANAGER_CREDENTIALS=/etc/topo-manager/fanout-credentials.json
 topo-manager-api
 ```
 
-When enabled, `GET /openapi.json`'s `info.version` becomes `0.6.0` (it stays
-`0.5.0` when disabled) and the seven paths below appear in the document.
+When enabled, `GET /openapi.json`'s `info.version` becomes `0.7.0` (it stays
+`0.5.0` when disabled) and the eleven paths below appear in the document (the
+seven base push paths plus the four combined allocate-and-apply /
+release-and-remove paths).
 
 #### Endpoints and their CLI equivalents
 
@@ -1051,6 +1061,59 @@ stays ledger-only and needs no token. The flow for anything that writes to a
 device is always **create first, then push**: `POST /sessions` or
 `POST /interconnect/sessions` to allocate, then one of the `apply` endpoints
 above to actually configure the device.
+
+#### Combined endpoints (allocate-and-apply / release-and-remove)
+
+For callers that want the ledger write and the device push to happen in one
+request, four combined endpoints fold the two steps together. They live on the
+same gated routers, so they are subject to the same enable flag (disabled
+answers a structured 404) and the same `X-API-Token` requirement (a missing or
+wrong token answers 401 before any side effect):
+
+| Method and path | Does | Ordering and rollback |
+| --- | --- | --- |
+| `POST /sessions/allocate-and-apply` | Allocate a traffic session, then push its VLAN/tunnel config to the fanouts in one call | Ledger first, then device. If the device push fails the ledger allocation is rolled back (released), so no half-created session is left behind |
+| `POST /sessions/{session_id}/release-and-remove` | Tear down the traffic session's config on the device, then release it from the ledger | Device first, then ledger. If the device teardown fails the ledger entry is kept (not released); the removal read-back is idempotent so the call is safe to retry |
+| `POST /interconnect/sessions/allocate-and-apply` | Allocate an interconnect session, then enable its ports and VLANs in one call | Ledger first, then device. If the device push fails the ledger allocation is rolled back (`release_now`) so no interconnect session remains |
+| `POST /interconnect/sessions/{session_id}/release-and-remove` | Release an interconnect session from both the device and the ledger | Delegates to the existing two-phase interconnect release; a mid-failure leaves the session in the re-runnable `releasing` state |
+
+These are what the token-unlocked
+[Web UI](#web-ui-with-token-unlocked-write-operations) calls for Allocate and
+Release. The standalone `apply` endpoints above remain available for the Apply
+action on an already-allocated session.
+
+The response shapes differ between combined and standalone endpoints:
+
+- `POST /sessions/allocate-and-apply` returns
+  `{"status": "allocated-and-applied", "session": {...}, "fanouts": [...]}` —
+  the ledger fields (`session_id`, `vlan`, ...) are **embedded under `session`**,
+  not at the top level.
+- `POST /sessions/{session_id}/release-and-remove` returns
+  `{"status": "released-and-removed", "session_id": "...", "fanouts": [...]}` —
+  the session is gone, so a plain `session_id` is returned instead of an
+  embedded session.
+- `POST /interconnect/sessions/allocate-and-apply` returns
+  `{"status": "allocated-and-applied", "session": {...}, "device": {"vlans": [...], "fanouts": [...], "notes": [...]}}` —
+  the per-fanout push results live under `device.fanouts`.
+- `POST /interconnect/sessions/{session_id}/release-and-remove` returns the same
+  shape as the existing `release-device` endpoint.
+
+Every combined endpoint's error body is the usual structured
+`{"error": {"type", "message"}}` with no traceback; the per-fanout result list
+appears only on a 200 success.
+
+```bash
+TOKEN="$TOPO_MANAGER_API_TOKEN"
+
+# Allocate and push in one request
+curl -s -X POST localhost:8000/sessions/allocate-and-apply \
+    -H "X-API-Token: $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"}'
+
+# Tear down on the device and release from the ledger in one request
+curl -s -X POST localhost:8000/sessions/s-0001/release-and-remove \
+    -H "X-API-Token: $TOKEN"
+```
 
 #### curl examples (with the required header)
 
@@ -1228,8 +1291,15 @@ endpoints offer:
   or port.
 - **Create a session** — pick a generator port and a DUT port and allocate. The
   dropdowns list **only currently available ports** (those not already held by
-  an active session), so you cannot pick a port that is taken.
+  an active session), so you cannot pick a port that is taken. With a token
+  entered, allocate also pushes the VLAN/tunnel config to the physical switch
+  in the same action (it calls `allocate-and-apply`); the Allocate button is
+  hidden until a token is entered.
 - **Release a session** — release the selected session from its detail panel.
+  With a token entered, Release also tears the config down on the device (it
+  calls `release-and-remove`), not just the ledger.
+- **Apply a session** — with a token entered, the detail panel also offers an
+  Apply action that re-pushes an already-allocated session to the device.
 - **Auto-refresh (optional)** — a checkbox re-polls the server every 10 seconds;
   a manual **Refresh** button is always available.
 - **Friendly errors** — API errors (e.g. a hard conflict on allocate) are shown
@@ -1237,11 +1307,13 @@ endpoints offer:
 
 ### Interconnect tab
 
-The Interconnect tab is a client of the **ledger-only** interconnect REST
-endpoints (`GET /interconnect/summary`, `GET /interconnect/resources/available`,
-`GET /interconnect/sessions`, `POST /interconnect/sessions`,
-`DELETE /interconnect/sessions/{id}`, and `POST /interconnect/plan` for a preview).
-It can see, build, and release interconnect sessions; it never pushes to a device.
+The Interconnect tab reads the **ledger-only** interconnect REST endpoints
+(`GET /interconnect/summary`, `GET /interconnect/resources/available`,
+`GET /interconnect/sessions`, and `POST /interconnect/plan` for a preview). It
+can see, build, and release interconnect sessions. Reads and the Preview stay
+token-free; when a token is entered, its Allocate / Release / Apply actions call
+the token-guarded combined endpoints and push to the device the same way the
+Traffic tab does.
 
 - **Interconnect topology** — interconnect has no generator→DUT tiering, so it is
   drawn as **one small diagram per group**: a group's four DUTs (`d0`..`d3`) sit
@@ -1262,41 +1334,97 @@ It can see, build, and release interconnect sessions; it never pushes to a devic
   **only currently buildable resources** (from `GET /interconnect/resources/available`
   and the summary). A **Preview** button shows the plan without allocating.
 - **Release a session** — release the selected session from its detail panel.
-  This is **ledger-only**: it clears the session from the ledger but does not park
-  the device (device cleanup stays on the CLI).
+  With no token this is **ledger-only** (it clears the session from the ledger
+  but does not park the device); with a token entered it calls
+  `release-and-remove`, which also parks the ports on the device.
 - **Friendly errors** — interconnect API errors (400 invalid request, 409 port
   conflict or VLAN exhaustion, 404 session gone) are shown as a readable banner.
   On a topology with no interconnect section the tab degrades gracefully to a
   neutral "This topology has no interconnect section." note instead of an error.
 
-**No device push and no token in the Web UI.** Pushing interconnect config to the
-fanout switches (`apply` / `verify` / `park` / device-level `release`) is **not**
-in the Web UI — those are the job of the token-guarded REST endpoints or the CLI.
-The Web UI does not send `X-API-Token` and never triggers a write to a device.
+**Device push in the Web UI is token-gated.** With no token entered the Web UI
+is read-only on both tabs and never sends `X-API-Token` or triggers a device
+write — the same behavior it has always had. When a valid token is entered in
+the header, the Allocate / Release / Apply actions become visible and call the
+token-guarded REST endpoints, which do push to the fanout switches. See
+[Web UI with token-unlocked write operations](#web-ui-with-token-unlocked-write-operations)
+for the full token flow and its limitations.
 
-### Scope: existing endpoints only, no new backend
+### Scope: client of existing REST endpoints
 
-The Web UI is a pure client of **existing REST endpoints** and adds no new
-backend logic and no new endpoints. The Traffic tab uses the five traffic
-endpoints documented in
-[Endpoints and curl examples](#endpoints-and-curl-examples) (`GET /topology`,
-`GET /resources/available`, `GET /sessions`, `POST /sessions`,
-`DELETE /sessions/{id}`). The Interconnect tab uses the ledger-only
+The Web UI is a pure client of REST endpoints and carries no backend logic of
+its own. Its reads use the same endpoints as before: the Traffic tab reads
+`GET /topology`, `GET /resources/available`, and `GET /sessions`; the
+Interconnect tab reads the ledger-only
 [interconnect endpoints](#interconnect-endpoints) (`summary`,
-`resources/available`, `sessions` GET/POST, `sessions/{id}` DELETE, and `plan`
-for a preview).
+`resources/available`, `sessions` GET, and `plan` for a preview). None of the
+reads or the Preview send a token.
 
-Consequently, **pushing VLAN config to fanout switches** (`apply` / `verify` /
-`setup` / `park`) is **not** in the Web UI — on both tabs those remain
-**CLI-only** (or token-guarded REST), consistent with
-[Two independent entry points](#two-independent-entry-points). The UI can show
-and request/release sessions, but device pushes stay off the Web UI.
+Its writes are token-gated. With no token entered, no write action is shown and
+the UI behaves exactly as the earlier read-only UI did. With a valid token, the
+Allocate / Release / Apply actions call the token-guarded
+[device-push endpoints](#device-push-over-rest) — the combined
+`allocate-and-apply` and `release-and-remove` paths for Allocate and Release,
+and the standalone `apply` path for Apply — each with the `X-API-Token` header.
+A 401 reverts the UI to read-only and clears the token; per-fanout results are
+rendered only on a successful push.
 
-Writes triggered from the UI (allocate / release) go through the same POST /
-DELETE handlers as the REST API, so the main-thread deployment constraint and
-the single-process serialization behavior described under
+Because the write actions call the same device-push handlers as the REST API,
+the main-thread deployment constraint and the single-process serialization
+behavior described under
 [Starting the server](#starting-the-server-two-equivalent-ways) apply unchanged
 — the UI does not add a separate write path or bypass the file lock.
+
+### Web UI with token-unlocked write operations
+
+The Web UI starts read-only. A header field lets you paste an API token to
+unlock write operations on both the Traffic and the Interconnect tab; until a
+token is present, no write button is shown and the UI only lists and inspects
+sessions, exactly as a read-only client would.
+
+Paste the same value you set in `TOPO_MANAGER_API_TOKEN` on the server into the
+header's token field. This reveals the Allocate, Release, and Apply actions on
+both tabs:
+
+- **Allocate** creates the session and pushes it to the physical switch in one
+  step. On the Traffic tab it calls `POST /sessions/allocate-and-apply`; on the
+  Interconnect tab it calls `POST /interconnect/sessions/allocate-and-apply`.
+  The allocation is device-synced — the VLAN/tunnel config is written to the
+  fanouts as part of the same action.
+- **Release** tears the config down on the device and then removes the session
+  from the ledger. On the Traffic tab it calls
+  `POST /sessions/{id}/release-and-remove`; on the Interconnect tab it calls
+  `POST /interconnect/sessions/{id}/release-and-remove`. Unlike the read-only
+  ledger release, this one does touch the device.
+- **Apply** re-pushes an already-allocated session to the device without
+  reallocating, via the standalone `POST /sessions/{id}/apply` (or
+  `POST /interconnect/sessions/{id}/apply`) endpoint.
+
+On a successful write the detail panel shows a per-fanout result list (which
+fanout, which ports, and the read-back outcome). A device-push failure
+(409/502/504) is shown as a single readable banner.
+
+How the token is handled, and its limitations:
+
+- **In memory only.** The token lives in a JavaScript variable for the life of
+  the page. It is never written to `localStorage`, `sessionStorage`, or a
+  cookie, so **reloading the page loses it** and you re-enter it each time you
+  open the UI.
+- **Cleartext over HTTP.** The header note states this plainly: the token and
+  every request travel unencrypted unless you put a TLS-terminating reverse
+  proxy in front of the server. Do not use the token-unlocked UI over an
+  untrusted network without one.
+- **401 reverts to read-only.** If the server rejects the token (for example it
+  was changed or mistyped), the UI clears the field and returns to the
+  read-only state.
+
+Server requirement: the write actions only work when the server has device push
+enabled. Start it with `TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`,
+`TOPO_MANAGER_API_TOKEN` set to the shared secret, and the fanout credentials
+reachable (via `TOPO_MANAGER_CREDENTIALS` or the default lookup / `TOPO_FANOUT_*`
+env vars) — see [Device push over REST](#device-push-over-rest). Without device
+push enabled the token-guarded endpoints answer a structured 404 and the UI
+stays read-only.
 
 ---
 

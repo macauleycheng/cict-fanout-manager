@@ -223,7 +223,7 @@ links:
 
 > ⚠️ 下發是對實體設備的高風險動作：預設 dry-run，實際套用需明確確認。
 
-### 7.3 REST 下發介面（預設關閉，API 0.6.0）
+### 7.3 REST 下發介面（預設關閉，API 0.7.0）
 REST 預設只做帳本層；設備下發須明確啟用（`TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`），語意以 CLI 為權威，
 只呼叫既有 `Deployer` / `InterconnectDeployer`，不重寫演算法。流程固定為「先 `POST` 建 session，再 `POST` apply」。
 
@@ -247,7 +247,7 @@ REST 預設只做帳本層；設備下發須明確啟用（`TOPO_MANAGER_ENABLE_
   `DevicePushRequestError`，空 body 等於全部 fanout）。
 - **未啟用時**：router 永遠掛載但 `include_in_schema=False`，請求命中得結構化 404（`error.type` 為
   `DevicePushDisabledError`，與「拓樸無互聯區段」的 `InterconnectNotConfiguredError` 區分），OpenAPI、版本
-  （0.5.0）與 description 與未加此功能時逐位元一致。啟用時版本為 0.6.0。細微差異：僅 POST 的新路徑若收到
+  （0.5.0）與 description 與未加此功能時逐位元一致。啟用時版本為 0.7.0。細微差異：僅 POST 的新路徑若收到
   `GET`，因路徑已匹配而回 405。
 - **每請求重建 allocator**：打流 `apply` / `verify` 以 `build_allocator` 重讀帳本，不用啟動單例的快照，
   才找得到 server 啟動後由其他行程寫入的 session，也不會對已釋放的 session 下發。互聯側另在 `device_locked()` 內
@@ -266,6 +266,40 @@ REST 預設只做帳本層；設備下發須明確啟用（`TOPO_MANAGER_ENABLE_
   永遠得不到 504。`translate_device_errors` 沿 `__cause__` 最多追 3 層（實測最大包裝深度 2，再留 1 層）：
   `DeviceTimeoutError` → 504、`DriverConnectionError` → 502；`DriverDependencyError` / `ConfigError` / `PortMappingError`
   還原為原例外（500，屬服務配置缺陷）；其餘 `ApplyError`（設備拒絕指令）維持 502。
+
+### 7.4 打流側撤下發（`Deployer.remove`）與合併端點
+
+打流側的 Release 原本只清帳本、不碰設備（與互聯側的兩段式 release 不對稱）。為了讓 Web UI 的 Release 能真正把
+已下發的 VLAN 從實體 fanout 撤除，`Deployer` 新增與 `apply` 對稱的 `remove(session, *, apply=False) -> PlanResult`
+（撤下發）：
+
+- **dry-run（`apply=False`）**：自建一份 `List[FanoutPlan]`，不重用 `plan(session)`（`plan()` 產生的是新增指令、
+  且 `FanoutPlan` 為 frozen）。對每個有變更的 fanout，把其變更改寫為 `action='remove'`，再呼叫 `driver.build_commands`
+  取得 remove 分支指令；全程不連線，回傳的每台 fanout 指令即為撤除指令（VLAN 與成員與 `plan(session)` 相同）。
+- **實際撤除（`apply=True`）**：依 fanout 排序逐台 `connect()` → `clear_vlan(changes)`（同時撤除 EDGE 與 UPLINK —
+  明確的 Release 連邊緣 port 也一起拆，與 apply 回滾時只處理 UPLINK 的 `_best_effort_clear` 不同）→ `read_vlans()`
+  → 角色分流 read-back → `finally` 內 `disconnect()`。跨 fanout 盡力而為；遇到第一個硬性 driver 失敗
+  （`DriverConnectionError` / `DeviceTimeoutError`，driver 已包裝）直接重拋結構化錯誤，不包成 `ApplyError`、也不回補
+  （release 期間無法「反撤除」）。read-back 落差重拋 `ReadBackMismatchError`（→ 409）。
+- **角色分流 read-back**：鏡射 `planner.diff_expected_vs_actual` 的角色切分（EDGE 與 UPLINK 落在 `VlanState` 不同部位）。
+  先算 `tagged_present = {(m.interface, m.vlan) | m in after.members, m.tagged is True}` 與
+  `access_present = {iface | (iface, mode) in after.tunnel_modes, mode == 'Access'}`。對每個預期變更：`EDGE` 判定為
+  「`interface` 不在 `access_present`」才算撤除成功；`UPLINK` 判定為「`(interface, vlan)` 不在 `tagged_present`」。
+  **EDGE 必須以 `tunnel_modes` 判定，不可看 members**：EDGE 在成功與失敗兩種情況 members 都是空的，用 members 會誤判成功。
+
+合併端點（§9「設備下發 REST」詳列路徑與回應形狀）把帳本與設備兩步併成一次請求，固定順序與逐步盡力回滾如下：
+
+- **打流 allocate-and-apply**：順序「帳本 → 設備」。先 `Allocator.allocate`（帳本失敗直接回結構化錯誤，無可回滾）；
+  再 `Deployer.apply(session, apply=True)`。設備失敗（含 credentials `ConfigError` 500）→ `Allocator.release(session_id)`
+  回滾帳本後重拋原錯；若回滾本身也失敗，拋出點名孤兒 `s-NNNN` 與補救方式（重跑 release-and-remove 或 CLI release）的結構化錯誤。
+- **打流 release-and-remove**：順序「設備 → 帳本」。先 `Deployer.remove(session, apply=True)`；設備失敗**不**清帳本、
+  重拋結構化錯誤（session 留著，撤除 read-back 只檢查「不存在」故重試是冪等安全的）；設備成功才 `Allocator.release(session_id)`。
+- **互聯 allocate-and-apply**：順序「帳本 → 設備」。先 `allocate_profile` / `allocate_pairs`；再 `InterconnectDeployer.apply`。
+  設備失敗 → `InterconnectAllocator.release_now(session_id)` 回滾（`apply` 不做 phase 寫入、失敗時 port 仍 shutdown，
+  故任一 phase 的 `release_now` 都是精確且不重複處理的回滾），然後重拋；`release_now` 也失敗則拋「設備下發失敗且帳本回滾失敗、
+  session 孤兒」的結構化錯誤（503 / 500 類）。
+- **互聯 release-and-remove**：委派給既有兩段式 `InterconnectDeployer.release`（`begin_release` → park / 清 VLAN →
+  `commit_release`）；中途失敗會把 session 留在可重跑的 `releasing` 狀態，不另外回滾。
 
 ---
 
@@ -350,10 +384,9 @@ Web UI 由既有 `topo-manager-api` 以靜態資產 serve（`/static` 與 `GET /
   改為「頁首／頁籤列／單一頁籤容器」三列、原四 panel 的 grid 下移到 `#tab-traffic`。
   三個新檔放 `static/` 同目錄即隨既有 `/static` mount 服出，不改 `ui.py` / `app.py`
   的 Python 程式，不新增後端端點。
-- **只呼叫既有互聯帳本端點**：summary、resources/available、sessions（GET/POST）、
-  sessions/{id}（DELETE，ledger-only）、plan（預覽）。**不**呼叫任何會連設備的端點
-  （apply / verify / park / release-device），也不處理 `X-API-Token`；設備下發一律
-  留給帶 token 的 REST 或 CLI。
+- **讀取仍只呼叫既有帳本端點**：summary、resources/available、sessions（GET）、plan（預覽）皆不帶 token。
+  **寫入改為 token 解鎖**：輸入 token 後，Allocate / Release / Apply 改呼叫帶 `X-API-Token` 的合併 / 下發端點
+  （見下方「Web UI token 解鎖寫入」）；未輸入 token 時完全維持原本的只讀行為，不送 token、不連設備。
 - **互聯視覺化資料來源**：互聯沒有 generator→DUT 分層樹，不套用打流側的分層佈局，
   改用「每組一張小圖」。節點（方形四角 d0..d3）來自 `GET /interconnect/summary`
   的 `groups[].duts[]`（`label` d0..d3 與 DUT `name`）；選中／filter 到某 session 時
@@ -376,8 +409,28 @@ Web UI 由既有 `topo-manager-api` 以靜態資產 serve（`/static` 與 `GET /
   group 缺席 → `[]` 的 not-found 契約）以 `topology-interconnect-small.yaml` 的真實
   session / summary 形狀做回歸。
 
-### 設備下發 REST（API 0.6.0，預設關閉）
-在互聯 REST 之外，可選擇啟用 7 個會連線並寫入 fanout 的端點（端點與 CLI 對照見 §7.3）。
+### Web UI token 解鎖寫入（純前端，記憶體內 token）
+Web UI 預設只讀。頁首新增一個 token 欄位，貼上 API token 即可在打流與互聯兩個頁籤解鎖寫入；未輸入 token 前
+兩頁都不顯示任何寫入按鈕，只能列出與檢視 session（與既有只讀 client 行為一致）。
+
+- **token 只存記憶體**：token 僅存在一個 JS 閉包 / 模組變數，**絕不**寫入 `localStorage` / `sessionStorage` / cookie，
+  因此重載頁面即遺失，每次開頁都要重填。前端新增 `static/token.js`（IIFE `auth` 物件，暴露
+  `getToken` / `setToken` / `clearToken` / `hasToken` 與共用的 `applyWriteLock()`）；`token.js` 於 `app.js` / `ic.js`
+  之前載入，且檔內不含 `localStorage` / `sessionStorage` / cookie 字面（結構性測試據此守約）。
+- **可見性以 body class 驅動**：`applyWriteLock()` 以 `document.body.classList.toggle('writes-unlocked', auth.hasToken())`
+  控制；CSS 以 `body:not(.writes-unlocked) ... { display:none !important }` 隱藏寫入按鈕（移除原本永久隱藏的規則）。
+  空 token → 無 `writes-unlocked` class → 與今日的只讀視圖逐位元一致。預設服出的 `<body>` 不帶該 class。
+- **寫入動作與端點**：打流 Allocate → `POST /sessions/allocate-and-apply`（讀內嵌的 `resp.session.session_id` / `vlan`，
+  非扁平）、Release → `POST /sessions/{id}/release-and-remove`、Apply → `POST /sessions/{id}/apply`（純 apply 回扁平
+  `resp.session_id` / `vlan`）；互聯頁籤對應三個 `/interconnect/...` 端點，Allocate 讀 `resp.session.*` 與 `resp.device.fanouts`。
+  每次寫入都帶 `X-API-Token`；Preview（`POST /interconnect/plan`）維持只讀、不帶 token。
+- **明文警語**：token 欄位旁有短註記，說明 token 以 HTTP 明文傳送（無 TLS，需要時由前置反向代理處理）、且只存記憶體、重載即失。
+- **成功才列逐 fanout 結果**：成功回應（200）才在 detail panel 列出逐 fanout 結果（fanout、ports、read-back 結果）；
+  錯誤 body 只有 `{error:{type,message}}`、不含 `fanouts`，以單行友善訊息顯示。
+- **401 → 退回只讀**：任何寫入收到 401（`ApiTokenError`）即清掉前端 token、重跑 `applyWriteLock()`、清空欄位，UI 退回只讀。
+
+### 設備下發 REST（API 0.7.0，預設關閉）
+在互聯 REST 之外，可選擇啟用會連線並寫入 fanout 的端點（7 個基礎端點加 4 個合併端點，端點與 CLI 對照見 §7.3）。
 啟用條件：`TOPO_MANAGER_ENABLE_DEVICE_PUSH=1` 且同時設定 `TOPO_MANAGER_API_TOKEN`；只接受 `1`，
 `0` / 未設 / 空字串為關閉，其他值（如 `true`）啟動期即報錯，避免被默默當成關閉。
 啟用但未設 token：`Settings.__init__` 丟 `ConfigError`，`topo-manager-api` 以單行 stderr、exit 1 結束，無 traceback。
@@ -411,7 +464,27 @@ REST 因精確查表仍可分流為 504。`ec_ssh` 的 `_reraise_as_connection_e
 互聯 `verify` 的 `problems` 為扁平字串清單，不逐 fanout 解析。`setup` 讀回非 Enabled 視為 read-back 不符（409），與 CLI 只印狀態不同。
 失敗後設備狀態可能部分改變（打流側對先前成功的 fanout 只做盡力回滾），建議以 `GET .../verify` 確認。
 
-**版本**：啟用時 `_API_VERSION` 為 0.6.0，未啟用維持 0.5.0（契約只在啟用時擴張，既有測試不需修改）。
+**版本**：啟用時 `_API_VERSION` 為 0.7.0，未啟用維持 0.5.0（契約只在啟用時擴張，既有測試不需修改）。
+
+**合併端點（allocate-and-apply / release-and-remove）**：掛在同一組 gated router 上（因此未啟用 → 404、
+缺／錯 token → 401 皆沿用既有閘門，副作用發生前即擋下），把帳本與設備兩步併成一次請求。固定順序與逐步盡力回滾
+的設備語意見 §7.4；以下為 REST 契約：
+
+| REST（皆 POST） | 動作 | 回應形狀 |
+| --- | --- | --- |
+| `/sessions/allocate-and-apply` | 分配打流 session 後下發（集合 POST，無 `{id}`） | `{status:'allocated-and-applied', session:SessionResponse, fanouts:[FanoutPushResult]}`；帳本欄位（`session_id`、`vlan`…）**內嵌於 `session.*`**，非頂層 |
+| `/sessions/{id}/release-and-remove` | 撤除打流 session 的設備設定後釋放帳本 | `{status:'released-and-removed', session_id, fanouts:[FanoutPushResult]}`；session 已清，故回扁平 `session_id` |
+| `/interconnect/sessions/allocate-and-apply` | 分配互聯 session 後下發 | `{status:'allocated-and-applied', session:IcSessionResponse, device:{vlans:[int], fanouts:[FanoutPushResult], notes:[str]}}`；逐 fanout 結果在 `device.fanouts` |
+| `/interconnect/sessions/{id}/release-and-remove` | 從設備與帳本釋放互聯 session | 同既有 `release-device` 的 `IcPushResponse` 形狀 |
+
+- **原子性與回滾**：見 §7.4。打流 allocate-and-apply 的設備失敗會 `Allocator.release` 回滾帳本（不留半成品 session）；
+  release-and-remove 的設備失敗則保留帳本（不先清）；互聯 allocate-and-apply 以 `release_now` 回滾。回滾本身再失敗時
+  拋出點名孤兒 session 與補救方式的結構化錯誤。
+- **結構化錯誤**：錯誤 body 一律為 `{"error":{"type","message"}}`，無 traceback；逐 fanout 結果清單只在 200 成功時出現，
+  失敗 body 不含 `fanouts` 陣列（需結構化後續資料請在失敗後呼叫對應 `verify`）。
+- 端點簽章不含 Pydantic body 參數（與 `setup` 相同），body 於 handler 內手動解析，壞 body → 400 `DevicePushRequestError`，
+  以免 body 驗證蓋過 token 的 401。合併端點是 Web UI 的 Allocate / Release 所呼叫（§9「Web UI token 解鎖寫入」）；
+  既有獨立 `apply` 端點保留給「對既有 session 重新下發」的 Apply 動作。
 
 **自動化驗收範圍**：本功能的全部自動化驗收（單元測試、主執行緒 live-server 整合測試，以及啟用設備下發後對四種環境組合實際啟動
 uvicorn 並以 curl 打的驗收）一律以注入的假 driver 進行，從不開啟任何對真實交換器的網路連線。本倉庫沒有任何自動化測試或自動化驗收
@@ -553,8 +626,8 @@ port 回到測前狀態（4093 未被修改）。以 `pytest -s` 執行可印出
 - slow protocol（LACP / LLDP / STP）透通須在 switch 端自行設定，本系統不設定
   也不驗證 `l2protocol-tunnel`。
 - 不使用 QinQ：QinQ access port 之間無法互通，且互聯 fanout 沒有 uplink port。
-- REST 僅做帳本層（見 §9「互聯 REST」），設備下發（apply / park / verify）僅限
-  CLI 或帶 token 的 REST；Web UI 的互聯頁籤只讀帳本、不連設備（見 §9「Web UI
-  互聯頁籤」）。
+- REST 預設只做帳本層（見 §9「互聯 REST」），設備下發（apply / park / verify）
+  僅限 CLI 或帶 token 的 REST；Web UI 的互聯頁籤未輸入 token 時只讀帳本、不連設備，
+  輸入 token 後才透過合併端點下發（見 §9「Web UI token 解鎖寫入」）。
 - 每個 port 需數次 `show` 讀回，大範圍 park 較慢，可用 `--fanout` / `--ports`
   縮小範圍。
