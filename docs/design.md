@@ -358,8 +358,9 @@ Web UI 由既有 `topo-manager-api` 以靜態資產 serve（`/static` 與 `GET /
   改用「每組一張小圖」。節點（方形四角 d0..d3）來自 `GET /interconnect/summary`
   的 `groups[].duts[]`（`label` d0..d3 與 DUT `name`）；選中／filter 到某 session 時
   以 `GET /interconnect/sessions` 的 `links[]`（`vlan`、`a_dut`/`a_port`、
-  `b_dut`/`b_port`）把該 session 的每條 link 畫成兩 DUT 之間的連線，並標 VLAN 與兩端
-  il_port。節點與 link 資料一律來自這兩個端點，不臆造。
+  `b_dut`/`b_port`、`a_node`/`b_node`）把該 session 的每條 link 畫成兩 DUT 之間的
+  連線，並標 VLAN 與兩端的「il_port @ fanout port」（fanout port 取自
+  `a_node`/`b_node` 冒號後那段）。節點與 link 資料一律來自這兩個端點，不臆造。
 - **建立表單兩種模式**：對應 `POST /interconnect/sessions` 的 `group`+`duts`+`profile`
   或 `group`+`pairs`，二擇一；下拉只列當前可建資源（`resources/available` 的
   `buildable_links` 與 summary）。建立成功後自動 refresh summary / list / available，

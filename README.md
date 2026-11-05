@@ -1249,8 +1249,10 @@ It can see, build, and release interconnect sessions; it never pushes to a devic
   slot. The nodes come from `GET /interconnect/summary`.
 - **Show a session's resources** — selecting (or filtering down to) an
   interconnect session draws that session's links on its group's diagram. Each
-  drawn link is labeled with its **VLAN** and the il_port on each end, so you can
-  see which DUT il_port connects to which, over which VLAN. Link data comes from
+  drawn link is labeled with its **VLAN** and, for each end, the DUT il_port
+  paired with its fanout port (`il_port @ fanout_port`), so you can see which
+  DUT il_port connects to which, over which VLAN, through which fanout port. The
+  fanout port is taken from each link's `a_node`/`b_node`. Link data comes from
   `GET /interconnect/sessions`.
 - **Filter sessions** — a text box filters the interconnect session list by id,
   group, profile, VLAN, DUT, or port.

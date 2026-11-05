@@ -189,7 +189,11 @@ function icLabelForDut(group, dutName) {
 
 /* buildSessionDrawLinks(session, summary)：把一筆 session 的 links[] 整理成
  * 要畫的連線集合。回傳
- *   [{groupName, aLabel, bLabel, aDut, aPort, bDut, bPort, vlan}, ...]
+ *   [{groupName, aLabel, bLabel, aDut, aPort, bDut, bPort,
+ *     aFanout, bFanout, vlan}, ...]
+ *
+ * aFanout / bFanout 為兩端 fanout port，取自 link 的 a_node / b_node（形如
+ * "ic-1-1:1"）冒號後那段，一律經 icPortOf 拆解（防 split limit 陷阱，§4.1）。
  *
  * not-found 契約（design §4.4/§4.7、review Finding 4）：
  *   - 先以 session 第一條 link 的 a_dut（退而用 session.group）在 summary 定
@@ -236,10 +240,29 @@ function buildSessionDrawLinks(session, summary) {
             aPort: link.a_port,
             bDut: link.b_dut,
             bPort: link.b_port,
+            /* fanout port：a_node / b_node 冒號後那段（經 icPortOf）。 */
+            aFanout: icPortOf(link.a_node || ""),
+            bFanout: icPortOf(link.b_node || ""),
             vlan: link.vlan
         });
     }
     return out;
+}
+
+/* icLinkLabelText(drawLink)：把一條 buildSessionDrawLinks 的連線組成拓樸圖上的
+ * 標籤文字（兩行）。回傳 { top, bottom }：
+ *   - top：VLAN（如 "VLAN 1000"）。
+ *   - bottom：兩端各自以 "<il_port> @ <fanout_port>" 表示、中間以雙箭頭相連
+ *     （如 "Eth8 @ 1 \u2194 Eth8 @ 2"），讓每端的 DUT il_port 與其對應的
+ *     fanout port 清楚成對，避免一行文字過長而擁擠。
+ *
+ * 純函式、無 DOM；供 renderIcGroup 與 Python-mirror 測試共用。 */
+function icLinkLabelText(drawLink) {
+    return {
+        top: "VLAN " + drawLink.vlan,
+        bottom: drawLink.aPort + " @ " + drawLink.aFanout
+            + " \u2194 " + drawLink.bPort + " @ " + drawLink.bFanout
+    };
 }
 
 /* ------------------------------------------------------------------ *
@@ -390,14 +413,25 @@ function renderIcGroup(group, groupLinks) {
             "class": "ic-edge active",
             x1: ca.x, y1: ca.y, x2: cb.x, y2: cb.y
         }));
+        /* 兩行標籤：第一行 VLAN、第二行兩端 "il_port @ fanout"（含 fanout
+         * port），以 <tspan> 分行避免單行過長而擁擠（語意審查觀察第 1 項）。 */
+        var labelXy = {
+            x: (ca.x + cb.x) / 2,
+            y: (ca.y + cb.y) / 2 - 4
+        };
+        var labelText = icLinkLabelText(dl);
         var label = icSvgEl("text", {
             "class": "ic-edge-label",
-            x: (ca.x + cb.x) / 2,
-            y: (ca.y + cb.y) / 2 - 4,
+            x: labelXy.x,
+            y: labelXy.y,
             "text-anchor": "middle"
         });
-        label.textContent = "VLAN " + dl.vlan + " \u00b7 "
-            + dl.aPort + " \u2194 " + dl.bPort;
+        var topSpan = icSvgEl("tspan", { x: labelXy.x, dy: "0" });
+        topSpan.textContent = labelText.top;
+        var bottomSpan = icSvgEl("tspan", { x: labelXy.x, dy: "10" });
+        bottomSpan.textContent = labelText.bottom;
+        label.appendChild(topSpan);
+        label.appendChild(bottomSpan);
         edgeGroup.appendChild(label);
     }
 

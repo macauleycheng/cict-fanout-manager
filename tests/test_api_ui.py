@@ -31,6 +31,11 @@ UI 路由唯讀、永不觸及 Phase 2 signal 檔鎖，故 TestClient 足矣（�
            topology-interconnect-small.yaml 實建的真實 session / summary 形狀，
            含 group 缺席 → [] 的 not-found 契約）。OpenAPI 補互聯 7 個 path key
            的成員資格斷言，/ 與 /static* 仍不入 paths。
+  - 0.6.1  語意審查觀察第 1 項：互聯拓樸圖連線標籤補兩端 fanout port。補
+           buildSessionDrawLinks 的 aFanout/bFanout（取自 a_node/b_node 冒號後
+           那段）mirror 斷言，新增 icLinkLabelText 的 Python-mirror 測試（標籤
+           含 VLAN、兩端 il_port 與 fanout port，且 fanout port 取自冒號後），
+           並於 ic.js 結構斷言補 icLinkLabelText 函式名。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -148,6 +153,8 @@ def test_get_static_ic_js(api_client: Tuple[TestClient, Path]) -> None:
     # 可抽出的純函式名存在（供 Python-mirror 測試對照）。
     assert "buildSessionDrawLinks" in body
     assert "icSessionMatchesFilter" in body
+    # 連線標籤純函式（標籤帶兩端 fanout port，語意審查觀察第 1 項）。
+    assert "icLinkLabelText" in body
     # 不得呼叫任何會連設備的端點目標（apply / verify / park / release-device；
     # 這些是帶 token 的 REST 或 CLI 的事，不出現在 Web UI 呼叫中）。亦不呼叫
     # /interconnect/plan/park（park 計畫，Web UI 不用）或處理 X-API-Token。
@@ -602,7 +609,9 @@ def _build_session_draw_links(session: dict, summary: dict):
       - summary：``GET /interconnect/summary`` 形狀的 dict。
 
     回傳：
-      - ``[{groupName, aLabel, bLabel, aDut, aPort, bDut, bPort, vlan}, ...]``。
+      - ``[{groupName, aLabel, bLabel, aDut, aPort, bDut, bPort, aFanout,
+        bFanout, vlan}, ...]``；aFanout/bFanout 為 a_node/b_node 冒號後那段
+        （經 ``_ic_port_of``）。
     """
     out = []
     if not session or not summary:
@@ -632,10 +641,42 @@ def _build_session_draw_links(session: dict, summary: dict):
                 "aPort": link["a_port"],
                 "bDut": link["b_dut"],
                 "bPort": link["b_port"],
+                "aFanout": _ic_port_of(link.get("a_node") or ""),
+                "bFanout": _ic_port_of(link.get("b_node") or ""),
                 "vlan": link["vlan"],
             }
         )
     return out
+
+
+def _ic_port_of(node_id: str) -> str:
+    """ic.js icPortOf 的 Python mirror：取首個 ':' 後的 port 段（可含 '/'）。
+
+    與 _port_of 等價；互聯 fanout 節點 ``"<fanout>:<port>"`` 的 fanout port 即
+    冒號後那段。無 ':' 時回整串（對齊 JS slice(indexOf+1)）。
+    """
+    idx = node_id.find(":")
+    return node_id[idx + 1:]
+
+
+def _ic_link_label_text(draw_link: dict) -> dict:
+    """ic.js icLinkLabelText 的 Python mirror：把一條連線組成兩行標籤文字。
+
+    與 ic.js 一致：top 為 ``"VLAN <vlan>"``，bottom 為
+    ``"<a_port> @ <a_fanout> \u2194 <b_port> @ <b_fanout>"``（兩端各以
+    ``il_port @ fanout_port`` 成對）。
+
+    參數：
+      - draw_link：``_build_session_draw_links`` 的一筆連線 dict。
+
+    回傳：
+      - ``{"top": str, "bottom": str}``。
+    """
+    return {
+        "top": "VLAN " + str(draw_link["vlan"]),
+        "bottom": draw_link["aPort"] + " @ " + draw_link["aFanout"]
+        + " \u2194 " + draw_link["bPort"] + " @ " + draw_link["bFanout"],
+    }
 
 
 def _real_ic_payloads(ic_topology_path: Path, tmp_path: Path):
@@ -737,6 +778,52 @@ def test_build_session_draw_links_mirror(
             # 兩端 DUT 必同組（互聯 session 不跨組）。
             assert link["a_dut"] in label_by_name
             assert link["b_dut"] in label_by_name
+            # fanout port 為 a_node / b_node 冒號後那段（供標籤用）。
+            assert drawn["aFanout"] == _ic_port_of(link["a_node"])
+            assert drawn["bFanout"] == _ic_port_of(link["b_node"])
+
+
+def test_ic_link_label_text_includes_fanout_port(
+    api_client: Tuple[TestClient, Path], ic_small_path: Path, tmp_path: Path
+) -> None:
+    """icLinkLabelText mirror：連線標籤含 VLAN、兩端 il_port 與 fanout port（語意審查觀察 1）。
+
+    用真實互聯 session payload，對每條 draw link 複刻 ic.js 的兩行標籤：
+      - top 行含 VLAN；
+      - bottom 行含兩端 il_port 與其對應 fanout port，且 fanout port 取自
+        a_node / b_node 冒號後那段（非冒號前的 fanout 裝置名）。
+    """
+    sessions, summary = _real_ic_payloads(ic_small_path, tmp_path)
+    assert sessions, "預期至少建出一筆互聯 session"
+
+    saw_link = False
+    for session in sessions:
+        draw = _build_session_draw_links(session, summary)
+        links_by_vlan = {link["vlan"]: link for link in session["links"]}
+        for drawn in draw:
+            saw_link = True
+            label = _ic_link_label_text(drawn)
+            link = links_by_vlan[drawn["vlan"]]
+            a_fanout = _ic_port_of(link["a_node"])
+            b_fanout = _ic_port_of(link["b_node"])
+
+            # top 行帶 VLAN。
+            assert label["top"] == "VLAN " + str(link["vlan"])
+            # bottom 行同時帶兩端 il_port 與 fanout port。
+            assert link["a_port"] in label["bottom"]
+            assert link["b_port"] in label["bottom"]
+            assert a_fanout in label["bottom"]
+            assert b_fanout in label["bottom"]
+            # 成對呈現 "<il_port> @ <fanout_port>"。
+            assert link["a_port"] + " @ " + a_fanout in label["bottom"]
+            assert link["b_port"] + " @ " + b_fanout in label["bottom"]
+            # fanout port 來自冒號後那段：a_node 含 ':' 時，fanout port 必不等
+            # 於冒號前的 fanout 裝置名（防 split 陷阱回 undefined/整串）。
+            if ":" in link["a_node"]:
+                assert a_fanout != _dev_of(link["a_node"])
+                assert a_fanout == link["a_node"].split(":", 1)[1]
+
+    assert saw_link, "預期至少有一條可畫的 link"
 
 
 def test_build_session_draw_links_group_absent_returns_empty(
