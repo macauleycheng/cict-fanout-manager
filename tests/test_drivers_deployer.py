@@ -14,6 +14,13 @@ session 以範例三層拓樸經 Allocator.derive_session 純推導合成（不�
 
 歷史（HISTORY）：
   - 0.4.0  FEAT-002 初版。
+  - 0.6.0  FEAT-001 撤下發：新增以**真** EcSshDriver + 注入 FakeTrafficSwitch
+           （connection_factory，每 host 共用同一假設備使 apply/remove 共享
+           狀態）驗證 ``Deployer.remove`` 的四個案例：UPLINK happy、EDGE happy
+           （以 tunnel_modes 還原為 Normal 判通過，證明不看 members）、UPLINK
+           drop_config 殘留丟 ReadBackMismatchError、EDGE-only drop_config 殘留
+           丟 ReadBackMismatchError（finding #1 守門：若回讀只看 members 會誤
+           判通過）。另驗 remove(apply=False) 回 remove 分支指令且不連線。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -33,9 +40,12 @@ from topo_manager.drivers.base import (
     VlanState,
 )
 from topo_manager.drivers.deployer import Deployer, SetupResult
+from topo_manager.drivers.ec_ssh import EcSshDriver
 from topo_manager.errors import ApplyError, ReadBackMismatchError
 from topo_manager.loader import load_topology
 from topo_manager.store import JsonSessionStore
+
+from ic_fakes import FakeTrafficSwitch
 
 
 class _FakeEntry:
@@ -453,3 +463,169 @@ def test_format_missing_edge_mentions_tunnel_access() -> None:
     assert "tagged 成員" in message
     assert "Eth1/42" in message
     assert "Eth1/41" in message
+
+
+# --------------------------------------------------------------------
+# FEAT-001 撤下發（Deployer.remove）：以真 EcSshDriver + FakeTrafficSwitch
+# 注入（connection_factory）驗證；絕不連真機。
+# --------------------------------------------------------------------
+
+
+class _FakeSegment:
+    """最小 trunk segment 替身（具 a_node / b_node）。"""
+
+    def __init__(self, a_node: str, b_node: str) -> None:
+        self.a_node = a_node
+        self.b_node = b_node
+
+
+class _FakeSession:
+    """最小 Session 替身：直接指定 vlan / trunk_segments / path。
+
+    供精準控制 planner 產出的 role（UPLINK 來自 trunk 兩端、EDGE 來自 path 扣
+    trunk 端），不經真實拓樸即能組出「純 UPLINK」或「純 EDGE」的下發計畫。
+    """
+
+    def __init__(
+        self,
+        vlan: int,
+        trunk_segments: List[_FakeSegment],
+        path: List[str],
+        session_id: str = "s-test",
+    ) -> None:
+        self.vlan = vlan
+        self.trunk_segments = trunk_segments
+        self.path = path
+        self.session_id = session_id
+
+
+def _ec_factory_for(switches: Dict[str, FakeTrafficSwitch]):
+    """回一個 driver_factory：每 host 共用同一 FakeTrafficSwitch（apply/remove 共狀態）。
+
+    FakeTrafficSwitch 自身無 factory 方法，故在此包一層 connection_factory：
+    回傳該 host 的假設備並累加其 ``connect_count``（供斷言「從未連線」）。
+    """
+
+    def _factory(name: str, entry: object) -> EcSshDriver:
+        switch = switches[name]
+
+        def _connection_factory(**kwargs: object) -> FakeTrafficSwitch:
+            switch.connect_count += 1
+            return switch
+
+        return EcSshDriver(
+            host=name,
+            username="u",
+            password="p",
+            connection_factory=_connection_factory,
+        )
+
+    return _factory
+
+
+def _uplink_session(vlan: int = 100) -> _FakeSession:
+    """純 UPLINK session：trunk 兩端皆在 fanout 'f'（path 無額外邊緣節點）。"""
+    seg = _FakeSegment("f:7", "f:8")
+    # path 僅含 trunk 端 → _derive_edge_nodes 扣掉後為空 → 無 EDGE 變更。
+    return _FakeSession(vlan=vlan, trunk_segments=[seg], path=["f:7", "f:8"])
+
+
+def _edge_only_session(vlan: int = 3999) -> _FakeSession:
+    """純 EDGE session：trunk 段兩端皆非 fanout 'f'；'f' 僅以邊緣節點出現。
+
+    trunk 端為 generator/DUT（非 configured fanout）故不產 UPLINK；path 內的
+    'f:42' 為邊緣節點 → 僅產 EDGE 變更。
+    """
+    seg = _FakeSegment("ixia-1:ixia-1/1", "dut-A:Eth0")
+    return _FakeSession(
+        vlan=vlan,
+        trunk_segments=[seg],
+        path=["ixia-1:ixia-1/1", "f:42", "dut-A:Eth0"],
+    )
+
+
+def test_remove_dry_run_returns_remove_commands_and_no_connect() -> None:
+    """remove(apply=False)：回 remove 分支指令、絕不連線（connect_count 為 0）。"""
+    switches = {"f": FakeTrafficSwitch()}
+    config = _FakeConfig(["f"])
+    deployer = Deployer(_ec_factory_for(switches), config)
+
+    result = deployer.remove(_uplink_session(), apply=False)
+
+    plan = next(fp for fp in result.fanouts if fp.fanout == "f")
+    assert plan.changes  # 有變更
+    assert all(c.action == "remove" for c in plan.changes)
+    # remove 分支指令：UPLINK remove 應含 'allowed vlan remove' 與 tunnel 還原。
+    assert any("allowed vlan remove 100" in cmd for cmd in plan.commands)
+    assert "no switchport dot1q-tunnel mode" in plan.commands
+    # 絕不連線。
+    assert switches["f"].connect_count == 0
+
+
+def test_remove_apply_uplink_happy_path() -> None:
+    """(a) UPLINK：apply 後 remove，show vlan 不再列 tagged 成員 → 回讀通過。"""
+    switches = {"f": FakeTrafficSwitch()}
+    config = _FakeConfig(["f"])
+    deployer = Deployer(_ec_factory_for(switches), config)
+    session = _uplink_session()
+
+    # 先下發，使假設備出現 tagged 成員。
+    deployer.apply(session, apply=True)
+    assert switches["f"].tagged.get(100)  # 成員存在
+
+    # 撤下發：不應丟錯，且假設備不再有該 VLAN 的 tagged 成員。
+    deployer.remove(session, apply=True)
+    assert not switches["f"].tagged.get(100)
+
+
+def test_remove_apply_edge_happy_path() -> None:
+    """(b) EDGE：apply 後 remove，tunnel mode 還原為 Normal → 回讀通過（看 tunnel_modes）。"""
+    switches = {"f": FakeTrafficSwitch()}
+    config = _FakeConfig(["f"])
+    deployer = Deployer(_ec_factory_for(switches), config)
+    session = _edge_only_session()
+
+    deployer.apply(session, apply=True)
+    # apply 後該 EDGE port tunnel mode 為 Access。
+    assert switches["f"].tunnel_modes.get(42) == "Access"
+
+    # remove：EDGE 走 remove 分支還原 tunnel 模式 → 不再是 Access → 回讀通過。
+    deployer.remove(session, apply=True)
+    assert switches["f"].tunnel_modes.get(42) != "Access"
+
+
+def test_remove_apply_uplink_drop_config_raises_mismatch() -> None:
+    """(c) UPLINK drop_config：假設備靜默忽略 remove → tagged 殘留 → ReadBackMismatchError。"""
+    switch = FakeTrafficSwitch()
+    switches = {"f": switch}
+    config = _FakeConfig(["f"])
+    deployer = Deployer(_ec_factory_for(switches), config)
+    session = _uplink_session()
+
+    deployer.apply(session, apply=True)
+    assert switch.tagged.get(100)
+
+    # 下發完成後才開啟 drop_config：remove 指令被靜默忽略 → 成員殘留。
+    switch.drop_config = True
+    with pytest.raises(ReadBackMismatchError):
+        deployer.remove(session, apply=True)
+
+
+def test_remove_apply_edge_only_drop_config_raises_mismatch() -> None:
+    """(d) EDGE-only drop_config：tunnel 仍 Access → 必丟 ReadBackMismatchError（finding #1 守門）。
+
+    此案若回讀只看 members 會誤判通過（EDGE 的 members 本就為空）；必須以
+    tunnel_modes 判定，故 drop_config 下 tunnel 仍 Access 時應判殘留。
+    """
+    switch = FakeTrafficSwitch()
+    switches = {"f": switch}
+    config = _FakeConfig(["f"])
+    deployer = Deployer(_ec_factory_for(switches), config)
+    session = _edge_only_session()
+
+    deployer.apply(session, apply=True)
+    assert switch.tunnel_modes.get(42) == "Access"
+
+    switch.drop_config = True
+    with pytest.raises(ReadBackMismatchError):
+        deployer.remove(session, apply=True)

@@ -31,6 +31,19 @@
            dry-run/apply 閘門）；``_format_missing`` 依 role 分述診斷字串
            （UPLINK「tagged 成員」、EDGE「tunnel access 設定」）。
            plan/apply/verify/detect_and_reapply 核心邏輯不變。不 import netmiko。
+  - 0.6.0  FEAT-001 撤下發：新增 ``remove(session, *, apply=False)``（與 apply
+           對稱的反向動作）。dry-run 建**自己的** List[FanoutPlan]（不重用
+           plan()——FanoutPlan frozen 且 plan() 組 add 指令），把各 fanout 變更
+           改寫為 action='remove' 後以 build_commands 組 remove 分支指令、絕不
+           連線；apply 對各 fanout connect → clear_vlan（同時拆 EDGE 與
+           UPLINK，顯式 Release 連邊緣一併拆，有別於 _best_effort_clear 僅動
+           UPLINK）→ read_vlans → role-split remove 回讀 → disconnect。新增
+           ``_remove_one_fanout`` / ``_remove_remaining``（role-split 撤除判
+           定：EDGE 以 tunnel_modes 判、UPLINK 以 tagged 成員判，鏡像
+           diff_expected_vs_actual 的 role 分流）/ ``_format_remaining``。跨
+           fanout best-effort 依序處理，遇硬性 driver 失敗原樣重拋結構化 driver
+           例外（不包 ApplyError、不重加）；回讀殘留丟 ReadBackMismatchError
+           （409）。不 import netmiko。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -354,6 +367,226 @@ class Deployer:
                     driver.disconnect()
             except Exception:  # noqa: BLE001 — 清理失敗不掩蓋原始錯誤。
                 continue
+
+    def remove(self, session: object, *, apply: bool = False) -> PlanResult:
+        """撤下發：移除本 session 先前下發的設定並以 role-split 回讀驗證（§7）。
+
+        與 ``apply`` 對稱的反向動作。``apply=False``（預設）：建**自己的**
+        ``List[FanoutPlan]``（不重用 ``plan(session)``——``FanoutPlan`` 為 frozen
+        且 ``plan`` 組的是 add 指令），對每個「有變更」的 fanout 把其變更改寫為
+        ``action='remove'``（複製出新的 ``PortVlanChange``，與
+        ``EcSshDriver.clear_vlan`` 內部所做改寫相同）後以
+        ``driver.build_commands`` 組 remove 分支指令；絕不連線。``apply=True``：
+        對每個有變更的 fanout 依序 connect → ``clear_vlan``（同時驅動 EDGE 與
+        UPLINK 的 remove 分支——顯式 Release 會拆除邊緣 port，有別於
+        apply-rollback 的 ``_best_effort_clear`` 僅動 UPLINK）→ ``read_vlans``
+        → 以 role-split remove 判定蒐集殘留 → ``disconnect``（try/finally）。
+
+        跨 fanout 採 best-effort 依序處理；遇第一個硬性 driver 失敗（driver 已
+        包好的 ``DriverConnectionError`` / ``DeviceTimeoutError``）即原樣重拋
+        結構化 driver 例外（**不**逐 fanout 包成 ``ApplyError``、**不**重加——
+        release 期間無法「反撤除」）。回讀殘留則丟 ``ReadBackMismatchError``
+        （REST 對應 409）。
+
+        INPUT：
+          - session：一筆已分配的 Session。
+          - apply：True 才真正連線撤除；False 為 dry-run（keyword-only）。
+
+        OUTPUT：無。
+
+        RETURN：
+          - ``PlanResult``（dry-run 與 apply 皆回傳計畫；各 fanout 的 commands
+            為 remove 分支指令，VLAN 與 fanout 成員與 ``plan(session)`` 一致）。
+
+        例外：
+          - ReadBackMismatchError：撤除後回讀仍有殘留（REST 對應 409）。
+          - DriverConnectionError / DeviceTimeoutError：連線/下發硬性失敗原樣
+            重拋（不包成 ApplyError）。
+          - PortMappingError：trunk 端 port 無法對映（純算階段丟出）。
+        """
+        grouped = self._changes_by_fanout(session)
+        fanout_plans: List[FanoutPlan] = []
+
+        for name in sorted(self._config.fanouts.keys()):
+            changes = grouped.get(name, [])
+            remove_changes: List[PortVlanChange] = []
+            commands: List[str] = []
+            if changes:
+                driver = self._driver_factory(name, self._config.fanouts[name])
+                # 把 add 變更改寫為 remove（複製新物件；FanoutPlan/PortVlanChange
+                # 皆 frozen，不能就地改），與 clear_vlan 內部改寫一致。
+                remove_changes = [
+                    PortVlanChange(
+                        fanout=change.fanout,
+                        interface=change.interface,
+                        vlan=change.vlan,
+                        action="remove",
+                        topology_node=change.topology_node,
+                        role=change.role,
+                    )
+                    for change in changes
+                ]
+                commands = driver.build_commands(remove_changes)
+            fanout_plans.append(
+                FanoutPlan(
+                    fanout=name,
+                    configured=True,
+                    changes=remove_changes,
+                    commands=commands,
+                )
+            )
+
+        plan_result = PlanResult(
+            session_id=getattr(session, "session_id", "(unknown)"),
+            vlan=getattr(session, "vlan", 0),
+            fanouts=fanout_plans,
+        )
+        if not apply:
+            return plan_result
+
+        for fanout_plan in plan_result.fanouts:
+            if not fanout_plan.changes:
+                continue
+            self._remove_one_fanout(fanout_plan)
+
+        return plan_result
+
+    def _remove_one_fanout(self, fanout_plan: FanoutPlan) -> None:
+        """對單一 fanout 執行連線→撤除→role-split 回讀驗證（§7）。
+
+        ``clear_vlan`` 同時驅動 EDGE 與 UPLINK 的 remove 分支（顯式 Release 連
+        邊緣 port 一併拆除）。回讀後以 role-split remove 判定逐條檢查是否已拆
+        除：EDGE 以 ``tunnel_modes`` 是否仍為 Access 判定（絕不以 members 判定
+        ——EDGE 在成功與失敗時 members 皆為空，會誤判為通過，finding #1）；
+        UPLINK 以 (interface, vlan) 是否仍在 tagged 成員中判定。
+
+        INPUT：
+          - fanout_plan：本 fanout 的 ``FanoutPlan``（changes 已改寫為 remove、
+            非空）。
+
+        OUTPUT：無。
+
+        RETURN：None。
+
+        例外：
+          - ReadBackMismatchError：回讀後仍有殘留（逐條列出）。
+          - DriverConnectionError / DeviceTimeoutError：連線/下發失敗原樣往外傳
+            （release 不包成 ApplyError、不重加）。
+        """
+        driver = self._driver_factory(
+            fanout_plan.fanout, self._config.fanouts[fanout_plan.fanout]
+        )
+        driver.connect()
+        try:
+            # 撤除：clear_vlan 以 action='remove' 改寫後走 remove 分支（已是
+            # remove 的變更再改寫仍為 remove，冪等）；EDGE 與 UPLINK 都拆。
+            driver.clear_vlan(fanout_plan.changes)
+
+            # read-back：重讀並以 role-split remove 判定蒐集殘留。
+            after = driver.read_vlans()
+            remaining = self._remove_remaining(fanout_plan.changes, after)
+            if remaining:
+                raise ReadBackMismatchError(
+                    self._format_remaining(fanout_plan.fanout, remaining)
+                )
+        finally:
+            driver.disconnect()
+
+    @staticmethod
+    def _remove_remaining(
+        expected: List[PortVlanChange], after: VlanState
+    ) -> List[PortVlanChange]:
+        """role-split 撤除回讀：回傳仍未拆除（殘留）的變更（§7、finding #1）。
+
+        鏡像 ``planner.diff_expected_vs_actual`` 的 role 分流（EDGE 與 UPLINK 落
+        在 ``VlanState`` 的不同部位）：
+
+          - 預先算 ``tagged_present``＝``after.members`` 中 tagged 為 True 的
+            (interface, vlan)；``access_present``＝``after.tunnel_modes`` 中 mode
+            為 Access 的 interface。
+          - EDGE：拆除完成的條件為 ``change.interface not in access_present``
+            （以 tunnel_modes 判定，**絕不**用 members）。
+          - UPLINK：拆除完成的條件為
+            ``(change.interface, change.vlan) not in tagged_present``。
+
+        INPUT：
+          - expected：本 fanout 預期已拆除的 ``PortVlanChange`` 清單
+            （action='remove'）。
+          - after：撤除後回讀的 ``VlanState``。
+
+        OUTPUT：無。
+
+        RETURN：
+          - 仍殘留（未拆除）的 ``PortVlanChange`` 清單（保留輸入順序；全部拆除
+            時回空清單）。
+        """
+        tagged_present = {
+            (member.interface, member.vlan)
+            for member in after.members
+            if member.tagged is True
+        }
+        access_present = {
+            interface
+            for (interface, mode) in after.tunnel_modes
+            if mode == "Access"
+        }
+
+        remaining: List[PortVlanChange] = []
+        for change in expected:
+            if change.role == PortRole_E.EDGE:
+                torn_down = change.interface not in access_present
+            else:
+                torn_down = (
+                    change.interface,
+                    change.vlan,
+                ) not in tagged_present
+            if not torn_down:
+                remaining.append(change)
+        return remaining
+
+    @staticmethod
+    def _format_remaining(
+        fanout_name: str, remaining: List[PortVlanChange]
+    ) -> str:
+        """把撤除後殘留項依 role 分述排版成訊息（鏡像 _format_missing 風格）。
+
+        依 ``change.role`` 分述殘留真因：UPLINK 類為「tagged 成員」仍殘留、EDGE
+        類為「tunnel access 設定」仍殘留。逐條列出各 (interface, vlan)。
+
+        INPUT：
+          - fanout_name：fanout 裝置名（str）。
+          - remaining：仍殘留的 ``PortVlanChange`` 清單。
+
+        OUTPUT：無。
+
+        RETURN：
+          - 多行訊息字串（含 fanout 名與依 role 分述的各 (interface, vlan)
+            殘留）。
+        """
+        uplink_remaining = [
+            change for change in remaining if change.role == PortRole_E.UPLINK
+        ]
+        edge_remaining = [
+            change for change in remaining if change.role == PortRole_E.EDGE
+        ]
+
+        parts: List[str] = []
+        if uplink_remaining:
+            items = ", ".join(
+                "({0}, VLAN {1})".format(change.interface, change.vlan)
+                for change in uplink_remaining
+            )
+            parts.append("tagged 成員仍殘留：{0}".format(items))
+        if edge_remaining:
+            items = ", ".join(
+                "({0}, VLAN {1})".format(change.interface, change.vlan)
+                for change in edge_remaining
+            )
+            parts.append("tunnel access 設定仍殘留：{0}".format(items))
+
+        return "撤除回讀驗證不符（fanout {0}）：{1}".format(
+            fanout_name, "；".join(parts)
+        )
 
     def setup_tunnel(
         self, fanout_names: List[str], *, apply: bool = False
