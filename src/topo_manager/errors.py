@@ -27,6 +27,9 @@
            404）、ApiTokenError（X-API-Token 缺漏或錯誤，401）、
            DevicePushRequestError（下發端點輸入非法，400）、
            DeviceTimeoutError（繼承 DriverConnectionError，SSH 逾時，504）。
+  - 0.7.0  群組功能：新增 4 個群組/ATLAS 例外子類（GroupNotFoundError /
+           GroupExistsError / GroupMembershipError / AtlasFormatError），皆繼承
+           TopologyError，REST 錯誤映射以精確類別查表分流對應的 HTTP 狀態碼。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -263,4 +266,41 @@ class DeviceTimeoutError(DriverConnectionError):
 
     繼承 ``DriverConnectionError``：既有 ``except DriverConnectionError``
     與測試行為不變；REST 映射以 ``type(exc)`` 精確查表，故仍分流為 504。
+    """
+
+
+class GroupNotFoundError(TopologyError):
+    """查無指定的群組（group name）時觸發（群組設計 §業務層，對應 404）。
+
+    觸發條件：``get_group``/``delete_group``/``add_member``（未 auto_create）/
+    ``remove_member`` 指定的 group name 不存在於群組帳本。訊息應含查無的
+    group name，供使用者確認輸入或改以 ``GET /groups`` 查詢現有群組。
+    """
+
+
+class GroupExistsError(TopologyError):
+    """建立群組時指定的 group name 已存在時觸發（群組設計 §業務層，對應 409）。
+
+    觸發條件：``create_group`` 指定的 group name 已存在於群組帳本。訊息應含
+    重複的 group name，供使用者改用其他名稱或直接對既有群組加入成員。
+    """
+
+
+class GroupMembershipError(TopologyError):
+    """session 已屬其他群組、卻被加入新群組時觸發（群組設計 §業務層，對應 409）。
+
+    「一 session 至多屬一群」為群組業務層不變量。觸發條件：``add_member`` 的
+    session_id 目前已屬 **他** 群（非目標群本身）。訊息應點名 session_id、其
+    現屬群組與目標群組，供使用者先移除再重試。
+    """
+
+
+class AtlasFormatError(TopologyError):
+    """ATLAS v2 輸出無法由 session/拓樸正確組出時觸發（群組設計 §ATLAS，對應 422）。
+
+    觸發條件（fail-closed，不臆測）：generator_port 的 TG 側裸名不符
+    ``^[A-Za-z]+-\\d+/\\d+$``；或 DUT port 不在該 DUT 的 ``tg_ports``、查無該
+    DUT、索引超出單字母標籤空間（>= 26）、或 DUT port 裸段不符
+    ``^Eth\\s*(?:\\d+/)?\\d+$``。屬可回報失敗而非程式 bug。訊息應含原始值與
+    期望格式。
     """
