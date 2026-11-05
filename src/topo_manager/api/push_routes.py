@@ -30,6 +30,9 @@ HISTORY：
            失敗不清帳本）。兩者皆 async def、手動解析 body、沿用既有
            _build_deployer / _load_session_and_config / _ports_of 與 apply_session
            的 FanoutPushResult 形狀；帳本操作用 build_allocator。
+  - 0.3.0  群組 REST（FEAT-002）：release-and-remove 於帳本釋放成功後呼叫
+           app.state.group_registry.remove_member_any 解除群組歸屬（AC-9），
+           與 delete_session 同語意。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -377,6 +380,10 @@ async def release_and_remove(request: Request, session_id: str) -> ReleaseAndRem
                 session_id, rollback_exc
             )
         ) from rollback_exc
+
+    # 帳本釋放成功後解除群組歸屬（AC-9，FEAT-002）：與 delete_session 同語意，
+    # 用啟動單例 group_registry.remove_member_any（鎖內交易；不屬任何群為 no-op）。
+    request.app.state.group_registry.remove_member_any(session_id)
 
     # (4) 成功：200，回已釋放的 session_id 與逐 fanout 撤除結果。
     return ReleaseAndRemoveResponse(

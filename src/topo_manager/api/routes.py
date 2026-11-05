@@ -33,6 +33,11 @@ handler 會丟到 threadpool 工作執行緒執行，導致鎖內 ``signal`` 拋
 歷史（HISTORY）：
   - 0.4.0  Phase 3 初版，建立五個 endpoint 與 compute_available 輔助
            （設計 §5）。
+  - 0.7.0  群組 REST（FEAT-002）：post_session 於 allocate 後依 body.group 以
+           單例 group_registry.add_member(auto_create=True) 歸群，並以
+           group_of 回填回應的 group；list_sessions 每筆以 build_group_registry
+           的 group_of 回填 group；delete_session 於 release 後以
+           remove_member_any 解除群組歸屬（AC-9）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -44,7 +49,7 @@ from typing import Dict, List, Set
 from fastapi import APIRouter, Request, status
 
 from topo_manager.allocator import Allocator, Session
-from topo_manager.api.deps import Settings, build_allocator
+from topo_manager.api.deps import Settings, build_allocator, build_group_registry
 from topo_manager.api.schemas import (
     AvailableResourcesResponse,
     AllocateRequest,
@@ -167,10 +172,17 @@ async def post_session(request: Request, body: AllocateRequest) -> SessionRespon
     """分配一筆新 session 並回其摘要（設計 §5.3、AC-3）。
 
     呼叫共用啟動單例 allocator.allocate（正確性由 Phase 2 鎖內交易保證）。
+    若 body 帶 group，於分配後以單例 group_registry 歸群（不存在則自動建立，
+    FEAT-002），並以 group_of 回填回應的 group 欄位。
     """
     allocator: Allocator = request.app.state.allocator
     session = allocator.allocate(body.generator_port, body.dut_port)
-    return SessionResponse.from_session(session, status="allocated")
+    if body.group is not None:
+        request.app.state.group_registry.add_member(
+            body.group, session.session_id, auto_create=True
+        )
+    group = request.app.state.group_registry.group_of(session.session_id)
+    return SessionResponse.from_session(session, status="allocated", group=group)
 
 
 @router.delete(
@@ -182,9 +194,12 @@ async def delete_session(request: Request, session_id: str) -> SessionResponse:
     """釋放一筆既有 session 並回其摘要（設計 §5.4、AC-6）。
 
     呼叫共用啟動單例 allocator.release；回 200 + status ``"released"``。
+    釋放後以單例 group_registry.remove_member_any 解除其群組歸屬（AC-9，
+    FEAT-002）。
     """
     allocator: Allocator = request.app.state.allocator
     session = allocator.release(session_id)
+    request.app.state.group_registry.remove_member_any(session_id)
     return SessionResponse.from_session(session, status="released")
 
 
@@ -202,8 +217,14 @@ async def list_sessions(request: Request) -> SessionListResponse:
     settings: Settings = request.app.state.settings
     allocator = build_allocator(settings)
     sessions = allocator.list_sessions()
+    # 讀路徑每請求以 factory 重建 group registry 取最新群組快照（FEAT-002）。
+    group_registry = build_group_registry(settings)
     responses = [
-        SessionResponse.from_session(session, status="active")
+        SessionResponse.from_session(
+            session,
+            status="active",
+            group=group_registry.group_of(session.session_id),
+        )
         for session in sessions
     ]
     return SessionListResponse(sessions=responses, count=len(responses))

@@ -30,6 +30,11 @@ settings / shared allocator / topology 存入 ``app.state`` 供 routes 取用。
            "0.7.0"（OpenAPI 新增四個 allocate-and-apply / release-and-remove
            路徑，屬 semver minor）；_PUSH_SENTENCE 增述這些合併端點。未啟用時
            的 _API_VERSION 維持 "0.5.0"（disabled 契約逐位元不變）。
+  - 0.9.0  群組 REST（FEAT-002）：create_app 於啟動期建
+           app.state.group_registry = build_group_registry(settings)（群組帳本
+           損毀→SessionStoreError，fail-fast）；無條件 include group_routes；
+           _API_VERSION 由 "0.5.0" 升為 "0.6.0"、_API_VERSION_PUSH 由 "0.7.0"
+           升為 "0.8.0"（OpenAPI 新增群組端點，屬 semver minor）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -40,8 +45,18 @@ from typing import Callable, Optional
 
 from fastapi import FastAPI
 
-from topo_manager.api import ic_push_routes, ic_routes, push_routes, routes
-from topo_manager.api.deps import Settings, build_allocator
+from topo_manager.api import (
+    group_routes,
+    ic_push_routes,
+    ic_routes,
+    push_routes,
+    routes,
+)
+from topo_manager.api.deps import (
+    Settings,
+    build_allocator,
+    build_group_registry,
+)
 from topo_manager.api.errors import register_exception_handlers
 from topo_manager.api.ic_deps import build_ic_startup_graph
 from topo_manager.api.ui import register_ui
@@ -49,7 +64,7 @@ from topo_manager.loader import load_topology
 
 # app metadata（設計 §5.6）。
 _API_TITLE = "topo-manager API"
-_API_VERSION = "0.5.0"
+_API_VERSION = "0.6.0"
 _API_DESCRIPTION = (
     "topo-manager 的 REST 介接層：查詢可用資源、要求 / 釋放 session、檢視完整 "
     "拓樸，並提供互聯 fanout 的帳本層操作（建立 / 釋放 / 列出 / 計畫查詢）。 "
@@ -61,7 +76,7 @@ _API_DESCRIPTION = (
 
 
 # 啟用設備下發時的版本與描述（未啟用沿用上方常數，逐字不變）。
-_API_VERSION_PUSH = "0.7.0"
+_API_VERSION_PUSH = "0.8.0"
 _CLI_ONLY_SENTENCE = (
     "互聯的設備下發（apply / park / 帶設備的 release / verify）僅限 "
     "CLI，REST 不提供、不連任何設備。"
@@ -106,6 +121,9 @@ def create_app(
     # 啟動期 fail-fast：先載拓樸（供 /topology 純讀單例），再建共用 allocator。
     topology = load_topology(settings.topology_path)
     allocator = build_allocator(settings)
+    # 群組帳本單例（FEAT-002）：建構期 load 一次（供寫路徑共用）；帳本損毀 /
+    # 還原不一致→SessionStoreError，與 allocator 同屬啟動期 fail-fast。
+    group_registry = build_group_registry(settings)
 
     push_enabled = settings.enable_device_push is True
     if push_enabled:
@@ -126,12 +144,17 @@ def create_app(
     app.state.settings = settings
     app.state.topology = topology
     app.state.allocator = allocator
+    # 群組 registry 單例（FEAT-002）：寫路徑共用，正確性由 GroupStore.locked() +
+    # 鎖內 reload 保證；讀路徑則每請求以 build_group_registry 重建。
+    app.state.group_registry = group_registry
     # 互聯小圖：無 interconnect 區段時為 None（降級，app 照常啟動，既有端點
     # 完全不受影響）；啟動期不讀互聯帳本（互聯帳本故障不得拖垮打流側 API）。
     app.state.ic_graph = build_ic_startup_graph(settings, topology)
 
     app.include_router(routes.router)
     app.include_router(ic_routes.router)
+    # 群組 REST 無條件掛載（FEAT-002，不依賴設備下發開關）。
+    app.include_router(group_routes.router)
     # 設備下發 router 永遠掛載：未啟用時 include_in_schema=False，請求命中由
     # require_device_push 回結構化 404；OpenAPI 與未加此功能時一致。
     if push_enabled:

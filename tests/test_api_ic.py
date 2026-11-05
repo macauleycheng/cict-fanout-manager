@@ -491,7 +491,7 @@ def test_settings_ic_vlan_not_integer(monkeypatch, name: str) -> None:
 def test_openapi_contains_interconnect(ic_api_client) -> None:
     client, _ = ic_api_client
     body = client.get("/openapi.json").json()
-    assert body["info"]["version"] == "0.5.0"
+    assert body["info"]["version"] == "0.6.0"
     paths = body["paths"]
     expected = {
         _SUMMARY: {"get"},

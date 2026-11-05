@@ -14,15 +14,18 @@ available 的清單模型）一律 ``ConfigDict(extra="forbid")``，以在 HTTP 
 
 歷史（HISTORY）：
   - 0.4.0  Phase 3 初版，建立 API 請求 / 回應 / 錯誤模型（設計 §5、§6.1）。
+  - 0.7.0  群組 REST（FEAT-002）：AllocateRequest 新增選填 group（空字串正規化
+           為 None）；SessionResponse 新增選填 group（預設 None），from_session
+           新增選填 group 參數帶入回應。既有欄位語意不變。
 
 Copyright (c) 2026 topo-manager。
 """
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Literal
 
 from topo_manager.allocator import Session
@@ -58,6 +61,7 @@ class SessionResponse(BaseModel):
       - status：衍生常數，取值與來源 endpoint 一一對應（設計 §5.3）：
         ``"allocated"``（POST /sessions）、``"released"``（DELETE）、
         ``"active"``（GET /sessions 清單內每筆）。必填、不省略。
+      - group：此 session 所屬群組名（FEAT-002）；不屬任何群組時為 None。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -70,21 +74,25 @@ class SessionResponse(BaseModel):
     physical_ports: List[str]
     trunk_segments: List[TrunkSegmentOut]
     status: Literal["allocated", "released", "active"]
+    group: Optional[str] = None
 
     @classmethod
     def from_session(
         cls,
         session: Session,
         status: Literal["allocated", "released", "active"],
+        group: Optional[str] = None,
     ) -> "SessionResponse":
         """由 Phase 2 ``Session`` 與指定 status 建出回應模型（設計 §5.3）。
 
         參數：
           - session：Phase 2 分配引擎回傳的 ``Session``。
           - status：本次回應的狀態常數（由各 handler 依其 endpoint 設定）。
+          - group：此 session 所屬群組名（FEAT-002）；不屬任何群組時為 None。
 
         回傳：
-          - 欄位值與 ``session`` 等值、``status`` 為指定常數的 ``SessionResponse``。
+          - 欄位值與 ``session`` 等值、``status`` 為指定常數、``group`` 為指定
+            群組名的 ``SessionResponse``。
         """
         return cls(
             session_id=session.session_id,
@@ -102,6 +110,7 @@ class SessionResponse(BaseModel):
                 for segment in session.trunk_segments
             ],
             status=status,
+            group=group,
         )
 
 
@@ -128,6 +137,8 @@ class AllocateRequest(BaseModel):
         非空字串（``min_length=1``）。
       - dut_port：DUT 端，一律 ``dev:port``（同 CLI ``--to``），非空字串
         （``min_length=1``）。
+      - group：選填的歸屬群組名（FEAT-002）；給定時 POST /sessions 會把新
+        session 加入該群（不存在則自動建立）。空字串正規化為 None（視同未指定）。
 
     ``extra="forbid"``：多餘欄位一律拒絕（→ 400，設計 §7）。
     """
@@ -136,6 +147,22 @@ class AllocateRequest(BaseModel):
 
     generator_port: str = Field(min_length=1)
     dut_port: str = Field(min_length=1)
+    group: Optional[str] = Field(default=None)
+
+    @field_validator("group")
+    @classmethod
+    def _normalize_group(cls, value: Optional[str]) -> Optional[str]:
+        """把空字串的 group 正規化為 None（視同未指定群組，FEAT-002）。
+
+        參數：
+          - value：請求帶入的 group（可能為 None、空字串或群組名）。
+
+        回傳：
+          - None（原為 None 或空字串）或原群組名。
+        """
+        if value is not None and value == "":
+            return None
+        return value
 
 
 class GeneratorPortOut(BaseModel):

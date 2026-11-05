@@ -26,6 +26,9 @@
            TOPO_MANAGER_API_TOKEN / TOPO_MANAGER_CREDENTIALS，並以
            connection_factory 注入 FakeEcSwitch 讓下發端點在子行程內可離線
            驗證）。
+  - 0.7.0  群組 REST（FEAT-002）：新增 group_live_server（2tier 主執行緒
+           live-server，額外帶 TOPO_MANAGER_GROUP_STATE 指向 tmp_path，讓群組
+           帳本隔離、不污染工作目錄）與 _start_group_live_server 輔助。
 Copyright (c) 2026 topo-manager。
 """
 
@@ -289,6 +292,76 @@ def fullscale_live_server(examples_dir: Path, tmp_path: Path):
     """fullscale 主執行緒 live-server fixture（AC-15 煙測用）。"""
     topology_path = examples_dir / "topology-fullscale.yaml"
     proc, server = _start_live_server(topology_path, tmp_path)
+    try:
+        yield server
+    finally:
+        _stop_live_server(proc, server)
+
+
+# ----------------------------------------------------------------------
+# 群組 REST 測試 fixtures（FEAT-002；群組帳本一律隔離在 tmp_path）
+# ----------------------------------------------------------------------
+
+
+def _start_group_live_server(
+    topology_path: Path, tmp_path: Path
+) -> Tuple[subprocess.Popen, _LiveServer]:
+    """啟動帶群組帳本環境變數的主執行緒 uvicorn 子行程，回 (proc, _LiveServer)。
+
+    骨架同 ``_start_live_server``（不改動既有函式）；額外設定
+    ``TOPO_MANAGER_GROUP_STATE`` 指向 ``tmp_path/state/groups.json``，讓群組帳本
+    隔離在 tmp_path，絕不污染工作目錄的 .topo-state/。供群組寫入端點整合測試。
+    """
+    port = _free_port()
+    state = tmp_path / "state" / "allocations.json"
+    group_state = tmp_path / "state" / "groups.json"
+    env = dict(os.environ)
+    env["TOPO_MANAGER_TOPOLOGY"] = str(topology_path)
+    env["TOPO_MANAGER_STATE"] = str(state)
+    env["TOPO_MANAGER_GROUP_STATE"] = str(group_state)
+    env["TOPO_MANAGER_HOST"] = "127.0.0.1"
+    env["TOPO_MANAGER_PORT"] = str(port)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "from topo_manager.api.server import run; run()"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = "http://127.0.0.1:{0}".format(port)
+    client = httpx.Client(base_url=base_url, timeout=10.0)
+    deadline = time.time() + 15.0
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            output = (
+                proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
+            )
+            raise RuntimeError("group live-server 啟動失敗：\n{0}".format(output))
+        try:
+            response = client.get("/openapi.json")
+            if response.status_code == 200:
+                ready = True
+                break
+        except httpx.HTTPError:
+            time.sleep(0.2)
+    if not ready:
+        proc.terminate()
+        raise RuntimeError("group live-server 等待就緒逾時")
+    server = _LiveServer(base_url, state, client)
+    server.group_state_path = group_state
+    server.topology_path = topology_path
+    return proc, server
+
+
+@pytest.fixture
+def group_live_server(two_tier_path: Path, tmp_path: Path):
+    """2tier 主執行緒 live-server（群組帳本隔離於 tmp_path，供群組寫入整合測試）。
+
+    用 2tier 拓樸，使群組寫入測試（POST /sessions 帶 group、AC-9）與 ATLAS
+    讀取測試對齊同一拓樸的 generator/DUT port（如 ixia-1/1、dut-A1:Eth0）。
+    """
+    proc, server = _start_group_live_server(two_tier_path, tmp_path)
     try:
         yield server
     finally:

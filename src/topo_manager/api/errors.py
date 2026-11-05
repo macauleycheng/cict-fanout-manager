@@ -22,6 +22,10 @@
            DriverConnectionError(502) / DeviceTimeoutError(504) /
            DriverParseError(502) / ReadBackMismatchError(409) / ApplyError(502)。
            這些例外原本 REST 不可能拋出，既有端點行為不變。
+  - 0.7.0  群組 REST（FEAT-002）：映射表新增 GroupNotFoundError(404) /
+           GroupExistsError(409) / GroupMembershipError(409) /
+           AtlasFormatError(422)。因 status_for 以 type(exc) 精確查表，這四個
+           子類必須顯式列出。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -39,12 +43,16 @@ from topo_manager.api.schemas import ErrorDetail, ErrorResponse
 from topo_manager.errors import (
     ApiTokenError,
     ApplyError,
+    AtlasFormatError,
     ConfigError,
     DevicePushDisabledError,
     DevicePushRequestError,
     DeviceTimeoutError,
     DriverConnectionError,
     DriverParseError,
+    GroupExistsError,
+    GroupMembershipError,
+    GroupNotFoundError,
     HardConflictError,
     InterconnectConflictError,
     InterconnectNotConfiguredError,
@@ -103,6 +111,11 @@ _STATUS_BY_EXC: Dict[Type[TopologyError], int] = {
     DriverParseError: 502,
     ReadBackMismatchError: 409,
     ApplyError: 502,
+    # 群組 REST（FEAT-002，精確查表）。
+    GroupNotFoundError: 404,
+    GroupExistsError: 409,
+    GroupMembershipError: 409,
+    AtlasFormatError: 422,
 }
 
 # 非預期例外（程式 bug）對外的固定訊息（不外洩內部細節，設計 §6.4）。

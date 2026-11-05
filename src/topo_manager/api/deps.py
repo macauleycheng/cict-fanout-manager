@@ -18,6 +18,10 @@ CLI 指向同一帳本、同一 pool 時行為一致。設定 / 參數層的錯�
            TOPO_MANAGER_API_TOKEN / TOPO_MANAGER_CREDENTIALS；啟用卻無 token
            時 __init__ 丟 ConfigError（啟動期 fail-fast）。預設全部關閉，既有
            行為不變。
+  - 0.7.0  群組 REST（FEAT-002）：Settings 新增選填的 group_state_path 與環境
+           變數 TOPO_MANAGER_GROUP_STATE（預設 .topo-state/groups.json）；新增
+           build_group_registry factory 建 GroupStore + GroupRegistry。既有
+           欄位與行為不變（群組帳本與打流／互聯帳本三方隔離）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -29,6 +33,8 @@ from typing import Optional
 
 from topo_manager.allocator import Allocator
 from topo_manager.errors import ConfigError
+from topo_manager.groups.registry import GroupRegistry
+from topo_manager.groups.store import GroupStore
 from topo_manager.loader import load_topology
 from topo_manager.store import JsonSessionStore
 
@@ -53,6 +59,9 @@ _ENV_IC_VLAN_MAX = "TOPO_MANAGER_IC_VLAN_MAX"
 _ENV_ENABLE_DEVICE_PUSH = "TOPO_MANAGER_ENABLE_DEVICE_PUSH"
 _ENV_API_TOKEN = "TOPO_MANAGER_API_TOKEN"
 _ENV_CREDENTIALS = "TOPO_MANAGER_CREDENTIALS"
+# 群組 REST（FEAT-002）：群組帳本路徑與其環境變數（與其他帳本隔離）。
+_DEFAULT_GROUP_STATE_PATH = ".topo-state/groups.json"
+_ENV_GROUP_STATE = "TOPO_MANAGER_GROUP_STATE"
 
 
 class Settings:
@@ -68,6 +77,7 @@ class Settings:
       - enable_device_push：是否啟用設備下發端點（預設 False）。
       - api_token：下發端點的共用密鑰（啟用時必填；不得出現在 log／訊息）。
       - credentials_path：fanout 連線設定檔路徑（None＝與 CLI 相同預設）。
+      - group_state_path：群組帳本路徑（預設 ``.topo-state/groups.json``）。
     """
 
     def __init__(
@@ -82,6 +92,7 @@ class Settings:
         enable_device_push: bool = False,
         api_token: Optional[str] = None,
         credentials_path: Optional[str] = None,
+        group_state_path: str = _DEFAULT_GROUP_STATE_PATH,
     ) -> None:
         """以顯式參數建立設定（測試注入用，設計 §10.1）。
 
@@ -94,6 +105,7 @@ class Settings:
           - enable_device_push：是否啟用設備下發端點（預設 False）。
           - api_token：下發端點共用密鑰（啟用時須為非空字串）。
           - credentials_path：fanout 連線設定檔路徑（None 走 CLI 預設）。
+          - group_state_path：群組帳本路徑（預設 CLI 慣例路徑）。
 
         例外：
           - ConfigError：啟用設備下發但 api_token 未設或為空字串。
@@ -108,6 +120,7 @@ class Settings:
         self.enable_device_push = enable_device_push
         self.api_token = api_token
         self.credentials_path = credentials_path
+        self.group_state_path = group_state_path
         self._validate_device_push(enable_device_push, api_token)
 
     @staticmethod
@@ -138,7 +151,8 @@ class Settings:
         （預設 3000）。VLAN 的 ``int()`` 轉換失敗亦丟 ``ConfigError``
         （不冒 ``ValueError``）。互聯側另讀 ``TOPO_MANAGER_IC_STATE``（預設
         ``.topo-state/interconnect.json``）、``TOPO_MANAGER_IC_VLAN_MIN`` /
-        ``TOPO_MANAGER_IC_VLAN_MAX``（預設 100 / 3000）。
+        ``TOPO_MANAGER_IC_VLAN_MAX``（預設 100 / 3000）。群組側另讀
+        ``TOPO_MANAGER_GROUP_STATE``（預設 ``.topo-state/groups.json``）。
 
         回傳：
           - 由環境變數組出的 ``Settings``。
@@ -168,6 +182,10 @@ class Settings:
         if credentials_path == "":
             credentials_path = None
 
+        group_state_path = os.environ.get(
+            _ENV_GROUP_STATE, _DEFAULT_GROUP_STATE_PATH
+        )
+
         return cls(
             topology_path=topology_path,
             state_path=state_path,
@@ -179,6 +197,7 @@ class Settings:
             enable_device_push=enable_device_push,
             api_token=api_token,
             credentials_path=credentials_path,
+            group_state_path=group_state_path,
         )
 
     @staticmethod
@@ -257,3 +276,24 @@ def build_allocator(settings: Settings) -> Allocator:
         )
     except ValueError as exc:
         raise ConfigError("VLAN pool 設定非法：{0}".format(exc)) from exc
+
+
+def build_group_registry(settings: Settings) -> GroupRegistry:
+    """以 ``settings.group_state_path`` 建 ``GroupStore`` + ``GroupRegistry``（FEAT-002）。
+
+    讀路徑（list／get／atlas）每請求以本 factory 重建以取最新帳本快照；寫路徑
+    則共用啟動期單例（``app.state.group_registry``），正確性由 ``GroupStore``
+    的 ``locked()`` + 鎖內 reload 保證（對齊 ``build_allocator`` 的讀寫分工）。
+
+    參數：
+      - settings：已建立的 ``Settings``（提供 group_state_path）。
+
+    回傳：
+      - 已還原既有群組帳本的 ``GroupRegistry``。
+
+    例外：
+      - SessionStoreError：群組帳本讀取／驗證失敗，或還原期不變量被違反
+        （由 ``GroupRegistry.__init__`` 往外傳）。
+    """
+    store = GroupStore(settings.group_state_path)
+    return GroupRegistry(store)
