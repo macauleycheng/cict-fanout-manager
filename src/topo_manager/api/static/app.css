@@ -391,3 +391,21 @@ input[type="text"] {
     color: var(--muted);
     font-style: italic;
 }
+
+/* ------------------------------------------------------------------ *
+ * 暫時隱藏「寫入」按鈕（Allocate / Release），使 Web UI 實質為唯讀檢視。
+ *
+ * 原因：Web UI 的 allocate/release 只改 JSON 帳本、不會下發到實體交換機，
+ * 若與 CLI/REST 的實機下發並用會造成帳本與交換機狀態不一致。先隱藏這些按鈕，
+ * 避免誤觸；底層 JS 邏輯與 REST 端點都保留未動。
+ *
+ * 日後若要恢復（例如 Web UI 接上帶認證的設備下發），直接刪除本區段即可，
+ * 不需改任何 JS。涵蓋：打流 Allocate(#btn-allocate)、互聯 Allocate
+ * (#ic-btn-allocate)、兩側動態建立的 Release 按鈕(.write-action)。
+ * 互聯 Preview(#ic-btn-preview) 為唯讀預覽，保留不隱藏。
+ * ------------------------------------------------------------------ */
+#btn-allocate,
+#ic-btn-allocate,
+.write-action {
+    display: none !important;
+}

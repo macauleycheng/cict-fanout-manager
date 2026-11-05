@@ -582,7 +582,9 @@ function renderIcDetail() {
     el.appendChild(ul);
 
     var releaseBtn = document.createElement("button");
-    releaseBtn.className = "danger";
+    /* class "write-action" 供 CSS 隱藏寫入按鈕用（見 app.css 的隱藏區段）；
+     * 邏輯與端點保留，日後要恢復只需刪掉該 CSS 規則。 */
+    releaseBtn.className = "danger write-action";
     releaseBtn.type = "button";
     releaseBtn.textContent = "Release session";
     releaseBtn.style.marginTop = "10px";
