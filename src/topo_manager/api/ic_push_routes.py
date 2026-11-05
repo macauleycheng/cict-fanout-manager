@@ -23,19 +23,29 @@ NOTES：
 
 HISTORY：
   - 0.1.0  設備下發 REST 初版（互聯側四個端點）。
+  - 0.2.0  FEAT-002 合併端點：新增 token 守護的
+           ``POST /interconnect/sessions/allocate-and-apply``（順序
+           LEDGER→DEVICE，設備失敗以 release_now 回捲帳本）與
+           ``POST /interconnect/sessions/{id}/release-and-remove``（薄封裝，呼叫
+           既有 _run_session_action 的 release，沿用兩階段可重跑語意）。沿用
+           _require_ic / build_ic_allocator / _build_deployer / _run_session_action
+           / _push_results / translate_device_errors 與 ic_routes 的
+           _check_request_mode / _pairs_of。
 
 Copyright (c) 2026 topo-manager。
 """
 
 from __future__ import annotations
 
+import json
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 
 from topo_manager.api.auth import require_api_token, require_device_push
 from topo_manager.api.ic_deps import build_ic_allocator
-from topo_manager.api.ic_routes import _require_ic
+from topo_manager.api.ic_routes import _check_request_mode, _pairs_of, _require_ic
+from topo_manager.api.ic_schemas import IcAllocateRequest, IcSessionResponse
 from topo_manager.api.push_common import (
     driver_factory_of,
     load_config,
@@ -44,6 +54,8 @@ from topo_manager.api.push_common import (
 )
 from topo_manager.api.push_schemas import (
     FanoutPushResult,
+    IcAllocateAndApplyDevice,
+    IcAllocateAndApplyResponse,
     IcParkPushResponse,
     IcPushResponse,
     IcVerifyPushResponse,
@@ -51,6 +63,7 @@ from topo_manager.api.push_schemas import (
     SkippedPort,
 )
 from topo_manager.api.schemas import ErrorResponse
+from topo_manager.errors import DevicePushRequestError, SessionStoreError
 
 # 各端點共用的錯誤回應文件。
 _ERROR_RESPONSES = {
@@ -222,3 +235,90 @@ async def park_ic_ports(
         ],
         warnings=list(result.warnings),
     )
+
+
+# ======================================================================
+# FEAT-002 合併端點（token 守護的 allocate-and-apply / release-and-remove）
+# ======================================================================
+def _parse_ic_allocate_body(raw: bytes) -> IcAllocateRequest:
+    """手動解析互聯 allocate-and-apply 的 body（壞 body → DevicePushRequestError 400）。
+
+    例外：
+      - DevicePushRequestError：非合法 JSON 或不符 schema。
+    """
+    try:
+        return IcAllocateRequest.model_validate(json.loads(raw))
+    except ValueError as exc:
+        raise DevicePushRequestError("請求 body 不合法：{0}".format(exc)) from exc
+
+
+@router.post(
+    "/sessions/allocate-and-apply",
+    response_model=IcAllocateAndApplyResponse,
+    summary="分配互聯 session 並立即下發（先入帳本、再下發；設備失敗回捲帳本）。",
+    responses=_ERROR_RESPONSES,
+)
+async def ic_allocate_and_apply(request: Request) -> IcAllocateAndApplyResponse:
+    """合併動作：InterconnectAllocator.allocate_* → InterconnectDeployer.apply。
+
+    順序 LEDGER → DEVICE。(1) 依 profile／pairs 分配（失敗結構化錯誤原樣往外
+    傳）。(2) apply 下發。(3) 成功回內嵌 session 與 device 區塊。(4) 設備失敗以
+    ``release_now`` 回捲帳本（apply 不做 phase 寫入、失敗時 port 仍 shutdown，
+    任何階段 release_now 皆為精確不重複處理的回捲），再原樣重拋；release_now 亦
+    失敗則拋「設備下發失敗且帳本回捲亦失敗，session 孤兒」的結構化錯誤。
+    """
+    settings, topology = _require_ic(request)
+    body = _parse_ic_allocate_body(await request.body())
+    _check_request_mode(body)
+
+    # (1) LEDGER：分配。
+    allocator = build_ic_allocator(settings, topology)
+    if body.duts is not None:
+        session = allocator.allocate_profile(body.group, list(body.duts), body.profile)
+    else:
+        session = allocator.allocate_pairs(body.group, _pairs_of(body))
+
+    # (2) DEVICE：apply。
+    deployer = _build_deployer(request, settings, allocator, load_config(settings))
+    try:
+        with translate_device_errors():
+            plan = deployer.apply(session, apply=True)
+    except Exception as device_exc:  # noqa: BLE001 — 設備失敗後回捲帳本再重拋。
+        # (4) 設備失敗：release_now 回捲帳本，再原樣重拋原設備錯誤。
+        try:
+            build_ic_allocator(settings, topology).release_now(session.session_id)
+        except Exception as rollback_exc:  # noqa: BLE001
+            raise SessionStoreError(
+                "設備下發失敗且帳本回捲亦失敗，互聯 session {0} 已成為孤兒；請執行 "
+                "release-and-remove 或 CLI release 清理（原回捲錯誤：{1}）".format(
+                    session.session_id, rollback_exc
+                )
+            ) from rollback_exc
+        raise device_exc
+
+    # (3) 成功：內嵌 session（status=allocated）與 device 區塊。
+    return IcAllocateAndApplyResponse(
+        status="allocated-and-applied",
+        session=IcSessionResponse.from_ic_session(session, "allocated"),
+        device=IcAllocateAndApplyDevice(
+            vlans=list(plan.vlans),
+            fanouts=_push_results(plan, session),
+            notes=list(plan.notes),
+        ),
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/release-and-remove",
+    response_model=IcPushResponse,
+    summary="連設備釋放互聯 session 並自帳本移除（沿用兩階段可重跑釋放）。",
+    responses=_ERROR_RESPONSES,
+)
+async def ic_release_and_remove(request: Request, session_id: str) -> IcPushResponse:
+    """薄封裝：呼叫既有 ``_run_session_action(..., 'release')``。
+
+    既有兩階段 ``InterconnectDeployer.release`` 本就一致（begin_release → park／
+    清 VLAN → commit_release）；中途失敗 session 停在 releasing 這個可重跑狀態，
+    故這裡不另加回捲，直接回 release action 的 ``IcPushResponse``。
+    """
+    return _run_session_action(request, session_id, "release")

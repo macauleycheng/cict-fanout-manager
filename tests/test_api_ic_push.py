@@ -7,6 +7,11 @@ apply／release-device／park 內部的 ``device_locked()`` 使用 ``SIGALRM``�
 
 歷史（HISTORY）：
   - 0.1.0  設備下發 REST 初版。
+  - 0.2.0  FEAT-002 合併端點整合測試：interconnect allocate-and-apply 成功（帳本
+           有新 session 且假設備顯示互聯 link、逐 fanout read-back）、
+           release-and-remove 成功（帳本不再有該 session）、allocate-and-apply
+           設備失敗（drop→409／auth→502／timeout→504）斷言 release_now 回捲後無
+           互聯 session 殘留且結構化錯誤。所有錯誤 body 皆無 Traceback。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -222,3 +227,110 @@ def test_topology_without_interconnect_section_is_404_not_configured(
     response = server.client.post("/interconnect/park", headers=_headers(server))
     assert response.status_code == 404
     assert response.json()["error"]["type"] == "InterconnectNotConfiguredError"
+
+
+# ----------------------------------------------------------------------
+# FEAT-002 合併端點（allocate-and-apply / release-and-remove）
+# ----------------------------------------------------------------------
+def _ic_session_count(server) -> int:
+    """以 ledger-only GET 讀回目前互聯 session 數量。"""
+    response = server.client.get("/interconnect/sessions")
+    assert response.status_code == 200, response.text
+    return response.json()["count"]
+
+
+def _ic_session_ids(server) -> set:
+    """以 ledger-only GET 讀回目前互聯 session_id 集合。"""
+    response = server.client.get("/interconnect/sessions")
+    assert response.status_code == 200, response.text
+    return {item["session_id"] for item in response.json()["sessions"]}
+
+
+def test_ic_allocate_and_apply_success_creates_ledger_and_links(ic_push_live_server) -> None:
+    """互聯 allocate-and-apply 成功：帳本有新 session、device 區塊有 vlans／link／read-back。"""
+    server = ic_push_live_server
+    response = server.client.post(
+        "/interconnect/sessions/allocate-and-apply",
+        json={"group": "A-g1", "duts": ["dut-A1", "dut-A2"], "profile": "mesh"},
+        headers=_headers(server),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "allocated-and-applied"
+    session = body["session"]
+    assert session["status"] == "allocated"
+    sid = session["session_id"]
+    device = body["device"]
+    assert device["vlans"]
+    assert device["fanouts"]
+    for item in device["fanouts"]:
+        assert item["ok"] is True
+        assert item["commands"]
+        assert item["ports"]
+        assert item["readback"]["verified"] is True
+        assert item["readback"]["missing"] == []
+
+    # 帳本確有這筆新 session。
+    assert sid in _ic_session_ids(server)
+    # verify 隨後為 ok（證明假設備確有互聯 link）。
+    verify = server.client.get(
+        "/interconnect/sessions/{0}/verify".format(sid), headers=_headers(server)
+    )
+    assert verify.status_code == 200
+    assert verify.json()["ok"] is True
+
+
+def test_ic_release_and_remove_success_clears_ledger(ic_push_live_server) -> None:
+    """互聯 release-and-remove 成功：連設備釋放並自帳本移除。"""
+    server = ic_push_live_server
+    created = server.client.post(
+        "/interconnect/sessions/allocate-and-apply",
+        json={"group": "A-g1", "duts": ["dut-A1", "dut-A2"], "profile": "mesh"},
+        headers=_headers(server),
+    )
+    sid = created.json()["session"]["session_id"]
+    assert sid in _ic_session_ids(server)
+
+    response = server.client.post(
+        "/interconnect/sessions/{0}/release-and-remove".format(sid),
+        headers=_headers(server),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["action"] == "release"
+    assert all(item["ok"] for item in body["fanouts"])
+
+    # 帳本已清；再 apply 得 404。
+    assert sid not in _ic_session_ids(server)
+    again = server.client.post(
+        "/interconnect/sessions/{0}/apply".format(sid), headers=_headers(server)
+    )
+    assert again.status_code == 404
+    assert again.json()["error"]["type"] == "InterconnectSessionNotFoundError"
+
+
+@pytest.mark.parametrize(
+    "mode,status,error_type",
+    [
+        ("drop", 409, "ReadBackMismatchError"),
+        ("auth", 502, "DriverConnectionError"),
+        ("timeout", 504, "DeviceTimeoutError"),
+    ],
+)
+def test_ic_allocate_and_apply_device_failure_rolls_back(
+    ic_small_path: Path, push_server_factory, mode: str, status: int, error_type: str
+) -> None:
+    """互聯 allocate-and-apply 設備失敗：release_now 回捲後無互聯 session 殘留。"""
+    server = push_server_factory(ic_small_path, _IC_FANOUTS, mode)
+    before = _ic_session_count(server)
+    response = server.client.post(
+        "/interconnect/sessions/allocate-and-apply",
+        json={"group": "A-g1", "duts": ["dut-A1", "dut-A2"], "profile": "mesh"},
+        headers=_headers(server),
+    )
+    assert response.status_code == status, response.text
+    assert response.json()["error"]["type"] == error_type
+    assert "Traceback" not in response.text
+    assert "fake-pass" not in response.text
+    # release_now 回捲後，互聯帳本不得殘留半成品 session。
+    assert _ic_session_count(server) == before

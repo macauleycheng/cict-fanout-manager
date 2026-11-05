@@ -1,13 +1,15 @@
 """設備下發 REST 的兩道閘門測試（tests/test_api_push_gate.py）。
 
-涵蓋 7 個下發端點的：未啟用 → 結構化 404（type 與「無互聯區段」不同）、啟用後
-token 缺漏／錯誤／非 ASCII／相同前綴 → 401，且 401 先於壞 query／壞 JSON body，
-並以注入的 driver 工廠斷言「從未被呼叫」、帳本檔 bytes 不變、credentials 檔
-（刻意指向不存在的路徑）未被讀取。僅用 TestClient：這些請求都在取鎖與連線之前
-就被拒絕，不需要主執行緒。
+涵蓋 11 個下發端點（含 FEAT-002 四個合併端點）的：未啟用 → 結構化 404（type 與
+「無互聯區段」不同）、啟用後 token 缺漏／錯誤／非 ASCII／相同前綴 → 401，且 401
+先於壞 query／壞 JSON body，並以注入的 driver 工廠斷言「從未被呼叫」、帳本檔
+bytes 不變、credentials 檔（刻意指向不存在的路徑）未被讀取。僅用 TestClient：這些
+請求都在取鎖與連線之前就被拒絕，不需要主執行緒。
 
 歷史（HISTORY）：
   - 0.1.0  設備下發 REST 初版。
+  - 0.2.0  FEAT-002：_PUSH_ENDPOINTS 增列四個合併端點（tagging／interconnect 的
+           allocate-and-apply / release-and-remove），兩道閘門參數化測試一併涵蓋。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -25,7 +27,7 @@ from topo_manager.api.deps import Settings
 
 _TOKEN = "test-token-xyz"
 
-# (method, path) 共 7 個下發端點。
+# (method, path) 共 11 個下發端點（含 FEAT-002 四個合併端點）。
 _PUSH_ENDPOINTS: List[Tuple[str, str]] = [
     ("POST", "/sessions/s-1/apply"),
     ("GET", "/sessions/s-1/verify"),
@@ -34,6 +36,11 @@ _PUSH_ENDPOINTS: List[Tuple[str, str]] = [
     ("GET", "/interconnect/sessions/ic-1/verify"),
     ("POST", "/interconnect/park"),
     ("POST", "/interconnect/sessions/ic-1/release-device"),
+    # FEAT-002 合併端點。
+    ("POST", "/sessions/allocate-and-apply"),
+    ("POST", "/sessions/s-1/release-and-remove"),
+    ("POST", "/interconnect/sessions/allocate-and-apply"),
+    ("POST", "/interconnect/sessions/ic-1/release-and-remove"),
 ]
 
 

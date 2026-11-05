@@ -15,6 +15,14 @@ NOTES：
 
 HISTORY：
   - 0.1.0  設備下發 REST 初版。
+  - 0.2.0  FEAT-002 合併端點：新增 token 守護的「allocate-and-apply /
+           release-and-remove」請求與回應模型。打流側
+           ``AllocateAndApplyRequest`` / ``AllocateAndApplyResponse``（回應內嵌
+           ``schemas.SessionResponse``，不重複頂層 session_id/vlan）、
+           ``ReleaseAndRemoveResponse``（session 已清，僅帶 session_id）；互聯側
+           ``IcAllocateAndApplyResponse``（內嵌 ``ic_schemas.IcSessionResponse``
+           與內嵌 device 模型）。互聯 allocate 沿用既有 ``IcAllocateRequest``，
+           本檔不重複定義。皆 ``extra="forbid"``。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -25,6 +33,9 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 from typing_extensions import Literal
+
+from topo_manager.api.ic_schemas import IcSessionResponse
+from topo_manager.api.schemas import SessionResponse
 
 
 class ReadbackSummary(BaseModel):
@@ -155,3 +166,89 @@ class IcVerifyPushResponse(BaseModel):
     ok: bool
     fanouts: List[str]
     problems: List[str]
+
+
+# ======================================================================
+# FEAT-002 合併端點（token 守護的 allocate-and-apply / release-and-remove）
+# ======================================================================
+class AllocateAndApplyRequest(BaseModel):
+    """打流 ``POST /sessions/allocate-and-apply`` 請求 body。
+
+    欄位（對齊 ``schemas.AllocateRequest``）：
+      - generator_port：generator 端輸入（裸名或 ``dev:port``）。
+      - dut_port：DUT 端輸入（``dev:port``）。
+
+    注意：此 body 於 handler 內手動解析（見 push_routes 模組 NOTES），故這裡
+    不設 ``min_length``；空字串交由 allocator 的 find_path 判為 PathLookupError。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    generator_port: str
+    dut_port: str
+
+
+class AllocateAndApplyResponse(BaseModel):
+    """打流 ``POST /sessions/allocate-and-apply`` 回應（先入帳本、再下發）。
+
+    欄位：
+      - status：固定 ``allocated-and-applied``。
+      - session：剛建立的 session（內嵌 ``SessionResponse``，status=allocated）；
+        session_id / vlan 皆在 ``session.*`` 之內，不於頂層重複。
+      - fanouts：逐 fanout 的下發結果（僅列有變更者）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["allocated-and-applied"]
+    session: SessionResponse
+    fanouts: List[FanoutPushResult]
+
+
+class ReleaseAndRemoveResponse(BaseModel):
+    """打流 ``POST /sessions/{id}/release-and-remove`` 回應（先撤設備、再清帳本）。
+
+    欄位：
+      - status：固定 ``released-and-removed``。
+      - session_id：已釋放的 session_id（session 本體已清，不內嵌）。
+      - fanouts：逐 fanout 的撤除結果。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["released-and-removed"]
+    session_id: str
+    fanouts: List[FanoutPushResult]
+
+
+class IcAllocateAndApplyDevice(BaseModel):
+    """互聯 allocate-and-apply 回應的 device 區塊（下發後的設備面結果）。
+
+    欄位：
+      - vlans：本次涉及的 VLAN（升冪）。
+      - fanouts：逐 fanout 的下發結果。
+      - notes：apply 回讀備註（如 Link Status）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    vlans: List[int]
+    fanouts: List[FanoutPushResult]
+    notes: List[str]
+
+
+class IcAllocateAndApplyResponse(BaseModel):
+    """互聯 ``POST /interconnect/sessions/allocate-and-apply`` 回應。
+
+    欄位：
+      - status：固定 ``allocated-and-applied``。
+      - session：剛建立的互聯 session（內嵌 ``IcSessionResponse``，
+        status=allocated）。
+      - device：下發後的設備面結果（vlans / fanouts / notes）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["allocated-and-applied"]
+    session: IcSessionResponse
+    device: IcAllocateAndApplyDevice

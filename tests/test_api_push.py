@@ -8,6 +8,12 @@ session 不存在 404、setup 的 body 規則、credentials 涵蓋核對，以�
 
 歷史（HISTORY）：
   - 0.1.0  設備下發 REST 初版。
+  - 0.2.0  FEAT-002 合併端點整合測試：allocate-and-apply 成功（帳本有新 session
+           且假設備顯示 VLAN 成員、逐 fanout read-back）、release-and-remove 成功
+           （假設備成員消失且帳本不再有該 session）、allocate-and-apply 設備失敗
+           （drop→409／auth→502／timeout→504）斷言帳本未殘留半成品（Allocator
+           回捲）、release-and-remove 設備失敗斷言帳本仍保有 session；所有錯誤
+           body 皆無 Traceback。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -215,3 +221,138 @@ def test_setup_timeout_is_504(three_tier_path: Path, push_server_factory) -> Non
     response = server.client.post("/fanouts/setup", headers=_headers(server))
     assert response.status_code == 504
     assert response.json()["error"]["type"] == "DeviceTimeoutError"
+
+
+# ----------------------------------------------------------------------
+# FEAT-002 合併端點（allocate-and-apply / release-and-remove）
+# ----------------------------------------------------------------------
+def _allocator_for(server):
+    """以 server 的拓樸與帳本路徑建 allocator（供測試直接讀回帳本狀態）。"""
+    return build_allocator(
+        Settings(
+            topology_path=str(server.topology_path),
+            state_path=str(server.state_path),
+        )
+    )
+
+
+def _ledger_session_ids(server):
+    """回傳帳本中目前所有 session_id 集合（每次重建 allocator 以讀最新帳本）。"""
+    return {session.session_id for session in _allocator_for(server).list_sessions()}
+
+
+def test_allocate_and_apply_success_creates_ledger_and_pushes(push_live_server) -> None:
+    """allocate-and-apply 成功：帳本有新 session、假設備已下發、逐 fanout read-back。"""
+    server = push_live_server
+    response = server.client.post(
+        "/sessions/allocate-and-apply",
+        json={"generator_port": _GENERATOR, "dut_port": _DUT_PORT},
+        headers=_headers(server),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "allocated-and-applied"
+    # session_id / vlan 在內嵌的 session.* 之內，不在頂層。
+    assert "session_id" not in body
+    assert "vlan" not in body
+    session = body["session"]
+    assert session["status"] == "allocated"
+    sid = session["session_id"]
+    assert len(body["fanouts"]) >= 2
+    for item in body["fanouts"]:
+        assert item["ok"] is True
+        assert item["commands"]
+        assert item["ports"]
+        assert item["readback"]["verified"] is True
+        assert item["readback"]["missing"] == []
+
+    # 帳本確實有這筆新 session。
+    assert sid in _ledger_session_ids(server)
+    # verify 隨後為 ok（證明假設備確有 VLAN 成員）。
+    verify = server.client.get(
+        "/sessions/{0}/verify".format(sid), headers=_headers(server)
+    )
+    assert verify.status_code == 200
+    assert verify.json()["ok"] is True
+
+
+def test_release_and_remove_success_tears_down_and_clears_ledger(push_live_server) -> None:
+    """release-and-remove 成功：假設備成員消失、帳本不再有該 session。"""
+    server = push_live_server
+    created = server.client.post(
+        "/sessions/allocate-and-apply",
+        json={"generator_port": _GENERATOR, "dut_port": _DUT_PORT},
+        headers=_headers(server),
+    )
+    sid = created.json()["session"]["session_id"]
+    assert sid in _ledger_session_ids(server)
+
+    response = server.client.post(
+        "/sessions/{0}/release-and-remove".format(sid), headers=_headers(server)
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "released-and-removed"
+    assert body["session_id"] == sid
+    assert all(item["ok"] for item in body["fanouts"])
+
+    # 帳本已清除；再對該 session apply 得 404。
+    assert sid not in _ledger_session_ids(server)
+    again = server.client.post(
+        "/sessions/{0}/apply".format(sid), headers=_headers(server)
+    )
+    assert again.status_code == 404
+    assert again.json()["error"]["type"] == "SessionNotFoundError"
+
+
+@pytest.mark.parametrize(
+    "mode,status,error_type",
+    [
+        ("drop", 409, "ReadBackMismatchError"),
+        ("auth", 502, "DriverConnectionError"),
+        ("timeout", 504, "DeviceTimeoutError"),
+    ],
+)
+def test_allocate_and_apply_device_failure_rolls_back_ledger(
+    three_tier_path: Path, push_server_factory, mode: str, status: int, error_type: str
+) -> None:
+    """allocate-and-apply 設備失敗：Allocator.release 回捲，帳本不留半成品。"""
+    server = push_server_factory(three_tier_path, _TRAFFIC_FANOUTS, mode)
+    before = _ledger_session_ids(server)
+    response = server.client.post(
+        "/sessions/allocate-and-apply",
+        json={"generator_port": _GENERATOR, "dut_port": _DUT_PORT},
+        headers=_headers(server),
+    )
+    assert response.status_code == status, response.text
+    assert response.json()["error"]["type"] == error_type
+    assert "Traceback" not in response.text
+    assert "fake-pass" not in response.text
+    # 設備失敗後帳本不得殘留半成品 session。
+    assert _ledger_session_ids(server) == before
+
+
+def test_release_and_remove_device_failure_keeps_ledger(
+    three_tier_path: Path, push_server_factory
+) -> None:
+    """release-and-remove 設備失敗：帳本仍保有該 session（不提早清除），結構化錯誤。
+
+    push_server_factory 每個 server 行程只有單一 fake mode，無法同時「ok 建立 +
+    壞設備釋放」；故先用一個外部 allocator 直接把 session 寫進共用帳本（只動帳本、
+    不連設備），再對同一 tmp_path 另起一個 timeout server 呼叫 release-and-remove，
+    斷言設備逾時 504 且帳本仍保有該 session。
+    """
+    server = push_server_factory(three_tier_path, _TRAFFIC_FANOUTS, "timeout")
+    # 外部 allocator 直接寫帳本（與 server 共用同一 state_path）。
+    session = _allocator_for(server).allocate(_GENERATOR, _DUT_PORT)
+    sid = session.session_id
+    assert sid in _ledger_session_ids(server)
+
+    response = server.client.post(
+        "/sessions/{0}/release-and-remove".format(sid), headers=_headers(server)
+    )
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["type"] == "DeviceTimeoutError"
+    assert "Traceback" not in response.text
+    # 設備撤除失敗 → 帳本不得提早清除，session 仍在。
+    assert sid in _ledger_session_ids(server)

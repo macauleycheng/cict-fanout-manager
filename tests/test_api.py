@@ -496,7 +496,7 @@ def test_openapi_unchanged_when_push_disabled(
 
 
 def test_openapi_when_push_enabled(three_tier_path: Path, tmp_path: Path) -> None:
-    """啟用：版本 0.6.0、含 7 個下發路徑且各自文件化 401／404／409／502／504。"""
+    """啟用：版本 0.7.0、含 7 個下發路徑且各自文件化 401／404／409／502／504。"""
     from topo_manager.api import create_app
     from topo_manager.api.deps import Settings
 
@@ -507,7 +507,7 @@ def test_openapi_when_push_enabled(three_tier_path: Path, tmp_path: Path) -> Non
         api_token="t",
     )
     body = TestClient(create_app(settings)).get("/openapi.json").json()
-    assert body["info"]["version"] == "0.6.0"
+    assert body["info"]["version"] == "0.7.0"
     assert "僅限 CLI" not in body["info"]["description"]
     assert "X-API-Token" in body["info"]["description"]
     for path, method in _PUSH_PATHS:

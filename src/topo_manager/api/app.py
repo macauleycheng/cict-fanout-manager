@@ -26,6 +26,10 @@ settings / shared allocator / topology 存入 ``app.state`` 供 routes 取用。
            （請求命中得結構化 404，OpenAPI 與既有逐位元一致）；啟用時
            version 為 "0.6.0" 並替換 description 的「僅限 CLI」句。未啟用時
            version／description 維持 "0.5.0"／原字串（既有測試不變）。
+  - 0.8.0  FEAT-002 合併端點：啟用設備下發時的 version 由 "0.6.0" 升為
+           "0.7.0"（OpenAPI 新增四個 allocate-and-apply / release-and-remove
+           路徑，屬 semver minor）；_PUSH_SENTENCE 增述這些合併端點。未啟用時
+           的 _API_VERSION 維持 "0.5.0"（disabled 契約逐位元不變）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -57,14 +61,15 @@ _API_DESCRIPTION = (
 
 
 # 啟用設備下發時的版本與描述（未啟用沿用上方常數，逐字不變）。
-_API_VERSION_PUSH = "0.6.0"
+_API_VERSION_PUSH = "0.7.0"
 _CLI_ONLY_SENTENCE = (
     "互聯的設備下發（apply / park / 帶設備的 release / verify）僅限 "
     "CLI，REST 不提供、不連任何設備。"
 )
 _PUSH_SENTENCE = (
-    "設備下發端點（apply / verify / setup / park / release-device）預設關閉，"
-    "需設定 TOPO_MANAGER_ENABLE_DEVICE_PUSH=1 與 TOPO_MANAGER_API_TOKEN，並以 "
+    "設備下發端點（apply / verify / setup / park / release-device，以及合併的 "
+    "allocate-and-apply / release-and-remove）預設關閉，需設定 "
+    "TOPO_MANAGER_ENABLE_DEVICE_PUSH=1 與 TOPO_MANAGER_API_TOKEN，並以 "
     "X-API-Token header 驗證；這些端點會連線並寫入 fanout，請求期間 server "
     "事件迴圈會被阻塞。"
 )
