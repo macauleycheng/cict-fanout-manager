@@ -9,6 +9,16 @@
  *
  * No build step, no bundler, no external graph library. Served verbatim via
  * GET /static/app.js. User-facing text is English.
+ *
+ * HISTORY:
+ *   - FEAT-003  Wire the Traffic tab's write actions to the token-guarded
+ *               combined endpoints: Allocate -> POST /sessions/allocate-and-apply
+ *               (reads the embedded resp.session.*), Release -> POST
+ *               /sessions/{id}/release-and-remove, and a new Apply button ->
+ *               POST /sessions/{id}/apply (flat resp.*), each sending the
+ *               X-API-Token header via apiFetchAuthed(). Render a per-fanout
+ *               result list in the detail panel on success; a 401
+ *               (ApiTokenError) clears the token and reverts to read-only.
  */
 
 "use strict";
@@ -50,7 +60,10 @@ var state = {
     available: null,       /* raw GET /resources/available payload */
     selectedId: null,      /* currently highlighted session_id, or null */
     autoRefresh: false,    /* whether auto-refresh is currently enabled */
-    autoTimer: null        /* setTimeout handle for the next auto-refresh tick */
+    autoTimer: null,       /* setTimeout handle for the next auto-refresh tick */
+    /* 最近一次寫入動作（allocate-and-apply / apply）的每-fanout 下發結果，供
+     * detail 面板呈現；{session_id, title, fanouts:[FanoutPushResult]}，或 null。 */
+    lastPush: null
 };
 
 var AUTO_REFRESH_INTERVAL_MS = 10000;
@@ -65,11 +78,20 @@ function ApiError(type, message, status) {
     this.status = status;
 }
 
-function apiFetch(method, url, body) {
+function apiFetch(method, url, body, extraHeaders) {
     var opts = { method: method, headers: {} };
     if (body !== undefined && body !== null) {
         opts.headers["Content-Type"] = "application/json";
         opts.body = JSON.stringify(body);
+    }
+    /* 選用的額外 header（如寫入動作的 X-API-Token，見 apiFetchAuthed）。 */
+    if (extraHeaders) {
+        var h;
+        for (h in extraHeaders) {
+            if (extraHeaders.hasOwnProperty(h)) {
+                opts.headers[h] = extraHeaders[h];
+            }
+        }
     }
     return fetch(url, opts).then(
         function (response) {
@@ -106,6 +128,13 @@ function apiFetch(method, url, body) {
             throw new ApiError("Network", "Cannot reach server", 0);
         }
     );
+}
+
+/* apiFetchAuthed：寫入動作專用的 apiFetch，額外帶上 X-API-Token header（值取自
+ * 記憶體內的 auth 模組，見 token.js）。token 為空時仍會送出 header（空字串），
+ * 後端 require_api_token 會以 401 ApiTokenError 回應，友善訊息會把 UI 轉回唯讀。 */
+function apiFetchAuthed(method, url, body) {
+    return apiFetch(method, url, body, { "X-API-Token": auth.getToken() });
 }
 
 /* ------------------------------------------------------------------ *
@@ -709,17 +738,76 @@ function renderDetail() {
     addDetailRow(dl, "Trunk segments", segText);
     el.appendChild(dl);
 
+    /* 寫入動作列：Apply 與 Release 皆帶 class "write-action"，由 body
+     * .writes-unlocked 閘控顯示（見 app.css）；空 token 時維持唯讀、兩鈕隱藏。 */
+    var actions = document.createElement("div");
+    actions.className = "detail-actions";
+    actions.style.marginTop = "10px";
+
+    var applyBtn = document.createElement("button");
+    applyBtn.className = "primary write-action";
+    applyBtn.type = "button";
+    applyBtn.textContent = "Apply";
+    applyBtn.addEventListener("click", function () {
+        applySession(selected.session_id);
+    });
+    actions.appendChild(applyBtn);
+
     var releaseBtn = document.createElement("button");
-    /* class "write-action" 供 CSS 隱藏寫入按鈕用（見 app.css 的隱藏區段）；
-     * 邏輯與端點保留，日後要恢復只需刪掉該 CSS 規則。 */
     releaseBtn.className = "danger write-action";
     releaseBtn.type = "button";
     releaseBtn.textContent = "Release session";
-    releaseBtn.style.marginTop = "10px";
     releaseBtn.addEventListener("click", function () {
         releaseSession(selected.session_id);
     });
-    el.appendChild(releaseBtn);
+    actions.appendChild(releaseBtn);
+    el.appendChild(actions);
+
+    /* 最近一次寫入動作的 per-fanout 下發結果（僅成功時有；錯誤走 banner）。 */
+    if (state.lastPush && state.lastPush.session_id === selected.session_id) {
+        el.appendChild(renderPushResult(state.lastPush));
+    }
+}
+
+/* renderPushResult：把一次寫入動作的 per-fanout 結果畫成清單（fanout / ports /
+ * verified / applied）。僅在 200 成功回應時呼叫；錯誤回應不帶 fanouts 陣列。 */
+function renderPushResult(push) {
+    var wrap = document.createElement("div");
+    wrap.className = "push-result";
+    wrap.style.marginTop = "10px";
+
+    var head = document.createElement("p");
+    head.className = "push-result-head";
+    head.textContent = push.title + " \u2014 per-fanout results:";
+    wrap.appendChild(head);
+
+    var fanouts = push.fanouts || [];
+    if (fanouts.length === 0) {
+        var none = document.createElement("p");
+        none.className = "empty";
+        none.textContent = "(no fanout changes)";
+        wrap.appendChild(none);
+        return wrap;
+    }
+
+    var ul = document.createElement("ul");
+    ul.className = "push-fanout-list";
+    for (var i = 0; i < fanouts.length; i += 1) {
+        var fr = fanouts[i];
+        var readback = fr.readback || null;
+        var li = document.createElement("li");
+        li.textContent = fr.fanout
+            + " \u00b7 ports " + (fr.ports || []).join(", ")
+            + " \u00b7 " + (fr.ok ? "applied" : "failed")
+            + " \u00b7 "
+            + (readback
+                ? (readback.verified ? "verified" : "unverified")
+                    + " (" + readback.checked + " checked)"
+                : "no read-back");
+        ul.appendChild(li);
+    }
+    wrap.appendChild(ul);
+    return wrap;
 }
 
 function addDetailRow(dl, label, value) {
@@ -913,27 +1001,45 @@ function allocateSession() {
         generator_port: genSel.value,
         dut_port: dutSel.value
     };
-    apiFetch("POST", "/sessions", body).then(
-        function () {
+    /* 寫入動作：建帳本並下發到設備（allocate-and-apply，帶 X-API-Token）。
+     * 回應把帳本內嵌於 resp.session.*（非頂層平鋪），per-fanout 於 resp.fanouts。 */
+    apiFetchAuthed("POST", "/sessions/allocate-and-apply", body).then(
+        function (resp) {
             clearError();
+            var session = (resp && resp.session) || {};
+            if (session.session_id) {
+                state.selectedId = session.session_id;
+                state.lastPush = {
+                    session_id: session.session_id,
+                    title: "Allocated and applied",
+                    fanouts: (resp && resp.fanouts) || []
+                };
+            }
             refreshAll();
         },
         function (err) {
+            handleWriteError(err);
             showAllocateError(err);
         }
     );
 }
 
 function releaseSession(sessionId) {
-    apiFetch("DELETE", "/sessions/" + encodeURIComponent(sessionId)).then(
+    /* 寫入動作：下發移除並清帳本（release-and-remove，帶 X-API-Token）。 */
+    apiFetchAuthed("POST", "/sessions/" + encodeURIComponent(sessionId)
+            + "/release-and-remove", {}).then(
         function () {
             clearError();
             if (state.selectedId === sessionId) {
                 state.selectedId = null;
             }
+            if (state.lastPush && state.lastPush.session_id === sessionId) {
+                state.lastPush = null;
+            }
             refreshAll();
         },
         function (err) {
+            handleWriteError(err);
             if (err.type === "SessionNotFoundError") {
                 showError(err.type, "Session already gone; refreshing.");
                 if (state.selectedId === sessionId) {
@@ -947,12 +1053,74 @@ function releaseSession(sessionId) {
     );
 }
 
+/* applySession：對既有 session 重新下發（pure apply，帶 X-API-Token）。
+ * 純 apply 回應為平鋪形狀 resp.session_id / resp.vlan / resp.status /
+ * resp.fanouts（不內嵌 session）；成功時把 per-fanout 結果留在 detail 面板。 */
+function applySession(sessionId) {
+    apiFetchAuthed("POST", "/sessions/" + encodeURIComponent(sessionId)
+            + "/apply", {}).then(
+        function (resp) {
+            clearError();
+            state.lastPush = {
+                session_id: (resp && resp.session_id) || sessionId,
+                title: "Applied",
+                fanouts: (resp && resp.fanouts) || []
+            };
+            renderDetail();
+        },
+        function (err) {
+            handleWriteError(err);
+            showError(err.type, friendlyMessage(err));
+        }
+    );
+}
+
+/* handleWriteError：所有寫入動作共用的 401 處理。後端在 token 無效時回
+ * ApiTokenError(401)；此時清掉記憶體內 token、切回唯讀（applyWriteLock），並清
+ * 空頁首 token 欄位，讓使用者重填。非 401 不動 token（交由各自 friendlyMessage）。 */
+function handleWriteError(err) {
+    if (err.type === "ApiTokenError") {
+        auth.clearToken();
+        applyWriteLock();
+        var input = document.getElementById("api-token");
+        if (input) {
+            input.value = "";
+        }
+        var stateEl = document.getElementById("token-state");
+        if (stateEl) {
+            stateEl.textContent = "Read-only";
+            stateEl.className = "";
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ *
  * Error banner (design §6).
  * ------------------------------------------------------------------ */
 
 function friendlyMessage(err) {
     switch (err.type) {
+        case "ApiTokenError":
+            /* 401：token 缺失或錯誤。handleWriteError 已清 token 並切回唯讀；
+             * 此處僅回友善文案。 */
+            return "Invalid or missing token; writes are locked. Re-enter a "
+                + "valid X-API-Token to unlock.";
+        case "DevicePushDisabledError":
+            return "Device push is disabled on the server; write actions are "
+                + "unavailable.";
+        case "DriverConnectionError":
+        case "ApplyError":
+            /* 502：連不上設備 / 下發失敗。顯示後端給的單一結構化訊息。 */
+            return "Device push failed: " + (err.message
+                || "cannot reach the switch.");
+        case "DeviceTimeoutError":
+            /* 504：設備逾時。 */
+            return "Device timed out: " + (err.message || "the switch did not "
+                + "respond in time.");
+        case "ReadBackMismatchError":
+            /* 409：下發後 read-back 不符。 */
+            return "Read-back mismatch after push: " + (err.message
+                || "the switch state does not match the request.");
         case "HardConflictError":
             return "That port pair is already in use by another session. "
                 + (err.message || "");

@@ -10,6 +10,12 @@
   (#tab-interconnect, hidden by default). Traffic content is produced by app.js;
   interconnect content by ic.js; tabs.js is the tiny tab-switch controller.
   User-facing text is English (per design + README convention).
+
+  The header also carries an X-API-Token field (#api-token): while empty the
+  page stays read-only (no write buttons visible); entering a token unlocks the
+  Allocate / Release / Apply actions on both tabs via a body.writes-unlocked
+  class. The token is kept in memory only (token.js), never persisted, and is
+  cleared on reload. token.js MUST load before app.js / ic.js (they call auth).
 -->
 <html lang="en">
 <head>
@@ -26,6 +32,13 @@
             <span id="topo-identity">Loading&hellip;</span>
             <span id="vlan-usage">VLANs in use: &ndash;</span>
             <span class="spacer"></span>
+            <span id="token-field">
+                <input id="api-token" type="password"
+                       placeholder="X-API-Token to unlock writes">
+                <span id="token-state">Read-only</span>
+                <span id="token-note">Sent over plain HTTP (no TLS). Kept in
+                    memory only &mdash; cleared on reload.</span>
+            </span>
             <button id="btn-refresh" type="button">Refresh</button>
             <label>
                 <input id="chk-autorefresh" type="checkbox">
@@ -163,8 +176,43 @@
 
     <div id="tooltip"></div>
 
+    <script src="/static/token.js"></script>
     <script src="/static/tabs.js"></script>
     <script src="/static/app.js"></script>
     <script src="/static/ic.js"></script>
+    <script>
+        /* 頁首 token 欄位的事件繫結（token 僅存記憶體，見 token.js）。輸入時以
+         * trim 後的值設定／清除 token，切換寫入鎖並更新唯讀/解鎖指示文字。 */
+        (function () {
+            "use strict";
+            var input = document.getElementById("api-token");
+            var state = document.getElementById("token-state");
+
+            function syncTokenState() {
+                if (auth.hasToken()) {
+                    state.textContent = "Writes unlocked";
+                    state.className = "unlocked";
+                } else {
+                    state.textContent = "Read-only";
+                    state.className = "";
+                }
+            }
+
+            input.addEventListener("input", function () {
+                var value = input.value.trim();
+                if (value) {
+                    auth.setToken(value);
+                } else {
+                    auth.clearToken();
+                }
+                applyWriteLock();
+                syncTokenState();
+            });
+
+            /* 初始為唯讀（空 token）：確保頁面載入即為唯讀檢視。 */
+            applyWriteLock();
+            syncTokenState();
+        })();
+    </script>
 </body>
 </html>

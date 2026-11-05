@@ -1,18 +1,32 @@
 /*
  * CICT Fanout Manager Web UI 互聯（interconnect）頁籤行為（design §3、§4）。
  *
- * 互聯頁籤的全部前端行為：呼叫既有互聯帳本層 REST（summary / available /
- * sessions GET+POST / sessions DELETE / plan），列出互聯 session 並支援文字
- * filter、選中某 session 時在「每組一張小圖」的互聯拓樸區畫出該 session 的每
- * 條 link（標 VLAN 與兩端 il_port），以及建立表單（profile 或 pairs 二擇一）
- * 與釋放按鈕。友善錯誤以 banner 呈現；無互聯區段（404）時整頁籤顯示中性提示。
+ * 互聯頁籤的全部前端行為：讀取既有互聯帳本層 REST（summary / available /
+ * sessions GET / plan）供唯讀檢視，列出互聯 session 並支援文字 filter、選中某
+ * session 時在「每組一張小圖」的互聯拓樸區畫出該 session 的每條 link（標 VLAN
+ * 與兩端 il_port），以及建立表單（profile 或 pairs 二擇一）。寫入動作
+ * （Allocate / Release / Apply）改接 token 保護的合併端點（allocate-and-apply
+ * / release-and-remove / apply，皆帶 X-API-Token），成功時於 detail 呈現
+ * per-fanout 結果。友善錯誤以 banner 呈現；無互聯區段（404）時整頁籤顯示中性
+ * 提示。Preview 維持唯讀不帶 token。
  *
- * 不呼叫任何會連設備的端點（apply / verify / park / release-device 一律不出
- * 現），不處理 X-API-Token。零 build、純 vanilla ES5-相容 JS + inline SVG
+ * 寫入 token 僅存於記憶體（見 token.js 的 auth），空 token 時 body 無
+ * writes-unlocked class、寫入按鈕由 CSS 隱藏，整頁籤回到唯讀檢視。零 build、
+ * 純 vanilla ES5-相容 JS + inline SVG
  * （document.createElementNS），服出去的 /static/ic.js。使用者面向文字為英文。
  *
  * 與 app.js 的唯一共享是頁首與頁籤列；互聯邏輯自帶獨立的 icState 與 refresh，
  * 與打流邏輯互不污染（design §2 方案 B）。
+ *
+ * 歷史（HISTORY）：
+ *   - FEAT-003  互聯頁籤改接 token 保護的合併端點：Allocate -> POST
+ *               /interconnect/sessions/allocate-and-apply（讀內嵌
+ *               resp.session.* 與 resp.device.fanouts）、Release -> POST
+ *               /interconnect/sessions/{id}/release-and-remove、renderIcDetail
+ *               新增 Apply 鈕 -> POST /interconnect/sessions/{id}/apply，皆經
+ *               icApiFetchAuthed() 帶 X-API-Token。Preview 維持唯讀不帶 token。
+ *               成功時於 detail 呈現 per-fanout 結果；401（ApiTokenError）清
+ *               token 並切回唯讀（共用 token.js 的 auth / applyWriteLock）。
  */
 
 "use strict";
@@ -51,7 +65,10 @@ var icState = {
     available: null,      /* GET /interconnect/resources/available */
     selectedId: null,     /* 選中的互聯 session_id，或 null */
     notConfigured: false, /* 404 無互聯區段 → 中性提示 */
-    loaded: false         /* 是否已做過首次載入（lazy load） */
+    loaded: false,        /* 是否已做過首次載入（lazy load） */
+    /* 最近一次互聯寫入動作（allocate-and-apply / apply）的 per-fanout 結果，供
+     * detail 面板呈現；{session_id, title, fanouts:[FanoutPushResult]}，或 null。 */
+    lastPush: null
 };
 
 /* ------------------------------------------------------------------ *
@@ -64,11 +81,20 @@ function IcApiError(type, message, status) {
     this.status = status;
 }
 
-function icApiFetch(method, url, body) {
+function icApiFetch(method, url, body, extraHeaders) {
     var opts = { method: method, headers: {} };
     if (body !== undefined && body !== null) {
         opts.headers["Content-Type"] = "application/json";
         opts.body = JSON.stringify(body);
+    }
+    /* 選用的額外 header（如寫入動作的 X-API-Token，見 icApiFetchAuthed）。 */
+    if (extraHeaders) {
+        var h;
+        for (h in extraHeaders) {
+            if (extraHeaders.hasOwnProperty(h)) {
+                opts.headers[h] = extraHeaders[h];
+            }
+        }
     }
     return fetch(url, opts).then(
         function (response) {
@@ -107,10 +133,52 @@ function icApiFetch(method, url, body) {
     );
 }
 
+/* icApiFetchAuthed：互聯寫入動作專用，額外帶 X-API-Token header（值取自記憶體內
+ * 的 auth 模組，見 token.js）。token 為空時仍送出空字串 header，後端以 401
+ * ApiTokenError 回應，由 icHandleWriteError 把 UI 轉回唯讀。 */
+function icApiFetchAuthed(method, url, body) {
+    return icApiFetch(method, url, body, { "X-API-Token": auth.getToken() });
+}
+
+/* icHandleWriteError：互聯寫入動作共用的 401 處理，與 app.js handleWriteError
+ * 同語意——ApiTokenError 時清 token、切回唯讀並清空頁首 token 欄位。 */
+function icHandleWriteError(err) {
+    if (err.type === "ApiTokenError") {
+        auth.clearToken();
+        applyWriteLock();
+        var input = document.getElementById("api-token");
+        if (input) {
+            input.value = "";
+        }
+        var stateEl = document.getElementById("token-state");
+        if (stateEl) {
+            stateEl.textContent = "Read-only";
+            stateEl.className = "";
+        }
+    }
+}
+
 /* 把後端錯誤 type 映射為英文友善文案（design §4.3）。err.type 為後端
  * exc.__class__.__name__ 的精確類別名；列舉已驗證的 type 並保留 default。 */
 function icFriendlyMessage(err) {
     switch (err.type) {
+        case "ApiTokenError":
+            /* 401：token 缺失或錯誤。icHandleWriteError 已清 token 並切回唯讀。 */
+            return "Invalid or missing token; writes are locked. Re-enter a "
+                + "valid X-API-Token to unlock.";
+        case "DevicePushDisabledError":
+            return "Device push is disabled on the server; write actions are "
+                + "unavailable.";
+        case "DriverConnectionError":
+        case "ApplyError":
+            return "Device push failed: " + (err.message
+                || "cannot reach the switch.");
+        case "DeviceTimeoutError":
+            return "Device timed out: " + (err.message || "the switch did not "
+                + "respond in time.");
+        case "ReadBackMismatchError":
+            return "Read-back mismatch after push: " + (err.message
+                || "the switch state does not match the request.");
         case "InterconnectNotConfiguredError":
             icState.notConfigured = true;
             return "This topology has no interconnect section.";
@@ -581,17 +649,77 @@ function renderIcDetail() {
     }
     el.appendChild(ul);
 
+    /* 寫入動作列：Apply 與 Release 皆帶 class "write-action"，由 body
+     * .writes-unlocked 閘控顯示（見 app.css）；空 token 時維持唯讀、兩鈕隱藏。 */
+    var actions = document.createElement("div");
+    actions.className = "ic-detail-actions";
+    actions.style.marginTop = "10px";
+
+    var applyBtn = document.createElement("button");
+    applyBtn.className = "primary write-action";
+    applyBtn.type = "button";
+    applyBtn.textContent = "Apply";
+    applyBtn.addEventListener("click", (function (id) {
+        return function () { applyIcSession(id); };
+    })(selected.session_id));
+    actions.appendChild(applyBtn);
+
     var releaseBtn = document.createElement("button");
-    /* class "write-action" 供 CSS 隱藏寫入按鈕用（見 app.css 的隱藏區段）；
-     * 邏輯與端點保留，日後要恢復只需刪掉該 CSS 規則。 */
     releaseBtn.className = "danger write-action";
     releaseBtn.type = "button";
     releaseBtn.textContent = "Release session";
-    releaseBtn.style.marginTop = "10px";
     releaseBtn.addEventListener("click", (function (id) {
         return function () { releaseIcSession(id); };
     })(selected.session_id));
-    el.appendChild(releaseBtn);
+    actions.appendChild(releaseBtn);
+    el.appendChild(actions);
+
+    /* 最近一次互聯寫入動作的 per-fanout 下發結果（僅成功時有；錯誤走 banner）。 */
+    if (icState.lastPush
+            && icState.lastPush.session_id === selected.session_id) {
+        el.appendChild(renderIcPushResult(icState.lastPush));
+    }
+}
+
+/* renderIcPushResult：把一次互聯寫入動作的 per-fanout 結果畫成清單（fanout /
+ * ports / verified / applied）。僅在 200 成功回應時呼叫；錯誤回應不帶 fanouts。 */
+function renderIcPushResult(push) {
+    var wrap = document.createElement("div");
+    wrap.className = "ic-push-result";
+    wrap.style.marginTop = "10px";
+
+    var head = document.createElement("p");
+    head.className = "ic-push-result-head";
+    head.textContent = push.title + " \u2014 per-fanout results:";
+    wrap.appendChild(head);
+
+    var fanouts = push.fanouts || [];
+    if (fanouts.length === 0) {
+        var none = document.createElement("p");
+        none.className = "empty";
+        none.textContent = "(no fanout changes)";
+        wrap.appendChild(none);
+        return wrap;
+    }
+
+    var ul = document.createElement("ul");
+    ul.className = "ic-push-fanout-list";
+    for (var i = 0; i < fanouts.length; i += 1) {
+        var fr = fanouts[i];
+        var readback = fr.readback || null;
+        var li = document.createElement("li");
+        li.textContent = fr.fanout
+            + " \u00b7 ports " + (fr.ports || []).join(", ")
+            + " \u00b7 " + (fr.ok ? "applied" : "failed")
+            + " \u00b7 "
+            + (readback
+                ? (readback.verified ? "verified" : "unverified")
+                    + " (" + readback.checked + " checked)"
+                : "no read-back");
+        ul.appendChild(li);
+    }
+    wrap.appendChild(ul);
+    return wrap;
 }
 
 function icAddDetailRow(dl, label, value) {
@@ -828,15 +956,29 @@ function allocateIcSession() {
     if (!body) {
         return;
     }
-    icApiFetch("POST", "/interconnect/sessions", body).then(
-        function () {
-            clearIcError();
-            icRefreshAll();
-        },
-        function (err) {
-            showIcError(err.type, icFriendlyMessage(err));
-        }
-    );
+    /* 寫入動作：建互聯帳本並下發到設備（allocate-and-apply，帶 X-API-Token）。
+     * 回應把帳本內嵌於 resp.session.*，per-fanout 於 resp.device.fanouts。 */
+    icApiFetchAuthed("POST", "/interconnect/sessions/allocate-and-apply", body)
+        .then(
+            function (resp) {
+                clearIcError();
+                var session = (resp && resp.session) || {};
+                var device = (resp && resp.device) || {};
+                if (session.session_id) {
+                    icState.selectedId = session.session_id;
+                    icState.lastPush = {
+                        session_id: session.session_id,
+                        title: "Allocated and applied",
+                        fanouts: device.fanouts || []
+                    };
+                }
+                icRefreshAll();
+            },
+            function (err) {
+                icHandleWriteError(err);
+                showIcError(err.type, icFriendlyMessage(err));
+            }
+        );
 }
 
 function previewIcSession() {
@@ -881,16 +1023,21 @@ function renderIcPreview(plan) {
 }
 
 function releaseIcSession(sessionId) {
-    icApiFetch("DELETE", "/interconnect/sessions/"
-            + encodeURIComponent(sessionId)).then(
+    /* 寫入動作：下發移除並清互聯帳本（release-and-remove，帶 X-API-Token）。 */
+    icApiFetchAuthed("POST", "/interconnect/sessions/"
+            + encodeURIComponent(sessionId) + "/release-and-remove", {}).then(
         function () {
             clearIcError();
             if (icState.selectedId === sessionId) {
                 icState.selectedId = null;
             }
+            if (icState.lastPush && icState.lastPush.session_id === sessionId) {
+                icState.lastPush = null;
+            }
             icRefreshAll();
         },
         function (err) {
+            icHandleWriteError(err);
             if (err.type === "InterconnectSessionNotFoundError") {
                 showIcError(err.type, "Session already gone; refreshing.");
                 if (icState.selectedId === sessionId) {
@@ -900,6 +1047,28 @@ function releaseIcSession(sessionId) {
             } else {
                 showIcError(err.type, icFriendlyMessage(err));
             }
+        }
+    );
+}
+
+/* applyIcSession：對既有互聯 session 重新下發（pure apply，帶 X-API-Token）。
+ * 回應為既有 IcPushResponse 形狀 {session_id, action:'apply', vlans, fanouts,
+ * notes}；成功時把 per-fanout 結果留在 detail 面板。 */
+function applyIcSession(sessionId) {
+    icApiFetchAuthed("POST", "/interconnect/sessions/"
+            + encodeURIComponent(sessionId) + "/apply", {}).then(
+        function (resp) {
+            clearIcError();
+            icState.lastPush = {
+                session_id: (resp && resp.session_id) || sessionId,
+                title: "Applied",
+                fanouts: (resp && resp.fanouts) || []
+            };
+            renderIcDetail();
+        },
+        function (err) {
+            icHandleWriteError(err);
+            showIcError(err.type, icFriendlyMessage(err));
         }
     );
 }

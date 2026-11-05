@@ -393,19 +393,54 @@ input[type="text"] {
 }
 
 /* ------------------------------------------------------------------ *
- * 暫時隱藏「寫入」按鈕（Allocate / Release），使 Web UI 實質為唯讀檢視。
+ * 寫入按鈕的可見性由 body.writes-unlocked class 閘控（FEAT-003）。
  *
- * 原因：Web UI 的 allocate/release 只改 JSON 帳本、不會下發到實體交換機，
- * 若與 CLI/REST 的實機下發並用會造成帳本與交換機狀態不一致。先隱藏這些按鈕，
- * 避免誤觸；底層 JS 邏輯與 REST 端點都保留未動。
- *
- * 日後若要恢復（例如 Web UI 接上帶認證的設備下發），直接刪除本區段即可，
- * 不需改任何 JS。涵蓋：打流 Allocate(#btn-allocate)、互聯 Allocate
- * (#ic-btn-allocate)、兩側動態建立的 Release 按鈕(.write-action)。
- * 互聯 Preview(#ic-btn-preview) 為唯讀預覽，保留不隱藏。
+ * 未填 token 時 body 沒有 writes-unlocked class，下列「寫入」按鈕一律隱藏，
+ * 版面與先前的唯讀檢視完全一致；於頁首 token 欄位填入 X-API-Token 後，
+ * token.js 的 applyWriteLock() 會加上 writes-unlocked class，這些規則即失效、
+ * 按鈕顯現。涵蓋：打流 Allocate(#btn-allocate)、互聯 Allocate
+ * (#ic-btn-allocate)、兩側動態建立的 Release / Apply 按鈕(.write-action)。
+ * 互聯 Preview(#ic-btn-preview) 為唯讀預覽，不受此閘控。
  * ------------------------------------------------------------------ */
-#btn-allocate,
-#ic-btn-allocate,
-.write-action {
+body:not(.writes-unlocked) #btn-allocate,
+body:not(.writes-unlocked) #ic-btn-allocate,
+body:not(.writes-unlocked) .write-action {
     display: none !important;
+}
+
+/* ---- 頁首 token 欄位（design §5、FEAT-003） ---- */
+
+#token-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+#api-token {
+    font: inherit;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: #fff;
+    width: 240px;
+}
+
+/* 唯讀/解鎖指示：預設唯讀（灰），解鎖時轉為綠色強調。 */
+#token-state {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+}
+
+#token-state.unlocked {
+    color: var(--gen);
+}
+
+/* 明文傳輸提醒：小字、次要色，不喧賓奪主。 */
+#token-note {
+    font-size: 11px;
+    color: var(--muted);
+    max-width: 260px;
+    line-height: 1.3;
 }

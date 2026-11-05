@@ -36,6 +36,15 @@ UI 路由唯讀、永不觸及 Phase 2 signal 檔鎖，故 TestClient 足矣（�
            那段）mirror 斷言，新增 icLinkLabelText 的 Python-mirror 測試（標籤
            含 VLAN、兩端 il_port 與 fanout port，且 fanout port 取自冒號後），
            並於 ic.js 結構斷言補 icLinkLabelText 函式名。
+  - 0.7.0  FEAT-003 前端 token 解鎖：ic.js 結構斷言由「禁用 X-API-Token /
+           setRequestHeader」翻為正面斷言（引用合併端點路徑字串且在寫入時帶
+           X-API-Token）；app.js 補 /sessions/allocate-and-apply 與 X-API-Token
+           正面斷言；index 版面補 token 欄位 marker（api-token / token-note /
+           token-state）；補 finding #5 斷言（預設 <body> 無 writes-unlocked
+           class、app.css 帶 body:not(.writes-unlocked) 隱藏規則）；新增
+           test_get_static_token_js（200、javascript、暴露 getToken/setToken/
+           clearToken/hasToken/applyWriteLock，且不含 localStorage/sessionStorage
+           /cookie）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -68,8 +77,16 @@ def test_get_index_html(api_client: Tuple[TestClient, Path]) -> None:
         "sel-dut",
         "session-list",
         "error-banner",
+        # FEAT-003：頁首 token 欄位 marker（填 token 才解鎖寫入動作，AC-1/AC-2）。
+        "api-token",
+        "token-note",
+        "token-state",
     ):
         assert marker in body, "index.html 缺 marker：{0}".format(marker)
+    # token.js 必須在 app.js / ic.js 之前載入（兩者呼叫 auth，AC-2）。
+    assert "/static/token.js" in body
+    assert body.index("/static/token.js") < body.index("/static/app.js")
+    assert body.index("/static/token.js") < body.index("/static/ic.js")
 
 
 def test_get_index_html_has_tab_markers(api_client: Tuple[TestClient, Path]) -> None:
@@ -116,9 +133,13 @@ def test_get_static_app_js(api_client: Tuple[TestClient, Path]) -> None:
     assert '"/resources/available"' in body
     assert '"/sessions"' in body
     assert '"POST"' in body
-    assert '"DELETE"' in body
+    # 讀取以 GET、寫入改用字面 POST 合併端點（不再用 DELETE，FEAT-003）。
     # BFS tier 函式名存在、且不以 role 決定分層（AC-3/AC-6）。
     assert "computeTiers" in body
+    # FEAT-003：打流寫入動作改接 token 保護的合併端點，寫入時帶 X-API-Token。
+    assert "/sessions/allocate-and-apply" in body
+    assert "/release-and-remove" in body
+    assert '"X-API-Token"' in body
     # 不得出現限制長度的 split 慣用法（會回 undefined，Finding 1）。
     assert "split(':', 1)" not in body
     assert "split(':',1)" not in body
@@ -147,24 +168,21 @@ def test_get_static_ic_js(api_client: Tuple[TestClient, Path]) -> None:
     assert '"/interconnect/resources/available"' in body
     assert '"/interconnect/sessions"' in body
     assert '"/interconnect/plan"' in body
-    # 字面 HTTP method（AC-3：由 §4.6 的字面 method call site 保證）。
+    # 字面 HTTP method（AC-3：寫入動作改用字面 POST 合併端點，不再用 DELETE）。
     assert '"POST"' in body
-    assert '"DELETE"' in body
     # 可抽出的純函式名存在（供 Python-mirror 測試對照）。
     assert "buildSessionDrawLinks" in body
     assert "icSessionMatchesFilter" in body
     # 連線標籤純函式（標籤帶兩端 fanout port，語意審查觀察第 1 項）。
     assert "icLinkLabelText" in body
-    # 不得呼叫任何會連設備的端點目標（apply / verify / park / release-device；
-    # 這些是帶 token 的 REST 或 CLI 的事，不出現在 Web UI 呼叫中）。亦不呼叫
-    # /interconnect/plan/park（park 計畫，Web UI 不用）或處理 X-API-Token。
-    assert "/interconnect/apply" not in body
-    assert "/interconnect/verify" not in body
-    assert "/interconnect/plan/park" not in body
-    assert "/interconnect/release-device" not in body
-    # 不設定 X-API-Token header（Web UI 不處理 token；bare 字樣僅出現在註解）。
-    assert '"X-API-Token"' not in body
-    assert "setRequestHeader" not in body
+    # FEAT-003：互聯寫入動作改接 token 保護的合併端點。正面斷言 ic.js 確實引用
+    # 這兩個合併端點路徑字串（allocate-and-apply 與 release-and-remove），
+    # 並於寫入時帶上 X-API-Token header（翻轉舊的「禁用」斷言，AC-3/AC-7）。
+    assert "/interconnect/sessions/allocate-and-apply" in body
+    assert "/release-and-remove" in body
+    assert '"X-API-Token"' in body
+    # Preview 仍為唯讀（不帶 token）：/interconnect/plan 端點字串仍在。
+    assert '"/interconnect/plan"' in body
     # 不得出現限制長度的 split 慣用法（JS limit 會丟掉 port 段，回 undefined）。
     assert "split(':', 1)" not in body
     assert "split(':',1)" not in body
@@ -187,6 +205,52 @@ def test_get_static_ic_css(api_client: Tuple[TestClient, Path]) -> None:
     response = client.get("/static/ic.css")
     assert response.status_code == 200
     assert "css" in response.headers["content-type"].lower()
+
+
+def test_get_static_token_js(api_client: Tuple[TestClient, Path]) -> None:
+    """GET /static/token.js 回 200、javascript，暴露 auth API 且不落地 token（FEAT-003）。"""
+    client, _ = api_client
+    response = client.get("/static/token.js")
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"].lower()
+
+    body = response.text
+    # auth 模組的公開 API 與共享的寫入鎖切換函式都存在。
+    for name in (
+        "getToken",
+        "setToken",
+        "clearToken",
+        "hasToken",
+        "applyWriteLock",
+    ):
+        assert name in body, "token.js 缺 {0}".format(name)
+    # token 絕不落地到任何瀏覽器儲存層（記憶體內、重整即失，AC-2）。
+    assert "localStorage" not in body
+    assert "sessionStorage" not in body
+    assert "cookie" not in body
+
+
+def test_index_default_read_only_and_css_gate(
+    api_client: Tuple[TestClient, Path]
+) -> None:
+    """finding #5：預設 <body> 無 writes-unlocked class，且 app.css 帶閘控隱藏規則。
+
+    服出去的 index.html 的 <body> 不帶 ``writes-unlocked`` class（空 token →
+    唯讀，與今日版面一致），而 app.css 以 ``body:not(.writes-unlocked) ... {
+    display:none !important }`` 把寫入按鈕隱藏（AC-1）。
+    """
+    client, _ = api_client
+    body = client.get("/").text
+    # 預設 <body> 不帶 writes-unlocked class（JS 僅在填 token 後才加上）。
+    assert 'class="writes-unlocked"' not in body
+    assert "writes-unlocked" not in body.split("<body", 1)[1].split(">", 1)[0]
+
+    css = client.get("/static/app.css").text
+    # app.css 以 body:not(.writes-unlocked) 閘控寫入按鈕，且用 display:none。
+    assert "body:not(.writes-unlocked)" in css
+    assert "display: none !important" in css
+    # 舊的「永久隱藏」規則已移除（不再無條件隱藏 #btn-allocate）。
+    assert "#btn-allocate,\n#ic-btn-allocate,\n.write-action {" not in css
 
 
 def test_static_missing_is_404(api_client: Tuple[TestClient, Path]) -> None:
