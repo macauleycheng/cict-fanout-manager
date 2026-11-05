@@ -54,8 +54,14 @@
     overflow: hidden;
 }
 
+/* hidden 的頁籤必須真正隱藏。注意 #tab-traffic / #tab-interconnect 是 ID
+ * 選擇器（specificity 1,0,0），會蓋過 class+attr 的 .tab-panel[hidden]
+ * （0,2,0），導致兩個 panel 同時顯示。這裡用同為 ID 級的選擇器並加
+ * !important，確保帶 hidden 屬性的頁籤容器一定被隱藏。 */
+#tab-traffic[hidden],
+#tab-interconnect[hidden],
 .tab-panel[hidden] {
-    display: none;
+    display: none !important;
 }
 
 #ic-topology-panel {
