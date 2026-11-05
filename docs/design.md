@@ -338,6 +338,43 @@ Pydantic、例外映射），不重寫配對、衝突與 VLAN 邏輯：
   `status_for` 以精確型別查表，故各子類皆顯式列出。
 - **版本**：新增端點屬 API 契約擴充，`_API_VERSION` 由 0.4.0 升為 0.5.0。
 
+### Web UI 互聯頁籤（純前端，只讀帳本）
+Web UI 由既有 `topo-manager-api` 以靜態資產 serve（`/static` 與 `GET /`）。版面
+改為**頁籤式**：共用頁首下方有「打流（traffic）」與「互聯（interconnect）」兩個
+互斥容器，預設顯示打流頁籤，切換純前端（顯示／隱藏、不重載）。打流頁籤為原本的
+單頁內容原封搬入，行為與外觀不變；互聯頁籤為新增。
+
+- **前端拆三支腳本（零 build）**：既有 `app.js`（打流）原樣不動；新增 `ic.js`
+  （互聯）與 `tabs.js`（極小頁籤切換控制器），各自在就緒時綁自己的元素，互不污染
+  （獨立的 `icState` 與 refresh）。樣式新增 `ic.css`，`app.css` 僅把 `#app` 的 grid
+  改為「頁首／頁籤列／單一頁籤容器」三列、原四 panel 的 grid 下移到 `#tab-traffic`。
+  三個新檔放 `static/` 同目錄即隨既有 `/static` mount 服出，不改 `ui.py` / `app.py`
+  的 Python 程式，不新增後端端點。
+- **只呼叫既有互聯帳本端點**：summary、resources/available、sessions（GET/POST）、
+  sessions/{id}（DELETE，ledger-only）、plan（預覽）。**不**呼叫任何會連設備的端點
+  （apply / verify / park / release-device），也不處理 `X-API-Token`；設備下發一律
+  留給帶 token 的 REST 或 CLI。
+- **互聯視覺化資料來源**：互聯沒有 generator→DUT 分層樹，不套用打流側的分層佈局，
+  改用「每組一張小圖」。節點（方形四角 d0..d3）來自 `GET /interconnect/summary`
+  的 `groups[].duts[]`（`label` d0..d3 與 DUT `name`）；選中／filter 到某 session 時
+  以 `GET /interconnect/sessions` 的 `links[]`（`vlan`、`a_dut`/`a_port`、
+  `b_dut`/`b_port`）把該 session 的每條 link 畫成兩 DUT 之間的連線，並標 VLAN 與兩端
+  il_port。節點與 link 資料一律來自這兩個端點，不臆造。
+- **建立表單兩種模式**：對應 `POST /interconnect/sessions` 的 `group`+`duts`+`profile`
+  或 `group`+`pairs`，二擇一；下拉只列當前可建資源（`resources/available` 的
+  `buildable_links` 與 summary）。建立成功後自動 refresh summary / list / available，
+  釋放後同樣 refresh。
+- **友善錯誤與降級**：解析 `{"error":{"type","message"}}`，涵蓋 400 / 409 / 404；
+  不冒原始 payload、不 crash。拓樸沒有互聯區段時（summary 回 404
+  `InterconnectNotConfiguredError`）互聯頁籤顯示中性提示「This topology has no
+  interconnect section.」而非紅 banner，打流頁籤完全不受影響。
+- **可測試性**：headless 無法開瀏覽器，改以「服出去的 JS 結構性斷言（六個互聯端點
+  目標、字面 POST/DELETE、純函式名、禁用 limit=1 的 split 慣用法）＋純函式
+  Python-mirror」守約；兩個純函式 `icSessionMatchesFilter`（清單 filter）與
+  `buildSessionDrawLinks`（把某 session 的 links 整理成要畫的連線集合，含
+  group 缺席 → `[]` 的 not-found 契約）以 `topology-interconnect-small.yaml` 的真實
+  session / summary 形狀做回歸。
+
 ### 設備下發 REST（API 0.6.0，預設關閉）
 在互聯 REST 之外，可選擇啟用 7 個會連線並寫入 fanout 的端點（端點與 CLI 對照見 §7.3）。
 啟用條件：`TOPO_MANAGER_ENABLE_DEVICE_PUSH=1` 且同時設定 `TOPO_MANAGER_API_TOKEN`；只接受 `1`，
@@ -516,6 +553,7 @@ port 回到測前狀態（4093 未被修改）。以 `pytest -s` 執行可印出
   也不驗證 `l2protocol-tunnel`。
 - 不使用 QinQ：QinQ access port 之間無法互通，且互聯 fanout 沒有 uplink port。
 - REST 僅做帳本層（見 §9「互聯 REST」），設備下發（apply / park / verify）僅限
-  CLI；沒有 Web UI 頁籤。
+  CLI 或帶 token 的 REST；Web UI 的互聯頁籤只讀帳本、不連設備（見 §9「Web UI
+  互聯頁籤」）。
 - 每個 port 需數次 `show` 讀回，大範圍 park 較慢，可用 `--fanout` / `--ports`
   縮小範圍。

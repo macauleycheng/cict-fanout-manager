@@ -662,9 +662,9 @@ skipping it).
 - Reading back a port takes a few `show` commands, so a large `park` takes
   time; use `--fanout` or `--ports` to narrow it.
 - Ledger operations (create/release/list/plan) are available over the
-  [REST API](#interconnect-endpoints); device push (`apply`, `park`,
-  `release --apply`, `verify`) stays **CLI-only**, and there is no Web UI tab
-  for interconnect.
+  [REST API](#interconnect-endpoints) and in the [Web UI](#web-ui)'s
+  Interconnect tab; device push (`apply`, `park`, `release --apply`, `verify`)
+  stays **CLI-only** (or token-guarded REST) and is never in the Web UI.
 
 ---
 
@@ -1202,9 +1202,19 @@ where `<host>`/`<port>` are `TOPO_MANAGER_HOST` / `TOPO_MANAGER_PORT` (default
 - `/` — the Web UI
 - `/docs` — the Swagger / OpenAPI documentation (see [Documentation](#documentation-openapi))
 
-### What it does
+### Layout: two tabs
 
-The UI is read-and-request oriented, mirroring what the REST API offers:
+The page is organized as two tabs under one shared header: a **Traffic** tab and
+an **Interconnect** tab. The Traffic tab is the original single page and is shown
+by default; the Interconnect tab is a ledger-only view of the interconnect
+fabric. Switching tabs is purely client-side (show/hide, no page reload). The
+header's Refresh / Auto-refresh controls apply to the Traffic tab; the
+Interconnect tab loads on first view and refreshes itself after create/release.
+
+### Traffic tab
+
+The Traffic tab is read-and-request oriented, mirroring what the traffic REST
+endpoints offer:
 
 - **Topology view** — renders the fabric as a layered graph (generators on the
   left, fanout tiers in the middle, DUTs on the right). The layering is derived
@@ -1225,20 +1235,60 @@ The UI is read-and-request oriented, mirroring what the REST API offers:
 - **Friendly errors** — API errors (e.g. a hard conflict on allocate) are shown
   as a readable banner rather than a raw status code or traceback.
 
-### Scope: five endpoints, no new backend
+### Interconnect tab
 
-The Web UI is a pure client of the **same five REST endpoints** documented in
+The Interconnect tab is a client of the **ledger-only** interconnect REST
+endpoints (`GET /interconnect/summary`, `GET /interconnect/resources/available`,
+`GET /interconnect/sessions`, `POST /interconnect/sessions`,
+`DELETE /interconnect/sessions/{id}`, and `POST /interconnect/plan` for a preview).
+It can see, build, and release interconnect sessions; it never pushes to a device.
+
+- **Interconnect topology** — interconnect has no generator→DUT tiering, so it is
+  drawn as **one small diagram per group**: a group's four DUTs (`d0`..`d3`) sit
+  at the four corners of a square, labeled with the DUT name and its `d0`..`d3`
+  slot. The nodes come from `GET /interconnect/summary`.
+- **Show a session's resources** — selecting (or filtering down to) an
+  interconnect session draws that session's links on its group's diagram. Each
+  drawn link is labeled with its **VLAN** and the il_port on each end, so you can
+  see which DUT il_port connects to which, over which VLAN. Link data comes from
+  `GET /interconnect/sessions`.
+- **Filter sessions** — a text box filters the interconnect session list by id,
+  group, profile, VLAN, DUT, or port.
+- **Create a session** — two modes matching `POST /interconnect/sessions`: a
+  **Profile** mode (pick a group, pick 2–4 DUTs in order, pick `mesh`/`line`/`ring`)
+  or a **Pairs** mode (pick a group, add explicit port pairs). The options list
+  **only currently buildable resources** (from `GET /interconnect/resources/available`
+  and the summary). A **Preview** button shows the plan without allocating.
+- **Release a session** — release the selected session from its detail panel.
+  This is **ledger-only**: it clears the session from the ledger but does not park
+  the device (device cleanup stays on the CLI).
+- **Friendly errors** — interconnect API errors (400 invalid request, 409 port
+  conflict or VLAN exhaustion, 404 session gone) are shown as a readable banner.
+  On a topology with no interconnect section the tab degrades gracefully to a
+  neutral "This topology has no interconnect section." note instead of an error.
+
+**No device push and no token in the Web UI.** Pushing interconnect config to the
+fanout switches (`apply` / `verify` / `park` / device-level `release`) is **not**
+in the Web UI — those are the job of the token-guarded REST endpoints or the CLI.
+The Web UI does not send `X-API-Token` and never triggers a write to a device.
+
+### Scope: existing endpoints only, no new backend
+
+The Web UI is a pure client of **existing REST endpoints** and adds no new
+backend logic and no new endpoints. The Traffic tab uses the five traffic
+endpoints documented in
 [Endpoints and curl examples](#endpoints-and-curl-examples) (`GET /topology`,
 `GET /resources/available`, `GET /sessions`, `POST /sessions`,
-`DELETE /sessions/{id}`). It adds no new backend logic and no new endpoints.
+`DELETE /sessions/{id}`). The Interconnect tab uses the ledger-only
+[interconnect endpoints](#interconnect-endpoints) (`summary`,
+`resources/available`, `sessions` GET/POST, `sessions/{id}` DELETE, and `plan`
+for a preview).
 
 Consequently, **pushing VLAN config to fanout switches** (`apply` / `verify` /
-`setup`) is **not** in the Web UI — those remain **CLI-only**, consistent with
+`setup` / `park`) is **not** in the Web UI — on both tabs those remain
+**CLI-only** (or token-guarded REST), consistent with
 [Two independent entry points](#two-independent-entry-points). The UI can show
-and request/release sessions, but device pushes stay on the CLI.
-The [interconnect endpoints](#interconnect-endpoints) are likewise not used by
-the UI: there is no interconnect tab, and the five endpoints above are the only
-ones the page calls.
+and request/release sessions, but device pushes stay off the Web UI.
 
 Writes triggered from the UI (allocate / release) go through the same POST /
 DELETE handlers as the REST API, so the main-thread deployment constraint and

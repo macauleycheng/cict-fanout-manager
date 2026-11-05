@@ -1,10 +1,14 @@
 <!DOCTYPE html>
 <!--
-  CICT Fanout Manager Web UI shell (design §3).
+  CICT Fanout Manager Web UI shell (design §5).
 
   Static shell with stable element ids that the acceptance tests assert on and
-  that app.js populates at runtime. Served verbatim via GET /. All dynamic
-  content is produced client-side by app.js calling the five JSON endpoints.
+  that app.js / ic.js populate at runtime. Served verbatim via GET /. The shared
+  header (#topbar) sits above a tab bar (#tabbar) that toggles two mutually
+  exclusive containers: the traffic tab (#tab-traffic, the original single page,
+  behaviour unchanged, shown by default) and the interconnect tab
+  (#tab-interconnect, hidden by default). Traffic content is produced by app.js;
+  interconnect content by ic.js; tabs.js is the tiny tab-switch controller.
   User-facing text is English (per design + README convention).
 -->
 <html lang="en">
@@ -13,6 +17,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CICT Fanout Manager</title>
     <link rel="stylesheet" href="/static/app.css">
+    <link rel="stylesheet" href="/static/ic.css">
 </head>
 <body>
     <div id="app">
@@ -28,49 +33,138 @@
             </label>
         </header>
 
-        <section id="topology-panel" class="panel">
-            <h2>Topology</h2>
-            <svg id="topology-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+        <nav id="tabbar">
+            <button id="tab-btn-traffic" class="tab-btn active" type="button"
+                    data-tab="traffic">Traffic</button>
+            <button id="tab-btn-interconnect" class="tab-btn" type="button"
+                    data-tab="interconnect">Interconnect</button>
+        </nav>
+
+        <!-- Traffic tab: the original single-page content, moved verbatim into
+             this container. Element ids and app.js behaviour are unchanged. -->
+        <section id="tab-traffic" class="tab-panel">
+            <section id="topology-panel" class="panel">
+                <h2>Topology</h2>
+                <svg id="topology-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+            </section>
+
+            <section id="create-panel" class="panel">
+                <h2>Create Session</h2>
+                <div class="field">
+                    <label for="sel-generator">Generator port</label>
+                    <select id="sel-generator">
+                        <option value="">Select a generator port&hellip;</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="sel-dut">DUT port</label>
+                    <select id="sel-dut">
+                        <option value="">Select a DUT port&hellip;</option>
+                    </select>
+                </div>
+                <button id="btn-allocate" class="primary" type="button" disabled>Allocate</button>
+            </section>
+
+            <section id="detail-panel" class="panel">
+                <h2>Session Detail</h2>
+                <div id="error-banner">
+                    <span class="type"></span>
+                    <span class="msg"></span>
+                    <button class="close" type="button" aria-label="Dismiss">&times;</button>
+                </div>
+                <div id="detail-content">
+                    <p class="empty">No session selected.</p>
+                </div>
+            </section>
+
+            <section id="sessions-panel" class="panel">
+                <h2>Sessions</h2>
+                <input id="session-filter" type="text" placeholder="Filter by id / VLAN / port&hellip;">
+                <ul id="session-list"></ul>
+            </section>
         </section>
 
-        <section id="create-panel" class="panel">
-            <h2>Create Session</h2>
-            <div class="field">
-                <label for="sel-generator">Generator port</label>
-                <select id="sel-generator">
-                    <option value="">Select a generator port&hellip;</option>
-                </select>
-            </div>
-            <div class="field">
-                <label for="sel-dut">DUT port</label>
-                <select id="sel-dut">
-                    <option value="">Select a DUT port&hellip;</option>
-                </select>
-            </div>
-            <button id="btn-allocate" class="primary" type="button" disabled>Allocate</button>
-        </section>
+        <!-- Interconnect tab: ledger-only interconnect view. One small diagram
+             per group; selecting a session draws that session's links with VLAN
+             and il_port labels. No device-push controls appear here. -->
+        <section id="tab-interconnect" class="tab-panel" hidden>
+            <section id="ic-topology-panel" class="panel">
+                <h2>Interconnect Topology</h2>
+                <div id="ic-topology">
+                    <p class="empty">Loading&hellip;</p>
+                </div>
+            </section>
 
-        <section id="detail-panel" class="panel">
-            <h2>Session Detail</h2>
-            <div id="error-banner">
-                <span class="type"></span>
-                <span class="msg"></span>
-                <button class="close" type="button" aria-label="Dismiss">&times;</button>
-            </div>
-            <div id="detail-content">
-                <p class="empty">No session selected.</p>
-            </div>
-        </section>
+            <section id="ic-create-panel" class="panel">
+                <h2>Create Interconnect Session</h2>
+                <div class="field">
+                    <span class="radio-group">
+                        <label>
+                            <input id="ic-mode-profile" type="radio" name="ic-mode" value="profile" checked>
+                            Profile
+                        </label>
+                        <label>
+                            <input id="ic-mode-pairs" type="radio" name="ic-mode" value="pairs">
+                            Pairs
+                        </label>
+                    </span>
+                </div>
+                <div class="field">
+                    <label for="ic-sel-group">Group</label>
+                    <select id="ic-sel-group">
+                        <option value="">Select a group&hellip;</option>
+                    </select>
+                </div>
+                <div id="ic-profile-fields">
+                    <div class="field">
+                        <label for="ic-sel-duts">DUTs (2&ndash;4, in order)</label>
+                        <select id="ic-sel-duts" multiple size="4"></select>
+                    </div>
+                    <div class="field">
+                        <label for="ic-sel-profile">Profile</label>
+                        <select id="ic-sel-profile">
+                            <option value="mesh">mesh</option>
+                            <option value="line">line</option>
+                            <option value="ring">ring</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="ic-pairs-fields" hidden>
+                    <label>Port pairs</label>
+                    <div id="ic-pairs-rows"></div>
+                    <button id="ic-add-pair" type="button">Add pair</button>
+                </div>
+                <div class="ic-create-actions">
+                    <button id="ic-btn-allocate" class="primary" type="button" disabled>Allocate</button>
+                    <button id="ic-btn-preview" type="button" disabled>Preview</button>
+                </div>
+            </section>
 
-        <section id="sessions-panel" class="panel">
-            <h2>Sessions</h2>
-            <input id="session-filter" type="text" placeholder="Filter by id / VLAN / port&hellip;">
-            <ul id="session-list"></ul>
+            <section id="ic-detail-panel" class="panel">
+                <h2>Interconnect Detail</h2>
+                <div id="ic-error-banner">
+                    <span class="type"></span>
+                    <span class="msg"></span>
+                    <button class="close" type="button" aria-label="Dismiss">&times;</button>
+                </div>
+                <div id="ic-detail-content">
+                    <p class="empty">No interconnect session selected.</p>
+                </div>
+            </section>
+
+            <section id="ic-sessions-panel" class="panel">
+                <h2>Interconnect Sessions</h2>
+                <input id="ic-session-filter" type="text"
+                       placeholder="Filter by id / group / profile / VLAN / port&hellip;">
+                <ul id="ic-session-list"></ul>
+            </section>
         </section>
     </div>
 
     <div id="tooltip"></div>
 
+    <script src="/static/tabs.js"></script>
     <script src="/static/app.js"></script>
+    <script src="/static/ic.js"></script>
 </body>
 </html>

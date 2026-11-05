@@ -41,16 +41,19 @@ h1 {
     margin: 0;
 }
 
-/* Overall grid: top bar spans full width; below it a two-column body with a
- * detail panel spanning the bottom. */
+/* Overall grid: top bar and tab bar span full width; below them a single tab
+ * container (#tab-traffic or #tab-interconnect) holds its own four-panel grid
+ * (that inner grid is defined in ic.css so the tabbing change stays minimal).
+ * The traffic panels keep their original grid-area names (topology / create /
+ * detail / sessions), which now resolve inside #tab-traffic's grid. */
 #app {
     display: grid;
-    grid-template-columns: 1fr 360px;
-    grid-template-rows: auto 1fr auto;
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto 1fr;
     grid-template-areas:
-        "topbar topbar"
-        "topology create"
-        "detail  sessions";
+        "topbar"
+        "tabbar"
+        "tabcontent";
     gap: 10px;
     padding: 10px;
     height: 100vh;

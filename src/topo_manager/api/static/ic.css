@@ -1,0 +1,313 @@
+/* CICT Fanout Manager Web UI 互聯頁籤樣式（design §5）。
+ *
+ * 互聯專屬樣式：每組一張小圖（.ic-group / .ic-node / .ic-edge）、互聯 banner、
+ * 互聯清單、建立表單的模式切換與 pair 列。色票沿用 app.css 的 :root 變數語彙。
+ * 頁籤列（#tabbar）與兩個 .tab-panel 容器的佈局在此定義。無 build；服出去的
+ * /static/ic.css。
+ */
+
+/* ---- 頁籤列與容器 ---- */
+
+#tabbar {
+    grid-area: tabbar;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+#tabbar .tab-btn {
+    border-radius: 7px 7px 0 0;
+    border-bottom: none;
+}
+
+#tabbar .tab-btn.active {
+    background: var(--gen);
+    color: #fff;
+    border-color: #1b5e20;
+}
+
+/* 打流頁籤容器：承載原本的四 panel grid（自 app.css 的 #app 下移）。 */
+#tab-traffic {
+    grid-area: tabcontent;
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    grid-template-rows: 1fr auto;
+    grid-template-areas:
+        "topology create"
+        "detail  sessions";
+    gap: 10px;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* 互聯頁籤容器：與打流頁籤結構對應的四區塊。 */
+#tab-interconnect {
+    grid-area: tabcontent;
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    grid-template-rows: 1fr auto;
+    grid-template-areas:
+        "ictopo  iccreate"
+        "icdetail icsessions";
+    gap: 10px;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.tab-panel[hidden] {
+    display: none;
+}
+
+#ic-topology-panel {
+    grid-area: ictopo;
+    overflow: auto;
+}
+
+#ic-create-panel {
+    grid-area: iccreate;
+}
+
+#ic-detail-panel {
+    grid-area: icdetail;
+}
+
+#ic-sessions-panel {
+    grid-area: icsessions;
+    display: flex;
+    flex-direction: column;
+}
+
+#ic-session-filter {
+    margin-bottom: 8px;
+}
+
+/* ---- 互聯拓樸：每組一張小圖 ---- */
+
+#ic-topology {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.ic-group {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+}
+
+.ic-group h3 {
+    font-size: 12px;
+    margin: 0 0 6px;
+    color: var(--muted);
+}
+
+.ic-group-svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    max-width: 360px;
+}
+
+.ic-node rect {
+    fill: var(--dut);
+    stroke: #263238;
+    stroke-width: 1.5;
+}
+
+.ic-node .ic-node-name {
+    font-size: 11px;
+    font-weight: 600;
+    fill: #fff;
+}
+
+.ic-node .ic-node-label {
+    font-size: 9px;
+    fill: #fff;
+    opacity: 0.85;
+}
+
+.ic-edge {
+    stroke: var(--line);
+    stroke-width: 1.6;
+    fill: none;
+}
+
+.ic-edge.active {
+    stroke: var(--active);
+    stroke-width: 2.4;
+}
+
+.ic-edge-label {
+    font-size: 9px;
+    fill: var(--active);
+}
+
+/* ---- 互聯清單 ---- */
+
+#ic-session-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow: auto;
+}
+
+#ic-session-list li {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+
+#ic-session-list li:hover {
+    background: #f5f7fa;
+}
+
+#ic-session-list li.selected {
+    border-color: var(--active);
+    background: #ffebee;
+}
+
+#ic-session-list .sid {
+    font-weight: 600;
+}
+
+#ic-session-list .meta {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* ---- 互聯 detail ---- */
+
+#ic-detail-content {
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+#ic-detail-content dl {
+    margin: 0 0 8px;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+}
+
+#ic-detail-content dt {
+    color: var(--muted);
+}
+
+#ic-detail-content dd {
+    margin: 0;
+    word-break: break-all;
+}
+
+.ic-link-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 12px;
+}
+
+.ic-link-list li {
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+    word-break: break-all;
+}
+
+.ic-preview-head {
+    font-weight: 600;
+    color: var(--muted);
+    margin: 0 0 6px;
+}
+
+/* ---- 建立表單 ---- */
+
+#ic-create-panel .field {
+    margin-bottom: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+#ic-create-panel label {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+#ic-create-panel .radio-group {
+    display: flex;
+    gap: 14px;
+}
+
+#ic-create-panel .radio-group label {
+    flex-direction: row;
+    align-items: center;
+    gap: 5px;
+    color: var(--text);
+}
+
+.ic-pair-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+    align-items: center;
+}
+
+.ic-pair-row select {
+    flex: 1;
+}
+
+.ic-pair-remove {
+    padding: 4px 8px;
+}
+
+#ic-add-pair {
+    margin-top: 4px;
+}
+
+.ic-create-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+/* ---- 互聯 banner ---- */
+
+#ic-error-banner {
+    display: none;
+    background: #ffebee;
+    border: 1px solid #ef9a9a;
+    color: #b71c1c;
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    font-size: 13px;
+    align-items: center;
+    gap: 10px;
+}
+
+#ic-error-banner.visible {
+    display: flex;
+}
+
+#ic-error-banner .msg {
+    flex: 1;
+}
+
+#ic-error-banner .type {
+    font-size: 11px;
+    color: var(--muted);
+}
+
+#ic-error-banner .close {
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: #b71c1c;
+    font-size: 16px;
+    padding: 0 4px;
+}
