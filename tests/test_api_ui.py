@@ -81,6 +81,8 @@ def test_get_index_html(api_client: Tuple[TestClient, Path]) -> None:
         "api-token",
         "token-note",
         "token-state",
+        # FEAT-003：打流頁籤的 group filter 下拉 marker。
+        "group-filter",
     ):
         assert marker in body, "index.html 缺 marker：{0}".format(marker)
     # token.js 必須在 app.js / ic.js 之前載入（兩者呼叫 auth，AC-2）。
@@ -140,6 +142,11 @@ def test_get_static_app_js(api_client: Tuple[TestClient, Path]) -> None:
     assert "/sessions/allocate-and-apply" in body
     assert "/release-and-remove" in body
     assert '"X-API-Token"' in body
+    # FEAT-003：group filter 連線（state.groups、GET /groups、renderGroupFilter、
+    # renderSessionList 的 group 過濾、detail 面板 Group 列）。
+    assert "state.groups" in body
+    assert '"/groups"' in body
+    assert "renderGroupFilter" in body
     # 不得出現限制長度的 split 慣用法（會回 undefined，Finding 1）。
     assert "split(':', 1)" not in body
     assert "split(':',1)" not in body
@@ -910,3 +917,125 @@ def test_build_session_draw_links_group_absent_returns_empty(
         for link in sessions[0]["links"]
     ]
     assert _build_session_draw_links(orphan, summary) == []
+
+
+# ----------------------------------------------------------------------
+# 打流 group filter 純函式 mirror 測試（FEAT-003）：以純 Python 複刻 app.js
+# renderSessionList 的過濾述詞 —— group filter（session.group === 選定組）與
+# 既有文字 filter（sessionMatchesFilter）做 AND。驗選組只留該組成員、選
+# "All groups"（空字串）還原全清單、且 group filter 與文字 filter 共存（AND）。
+# ----------------------------------------------------------------------
+
+
+def _session_matches_text_filter(session: dict, needle: str) -> bool:
+    """app.js sessionMatchesFilter 的 Python mirror（文字 filter）。
+
+    把 session 的 session_id / vlan / generator_port / dut_port 串接小寫後做
+    子字串比對；needle 為空字串時一律命中（與 JS 一致）。
+
+    參數：
+      - session：``GET /sessions`` 形狀的 session dict。
+      - needle：已 strip + lower 的 filter 字串。
+
+    回傳：
+      - 是否命中（bool）。
+    """
+    if not needle:
+        return True
+    hay = " ".join(
+        [
+            session.get("session_id") or "",
+            str(session.get("vlan")),
+            session.get("generator_port") or "",
+            session.get("dut_port") or "",
+        ]
+    ).lower()
+    return needle in hay
+
+
+def _session_list_filter(sessions, selected_group: str, needle: str):
+    """app.js renderSessionList 過濾述詞的 Python mirror（group AND 文字 filter）。
+
+    與 app.js 一致：``selected_group`` 非空時僅保留 ``session.group ==
+    selected_group`` 的成員；其後再 AND 既有文字 filter
+    （``_session_matches_text_filter``）。``selected_group`` 為空字串
+    （"All groups"）時不做 group 過濾。
+
+    參數：
+      - sessions：``GET /sessions`` 形狀的 session dict 清單。
+      - selected_group：#group-filter 的選值（空字串＝全部）。
+      - needle：已 strip + lower 的文字 filter 字串。
+
+    回傳：
+      - 通過過濾（保序）的 session dict 清單。
+    """
+    out = []
+    for session in sessions:
+        if selected_group and session.get("group") != selected_group:
+            continue
+        if not _session_matches_text_filter(session, needle):
+            continue
+        out.append(session)
+    return out
+
+
+def test_session_list_group_filter_mirror() -> None:
+    """group filter mirror：選組只留該組成員、選 All 還原、且與文字 filter AND（FEAT-003）。"""
+    sessions = [
+        {
+            "session_id": "s-0001",
+            "vlan": 100,
+            "generator_port": "ixia-1:ixia-1/1",
+            "dut_port": "dut-A1:Eth0",
+            "group": "T1",
+        },
+        {
+            "session_id": "s-0002",
+            "vlan": 101,
+            "generator_port": "ixia-1:ixia-1/2",
+            "dut_port": "dut-A2:Eth0",
+            "group": "T1",
+        },
+        {
+            "session_id": "s-0003",
+            "vlan": 102,
+            "generator_port": "trex-1:trex-1/0",
+            "dut_port": "dut-B1:Eth0",
+            "group": "T2",
+        },
+        {
+            "session_id": "s-0004",
+            "vlan": 103,
+            "generator_port": "trex-1:trex-1/1",
+            "dut_port": "dut-B2:Eth0",
+            "group": None,
+        },
+    ]
+
+    # 選 "All groups"（空字串）＋無文字 filter → 全清單還原。
+    assert _session_list_filter(sessions, "", "") == sessions
+
+    # 選 T1 → 僅留 group == "T1" 的兩筆（保序）。
+    t1 = _session_list_filter(sessions, "T1", "")
+    assert [s["session_id"] for s in t1] == ["s-0001", "s-0002"]
+
+    # 選 T2 → 僅留該組單筆。
+    t2 = _session_list_filter(sessions, "T2", "")
+    assert [s["session_id"] for s in t2] == ["s-0003"]
+
+    # 未分組（group=None）的 session 不會被任何非空選組命中。
+    assert _session_list_filter(sessions, "T1", "") == t1
+    assert all(s["group"] == "T1" for s in t1)
+
+    # group filter 與文字 filter 共存（AND）：選 T1 且文字 filter "s-0002"
+    # → 僅留同時符合兩者的單筆。
+    both = _session_list_filter(sessions, "T1", "s-0002")
+    assert [s["session_id"] for s in both] == ["s-0002"]
+
+    # AND 的互斥情形：選 T2 但文字 filter 指向 T1 的成員 → 空清單。
+    assert _session_list_filter(sessions, "T2", "s-0001") == []
+
+    # 不選組、只用文字 filter → 等同純文字 filter（跨組命中 VLAN 子字串）。
+    assert [s["session_id"] for s in _session_list_filter(sessions, "", "102")] == [
+        "s-0003"
+    ]

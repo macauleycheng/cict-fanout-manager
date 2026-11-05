@@ -11,6 +11,13 @@
  * GET /static/app.js. User-facing text is English.
  *
  * HISTORY:
+ *   - FEAT-003  Web UI group filter: add state.groups, a fourth concurrent
+ *               GET /groups in refreshAll (degrading like the other reads on
+ *               failure), renderGroupFilter() to (re)fill the #group-filter
+ *               dropdown preserving the current selection, a group predicate in
+ *               renderSessionList (session.group === selected AND the text
+ *               filter), a #group-filter 'change' binding, and a Group row in
+ *               the detail panel. allocateSession() is unchanged.
  *   - FEAT-003  Wire the Traffic tab's write actions to the token-guarded
  *               combined endpoints: Allocate -> POST /sessions/allocate-and-apply
  *               (reads the embedded resp.session.*), Release -> POST
@@ -57,6 +64,7 @@ function portOf(nodeId) {
 var state = {
     topology: null,        /* raw GET /topology payload */
     sessions: [],          /* raw GET /sessions .sessions list */
+    groups: [],            /* raw GET /groups .groups list（供 group-filter 下拉） */
     available: null,       /* raw GET /resources/available payload */
     selectedId: null,      /* currently highlighted session_id, or null */
     autoRefresh: false,    /* whether auto-refresh is currently enabled */
@@ -717,6 +725,7 @@ function renderDetail() {
 
     var dl = document.createElement("dl");
     addDetailRow(dl, "Session", selected.session_id);
+    addDetailRow(dl, "Group", selected.group || "(none)");
     addDetailRow(dl, "VLAN", String(selected.vlan));
     addDetailRow(dl, "Generator", selected.generator_port);
     addDetailRow(dl, "DUT", selected.dut_port);
@@ -836,10 +845,42 @@ function sessionMatchesFilter(session, needle) {
     return hay.indexOf(needle) !== -1;
 }
 
+/* renderGroupFilter：以 state.groups 重填 #group-filter 的選項。首項固定為
+ * "All groups"（value 空字串），其後每組一個以組名為 value/label 的選項。
+ * 重填前先記住目前選值，若該組仍存在則保留，否則退回 "All groups"（空字串）。 */
+function renderGroupFilter() {
+    var sel = document.getElementById("group-filter");
+    var prev = sel.value;
+    while (sel.firstChild) {
+        sel.removeChild(sel.firstChild);
+    }
+    var all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All groups";
+    sel.appendChild(all);
+
+    var groups = state.groups || [];
+    var stillExists = false;
+    for (var i = 0; i < groups.length; i += 1) {
+        var name = groups[i].name;
+        var opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+        if (name === prev) {
+            stillExists = true;
+        }
+    }
+    /* 保留先前選值（若該組仍在），否則退回 "All groups"。 */
+    sel.value = stillExists ? prev : "";
+}
+
 function renderSessionList() {
     var ul = document.getElementById("session-list");
     var needle = document.getElementById("session-filter").value
         .trim().toLowerCase();
+    /* group-filter 的選值（空字串＝全部）；與既有文字 filter 做 AND。 */
+    var selectedGroup = document.getElementById("group-filter").value;
     while (ul.firstChild) {
         ul.removeChild(ul.firstChild);
     }
@@ -847,6 +888,10 @@ function renderSessionList() {
     var shown = 0;
     for (var i = 0; i < state.sessions.length; i += 1) {
         var s = state.sessions[i];
+        /* group filter：非空時僅保留該組成員（session.group 相符）；再 AND 文字 filter。 */
+        if (selectedGroup && s.group !== selectedGroup) {
+            continue;
+        }
         if (!sessionMatchesFilter(s, needle)) {
             continue;
         }
@@ -1202,8 +1247,19 @@ function refreshAll() {
             showError(err.type, "Failed to load resources: " + friendlyMessage(err));
         }
     );
+    /* group filter 的資料來源（GET /groups）。讀取失敗比照 readFailed 降級：
+     * state.groups 退回空陣列（下拉落回「All groups」），且不鎖死 allocate 之外
+     * 的其他功能；allocate 的降級與其他讀取一致由 readFailed 統一處理。 */
+    var groupsP = apiFetch("GET", "/groups").then(
+        function (data) { state.groups = (data && data.groups) || []; },
+        function (err) {
+            readFailed = true;
+            state.groups = [];
+            showError(err.type, "Failed to load groups: " + friendlyMessage(err));
+        }
+    );
 
-    return Promise.all([topoP, sessP, availP]).then(function () {
+    return Promise.all([topoP, sessP, availP, groupsP]).then(function () {
         /* Preserve selection only if it still exists. */
         if (state.selectedId && !currentSelection()) {
             state.selectedId = null;
@@ -1211,6 +1267,7 @@ function refreshAll() {
         renderTopology();
         renderTopBar();
         renderCreateControls();
+        renderGroupFilter();
         renderSessionList();
         renderDetail();
         /* 任一讀取失敗時鎖住 allocate；renderCreateControls 內已依 available
@@ -1281,6 +1338,7 @@ function wire() {
     document.getElementById("sel-dut").addEventListener("change", updateAllocateEnabled);
     document.getElementById("btn-allocate").addEventListener("click", allocateSession);
     document.getElementById("session-filter").addEventListener("input", renderSessionList);
+    document.getElementById("group-filter").addEventListener("change", renderSessionList);
 
     var close = document.querySelector("#error-banner .close");
     if (close) {
