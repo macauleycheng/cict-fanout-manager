@@ -37,9 +37,15 @@ def _headers(server) -> dict:
 
 
 def _create_session(server) -> dict:
-    """先 POST 建 session（只動帳本），回傳其 JSON。"""
+    """先 POST 建 session（只動帳本），回傳其 JSON。
+
+    純帳本寫入自 Design 1 起需 token（啟用設備下發時 token 必設），故帶
+    ``X-API-Token``（值為 ``server.token``）。
+    """
     response = server.client.post(
-        "/sessions", json={"generator_port": _GENERATOR, "dut_port": _DUT_PORT}
+        "/sessions",
+        json={"generator_port": _GENERATOR, "dut_port": _DUT_PORT},
+        headers=_headers(server),
     )
     assert response.status_code == 201, response.text
     return response.json()

@@ -46,13 +46,15 @@ from __future__ import annotations
 
 from typing import Dict, List, Set
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Depends, Request, status
 
 from topo_manager.allocator import Allocator, Session
+from topo_manager.api.auth import require_ledger_write
 from topo_manager.api.deps import Settings, build_allocator, build_group_registry
 from topo_manager.api.schemas import (
     AvailableResourcesResponse,
     AllocateRequest,
+    CapabilitiesResponse,
     DutPortOut,
     GeneratorPortOut,
     SessionListResponse,
@@ -147,6 +149,29 @@ async def get_topology(request: Request) -> Topology:
 
 
 @router.get(
+    "/capabilities",
+    response_model=CapabilitiesResponse,
+    summary="回報寫入能力（設備下發開關、是否需 token、是否已解鎖），供 Web UI 決策。",
+)
+async def get_capabilities(request: Request) -> CapabilitiesResponse:
+    """回報 server 的寫入能力，供 Web UI 決定走哪組寫入端點與鎖狀態。
+
+    純讀 ``app.state.settings``，不碰 ledger、不連設備：
+
+    - device_push：``settings.enable_device_push`` 是否為真。
+    - write_requires_token：恆為 true（純帳本寫入亦以 token 閘控）。
+    - writes_unlocked：是否已設定 ``api_token``（未設即唯讀鎖住）。
+    """
+    settings: Settings = request.app.state.settings
+    has_token = settings.api_token is not None and settings.api_token != ""
+    return CapabilitiesResponse(
+        device_push=settings.enable_device_push is True,
+        write_requires_token=True,
+        writes_unlocked=has_token,
+    )
+
+
+@router.get(
     "/resources/available",
     response_model=AvailableResourcesResponse,
     summary="取得可用 generator / DUT port 清單（排除已佔用）。",
@@ -167,6 +192,7 @@ async def get_available_resources(request: Request) -> AvailableResourcesRespons
     response_model=SessionResponse,
     status_code=status.HTTP_201_CREATED,
     summary="分配一筆 session（含 VLAN 與路徑）。",
+    dependencies=[Depends(require_ledger_write)],
 )
 async def post_session(request: Request, body: AllocateRequest) -> SessionResponse:
     """分配一筆新 session 並回其摘要（設計 §5.3、AC-3）。
@@ -189,6 +215,7 @@ async def post_session(request: Request, body: AllocateRequest) -> SessionRespon
     "/sessions/{session_id}",
     response_model=SessionResponse,
     summary="釋放一筆既有 session（回被釋放 session 摘要）。",
+    dependencies=[Depends(require_ledger_write)],
 )
 async def delete_session(request: Request, session_id: str) -> SessionResponse:
     """釋放一筆既有 session 並回其摘要（設計 §5.4、AC-6）。

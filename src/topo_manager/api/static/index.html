@@ -75,6 +75,13 @@
                         <option value="">Select a DUT port&hellip;</option>
                     </select>
                 </div>
+                <div class="field">
+                    <label for="inp-group">Group (optional)</label>
+                    <input id="inp-group" type="text"
+                           list="group-names" autocomplete="off"
+                           placeholder="e.g. T1 (created if new)">
+                    <datalist id="group-names"></datalist>
+                </div>
                 <button id="btn-allocate" class="primary" type="button" disabled>Allocate</button>
             </section>
 

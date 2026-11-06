@@ -40,9 +40,10 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Query, Request, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from typing_extensions import Literal
 
+from topo_manager.api.auth import require_ledger_write
 from topo_manager.api.deps import Settings
 from topo_manager.api.ic_deps import build_ic_allocator
 from topo_manager.api.ic_schemas import (
@@ -307,6 +308,7 @@ async def list_ic_sessions(request: Request) -> IcSessionListResponse:
     status_code=status.HTTP_201_CREATED,
     summary="建立互聯 session（duts + profile，或明確 port 對；二選一）。",
     responses=_ERROR_RESPONSES,
+    dependencies=[Depends(require_ledger_write)],
 )
 async def create_ic_session(request: Request, body: IcAllocateRequest) -> IcSessionResponse:
     """建立互聯 session 並回每條 link 的 VLAN 與兩端 port（只動帳本，不連設備）。
@@ -328,6 +330,7 @@ async def create_ic_session(request: Request, body: IcAllocateRequest) -> IcSess
     response_model=IcSessionResponse,
     summary="釋放互聯 session（僅帳本層，等同 release --ledger-only；不連設備）。",
     responses=_ERROR_RESPONSES,
+    dependencies=[Depends(require_ledger_write)],
 )
 async def delete_ic_session(request: Request, session_id: str) -> IcSessionResponse:
     """自帳本移除 session（任何 phase 皆可）；設備未 park，回應帶 warning。"""

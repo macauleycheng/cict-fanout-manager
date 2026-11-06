@@ -48,6 +48,12 @@ import pytest
 # tests/conftest.py → 專案根為其父目錄的父目錄。
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# 純帳本寫入自 Design 1 起以 token 閘控（未設 TOPO_MANAGER_API_TOKEN → 403 唯讀）。
+# 寫入能力的測試 fixture 一律帶此預設 token，並讓 TestClient／httpx client 預設
+# 送出 X-API-Token，使既有 POST /sessions、DELETE /sessions/{id} 呼叫點不必逐一
+# 改寫即維持原語意。驗 401／403 的測試自行覆寫或移除此 header。
+_DEFAULT_TEST_TOKEN = "test-ledger-token"
+
 
 @pytest.fixture
 def examples_dir() -> Path:
@@ -97,8 +103,13 @@ def api_client(three_tier_path: Path, tmp_path: Path):
         state_path=str(state),
         vlan_min=100,
         vlan_max=3000,
+        api_token=_DEFAULT_TEST_TOKEN,
     )
-    return TestClient(create_app(settings)), state
+    # 預設帶 X-API-Token：純帳本寫入自 Design 1 起需 token；唯讀端點不受影響。
+    client = TestClient(
+        create_app(settings), headers={"X-API-Token": _DEFAULT_TEST_TOKEN}
+    )
+    return client, state
 
 
 class _LiveServer:
@@ -140,6 +151,8 @@ def _start_live_server(
     env["TOPO_MANAGER_STATE"] = str(state)
     env["TOPO_MANAGER_HOST"] = "127.0.0.1"
     env["TOPO_MANAGER_PORT"] = str(port)
+    # 純帳本寫入自 Design 1 起需 token：帶預設 token 並讓 client 預設送出。
+    env["TOPO_MANAGER_API_TOKEN"] = _DEFAULT_TEST_TOKEN
 
     proc = subprocess.Popen(
         [sys.executable, "-c", "from topo_manager.api.server import run; run()"],
@@ -149,7 +162,11 @@ def _start_live_server(
     )
 
     base_url = "http://127.0.0.1:{0}".format(port)
-    client = httpx.Client(base_url=base_url, timeout=10.0)
+    client = httpx.Client(
+        base_url=base_url,
+        timeout=10.0,
+        headers={"X-API-Token": _DEFAULT_TEST_TOKEN},
+    )
 
     # 等待就緒：輪詢 /openapi.json 直到可連線（最多約 15 秒）。
     deadline = time.time() + 15.0
@@ -209,6 +226,7 @@ _FAULTY_WRITE_SERVER_SCRIPT = (
     "    state_path=os.environ['TOPO_MANAGER_STATE'],\n"
     "    vlan_min=100,\n"
     "    vlan_max=3000,\n"
+    "    api_token=os.environ['TOPO_MANAGER_API_TOKEN'],\n"
     ")\n"
     "app = create_app(settings)\n"
     "\n"
@@ -244,6 +262,7 @@ def _start_faulty_write_live_server(
     env["TOPO_MANAGER_STATE"] = str(state)
     env["TOPO_MANAGER_HOST"] = "127.0.0.1"
     env["TOPO_MANAGER_PORT"] = str(port)
+    env["TOPO_MANAGER_API_TOKEN"] = _DEFAULT_TEST_TOKEN
 
     proc = subprocess.Popen(
         [sys.executable, "-c", _FAULTY_WRITE_SERVER_SCRIPT],
@@ -253,7 +272,11 @@ def _start_faulty_write_live_server(
     )
 
     base_url = "http://127.0.0.1:{0}".format(port)
-    client = httpx.Client(base_url=base_url, timeout=10.0)
+    client = httpx.Client(
+        base_url=base_url,
+        timeout=10.0,
+        headers={"X-API-Token": _DEFAULT_TEST_TOKEN},
+    )
 
     deadline = time.time() + 15.0
     ready = False
@@ -321,6 +344,8 @@ def _start_group_live_server(
     env["TOPO_MANAGER_GROUP_STATE"] = str(group_state)
     env["TOPO_MANAGER_HOST"] = "127.0.0.1"
     env["TOPO_MANAGER_PORT"] = str(port)
+    # 純帳本寫入自 Design 1 起需 token：群組寫入測試（POST /sessions 帶 group）亦然。
+    env["TOPO_MANAGER_API_TOKEN"] = _DEFAULT_TEST_TOKEN
 
     proc = subprocess.Popen(
         [sys.executable, "-c", "from topo_manager.api.server import run; run()"],
@@ -329,7 +354,11 @@ def _start_group_live_server(
         stderr=subprocess.STDOUT,
     )
     base_url = "http://127.0.0.1:{0}".format(port)
-    client = httpx.Client(base_url=base_url, timeout=10.0)
+    client = httpx.Client(
+        base_url=base_url,
+        timeout=10.0,
+        headers={"X-API-Token": _DEFAULT_TEST_TOKEN},
+    )
     deadline = time.time() + 15.0
     ready = False
     while time.time() < deadline:
@@ -393,8 +422,13 @@ def ic_api_client(ic_small_path: Path, tmp_path: Path):
         topology_path=str(ic_small_path),
         state_path=str(tmp_path / "state" / "allocations.json"),
         ic_state_path=str(ic_state),
+        api_token=_DEFAULT_TEST_TOKEN,
     )
-    return TestClient(create_app(settings)), ic_state
+    # 互聯帳本寫入亦以 token 閘控（require_ledger_write）：預設帶 X-API-Token。
+    client = TestClient(
+        create_app(settings), headers={"X-API-Token": _DEFAULT_TEST_TOKEN}
+    )
+    return client, ic_state
 
 
 @pytest.fixture
@@ -409,8 +443,11 @@ def ic_no_section_api_client(three_tier_path: Path, tmp_path: Path):
         topology_path=str(three_tier_path),
         state_path=str(tmp_path / "state" / "allocations.json"),
         ic_state_path=str(tmp_path / "state" / "interconnect.json"),
+        api_token=_DEFAULT_TEST_TOKEN,
     )
-    return TestClient(create_app(settings))
+    return TestClient(
+        create_app(settings), headers={"X-API-Token": _DEFAULT_TEST_TOKEN}
+    )
 
 
 def _start_ic_live_server(
@@ -435,6 +472,9 @@ def _start_ic_live_server(
     env["TOPO_MANAGER_IC_STATE"] = str(ic_state)
     env["TOPO_MANAGER_HOST"] = "127.0.0.1"
     env["TOPO_MANAGER_PORT"] = str(port)
+    # 純帳本寫入自 Design 1 起需 token：互聯 live-server 偶爾也會 POST /sessions
+    # （打流側共存測試）；互聯端點不檢查 token，多帶此 header 無害。
+    env.setdefault("TOPO_MANAGER_API_TOKEN", _DEFAULT_TEST_TOKEN)
     if extra_env:
         env.update(extra_env)
     proc = subprocess.Popen(
@@ -444,7 +484,11 @@ def _start_ic_live_server(
         stderr=subprocess.STDOUT,
     )
     base_url = "http://127.0.0.1:{0}".format(port)
-    client = httpx.Client(base_url=base_url, timeout=10.0)
+    client = httpx.Client(
+        base_url=base_url,
+        timeout=10.0,
+        headers={"X-API-Token": env["TOPO_MANAGER_API_TOKEN"]},
+    )
     deadline = time.time() + 15.0
     ready = False
     while time.time() < deadline:
@@ -647,7 +691,13 @@ def _start_push_live_server(
         stderr=subprocess.STDOUT,
     )
     base_url = "http://127.0.0.1:{0}".format(port)
-    client = httpx.Client(base_url=base_url, timeout=10.0)
+    # 啟用下發時 token 必設；帳本寫入（POST/DELETE）亦需 token，故 client 預設帶
+    # X-API-Token（值同 env 的 test-token-xyz）。各測試顯式帶的 header 會覆寫。
+    client = httpx.Client(
+        base_url=base_url,
+        timeout=10.0,
+        headers={"X-API-Token": "test-token-xyz"},
+    )
     deadline = time.time() + 15.0
     ready = False
     while time.time() < deadline:

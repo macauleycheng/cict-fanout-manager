@@ -54,6 +54,7 @@ from topo_manager.errors import (
     GroupMembershipError,
     GroupNotFoundError,
     HardConflictError,
+    WriteLockedError,
     InterconnectConflictError,
     InterconnectNotConfiguredError,
     InterconnectRequestError,
@@ -105,6 +106,8 @@ _STATUS_BY_EXC: Dict[Type[TopologyError], int] = {
     # 設備下發 REST（精確查表）。
     DevicePushDisabledError: 404,
     ApiTokenError: 401,
+    # 純帳本寫入未解鎖（未設 TOPO_MANAGER_API_TOKEN，唯讀模式）→ 403。
+    WriteLockedError: 403,
     DevicePushRequestError: 400,
     DriverConnectionError: 502,
     DeviceTimeoutError: 504,

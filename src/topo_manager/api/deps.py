@@ -174,8 +174,14 @@ class Settings:
         ic_vlan_max = cls._parse_vlan_env(_ENV_IC_VLAN_MAX, _DEFAULT_IC_VLAN_MAX)
 
         enable_device_push = cls._parse_enable_env()
-        # 未啟用時 token／credentials 變數被忽略（不影響既有行為）。
-        api_token = os.environ.get(_ENV_API_TOKEN) if enable_device_push else None
+        # api_token 不論是否啟用設備下發皆讀取：純帳本寫入端點
+        # （POST /sessions、DELETE /sessions/{id}）在未啟用下發時仍以此 token
+        # 閘控（有設 token 才解鎖寫入；未設則唯讀，見 auth.require_ledger_write）。
+        # 空字串正規化為 None（視同未設定）。
+        api_token = os.environ.get(_ENV_API_TOKEN)
+        if api_token == "":
+            api_token = None
+        # credentials 僅設備下發用，未啟用時忽略（不影響既有行為）。
         credentials_path = (
             os.environ.get(_ENV_CREDENTIALS) if enable_device_push else None
         )

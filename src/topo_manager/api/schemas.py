@@ -217,6 +217,30 @@ class AvailableResourcesResponse(BaseModel):
     occupied_ports: Dict[str, str]
 
 
+class CapabilitiesResponse(BaseModel):
+    """``GET /capabilities`` 的回應：供 Web UI 決定寫入路徑與鎖狀態。
+
+    Web UI 以此判斷 Allocate／Release 該打哪組端點、是否需要 token、是否全鎖：
+
+    欄位：
+      - device_push：是否啟用設備下發（``TOPO_MANAGER_ENABLE_DEVICE_PUSH=1``）。
+        為真時 UI 的 Allocate 走 ``allocate-and-apply``、Release 走
+        ``release-and-remove``（會連線並寫入 fanout）；為假時走純帳本
+        ``POST /sessions``／``DELETE /sessions/{id}``（不碰設備）。
+      - write_requires_token：寫入是否需要 ``X-API-Token``。目前恆為 true：
+        未設 token → 唯讀鎖住、設了 token → 需帶正確 token。
+      - writes_unlocked：server 端是否已具備解鎖寫入的條件（即已設定
+        ``TOPO_MANAGER_API_TOKEN``）。為 false 時任何寫入都會被 403 鎖住
+        （唯讀模式），UI 據此提示「唯讀：server 未設定 token」。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_push: bool
+    write_requires_token: bool
+    writes_unlocked: bool
+
+
 class ErrorDetail(BaseModel):
     """結構化錯誤的內層明細（設計 §6.1）。
 

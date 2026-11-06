@@ -31,7 +31,11 @@ import hmac
 
 from fastapi import Request
 
-from topo_manager.errors import ApiTokenError, DevicePushDisabledError
+from topo_manager.errors import (
+    ApiTokenError,
+    DevicePushDisabledError,
+    WriteLockedError,
+)
 
 # 驗證用 header 名稱。
 _TOKEN_HEADER = "X-API-Token"
@@ -65,6 +69,38 @@ async def require_api_token(request: Request) -> None:
       - ApiTokenError：header 缺漏或與設定的 token 不符。
     """
     expected = request.app.state.settings.api_token
+    provided = request.headers.get(_TOKEN_HEADER)
+    if provided is None:
+        raise ApiTokenError("缺少或錯誤的 X-API-Token")
+    if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+        raise ApiTokenError("缺少或錯誤的 X-API-Token")
+
+
+async def require_ledger_write(request: Request) -> None:
+    """純帳本寫入端點的 token 閘門（``POST /sessions``／``DELETE /sessions/{id}``）。
+
+    與設備下發的 ``require_api_token`` 不同，純帳本寫入不依賴
+    ``TOPO_MANAGER_ENABLE_DEVICE_PUSH``：
+
+    - 未設定 ``TOPO_MANAGER_API_TOKEN``（``api_token`` 為 None／空字串）→ 視為
+      唯讀模式，一律鎖住寫入，丟 ``WriteLockedError``（403）；此時不比對 header。
+    - 有設定 token → 驗 ``X-API-Token``，缺漏或不符丟 ``ApiTokenError``（401）。
+
+    比較使用 ``hmac.compare_digest``（定時間比較），輸入以 UTF-8 bytes 比較；
+    錯誤訊息不含任何 token 內容。
+
+    參數：
+      - request：進來的請求（取 header 與 ``app.state.settings``）。
+
+    例外：
+      - WriteLockedError：未設定 token（唯讀模式，寫入未解鎖）。
+      - ApiTokenError：有設定 token 但 header 缺漏或不符。
+    """
+    expected = request.app.state.settings.api_token
+    if expected is None or expected == "":
+        raise WriteLockedError(
+            "寫入未解鎖：未設定 TOPO_MANAGER_API_TOKEN（唯讀模式）"
+        )
     provided = request.headers.get(_TOKEN_HEADER)
     if provided is None:
         raise ApiTokenError("缺少或錯誤的 X-API-Token")

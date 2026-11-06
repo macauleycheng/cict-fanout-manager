@@ -66,6 +66,12 @@ var icState = {
     selectedId: null,     /* 選中的互聯 session_id，或 null */
     notConfigured: false, /* 404 無互聯區段 → 中性提示 */
     loaded: false,        /* 是否已做過首次載入（lazy load） */
+    /* GET /capabilities：{device_push, ...}。決定 Allocate／Release 走設備下發
+     * 合併端點或純帳本端點；讀取失敗時為 null，視同未啟用設備下發。 */
+    capabilities: null,
+    /* 最近一次 Preview 的計畫 {group, links}（供拓樸以虛線畫出）；無則 null。
+     * 選取 session、建立、釋放、重新整理、或改動建立表單時清除。 */
+    preview: null,
     /* 最近一次互聯寫入動作（allocate-and-apply / apply）的 per-fanout 結果，供
      * detail 面板呈現；{session_id, title, fanouts:[FanoutPushResult]}，或 null。 */
     lastPush: null
@@ -166,6 +172,10 @@ function icFriendlyMessage(err) {
             /* 401：token 缺失或錯誤。icHandleWriteError 已清 token 並切回唯讀。 */
             return "Invalid or missing token; writes are locked. Re-enter a "
                 + "valid X-API-Token to unlock.";
+        case "WriteLockedError":
+            /* 403：server 未設定 TOPO_MANAGER_API_TOKEN，寫入一律鎖住。 */
+            return "Writes are locked: the server has no TOPO_MANAGER_API_TOKEN "
+                + "configured (read-only mode).";
         case "DevicePushDisabledError":
             return "Device push is disabled on the server; write actions are "
                 + "unavailable.";
@@ -350,42 +360,29 @@ function icSvgEl(name, attrs) {
     return el;
 }
 
-/* 方形四角座標（d0 左上、d1 右上、d2 右下、d3 左下）。 */
+/* 互聯小圖版面：左欄為該組 DUT（由上而下排成一排），右側為該組的 fanout
+ * switch 方框；DUT 的 il_port 連到 fanout 方框左緣的 port，同一條 link 的兩個
+ * fanout port 在方框內以弧線相連並標 VLAN。 */
 var IC_LAYOUT = {
-    width: 320,
-    height: 220,
-    marginX: 60,
-    marginY: 50,
-    boxWidth: 100,
-    boxHeight: 44
+    width: 480,
+    minHeight: 150,
+    dutX: 10,          /* DUT 方框左緣 */
+    dutW: 100,
+    dutH: 48,
+    rowStep: 60,       /* 相鄰 DUT 的垂直間距 */
+    fanX: 280,         /* fanout 方框左緣（port 圓點所在） */
+    fanW: 190,
+    fanTop: 10,        /* fanout 方框上緣 */
+    portTop: 40,       /* 方框內第一個 port 離方框上緣的距離 */
+    portStep: 18,      /* 相鄰 port 的垂直間距 */
+    pairGap: 8,        /* 每兩個 port（一條 link）之間額外多留的間距 */
+    arcBase: 24        /* VLAN 弧線頂點離方框左緣的距離 */
 };
 
-function icCornerFor(label) {
-    var innerW = IC_LAYOUT.width - IC_LAYOUT.marginX * 2 - IC_LAYOUT.boxWidth;
-    var innerH = IC_LAYOUT.height - IC_LAYOUT.marginY * 2 - IC_LAYOUT.boxHeight;
-    switch (label) {
-        case "d0":
-            return { x: IC_LAYOUT.marginX, y: IC_LAYOUT.marginY };
-        case "d1":
-            return { x: IC_LAYOUT.marginX + innerW, y: IC_LAYOUT.marginY };
-        case "d2":
-            return {
-                x: IC_LAYOUT.marginX + innerW,
-                y: IC_LAYOUT.marginY + innerH
-            };
-        case "d3":
-            return { x: IC_LAYOUT.marginX, y: IC_LAYOUT.marginY + innerH };
-        default:
-            return null;
-    }
-}
-
-function icCenterOf(corner) {
-    return {
-        x: corner.x + IC_LAYOUT.boxWidth / 2,
-        y: corner.y + IC_LAYOUT.boxHeight / 2
-    };
-}
+/* 每條 link 的顏色（依序循環），線、弧與標籤同色，方便分辨哪兩端是同一條。 */
+var IC_LINK_COLORS = [
+    "#e65100", "#1565c0", "#2e7d32", "#6a1b9a", "#c62828", "#00838f"
+];
 
 /* ------------------------------------------------------------------ *
  * 互聯拓樸渲染（每組一張小圖，design §4.4/§4.6）。
@@ -425,9 +422,17 @@ function renderIcTopology() {
         return;
     }
 
+    /* 要畫的連線來源：選中的 session（實線）；沒有選中時，用最近一次 Preview
+     * 的計畫（虛線，尚未入帳）。 */
     var selected = currentIcSelection();
-    var drawLinks = selected
-        ? buildSessionDrawLinks(selected, icState.summary)
+    var source = selected;
+    var dashed = false;
+    if (!selected && icState.preview) {
+        source = icState.preview;
+        dashed = true;
+    }
+    var drawLinks = source
+        ? buildSessionDrawLinks(source, icState.summary)
         : [];
     /* 依組名歸類要畫的連線。 */
     var linksByGroup = {};
@@ -442,98 +447,211 @@ function renderIcTopology() {
     var groups = icState.summary.groups;
     for (var gi = 0; gi < groups.length; gi += 1) {
         container.appendChild(
-            renderIcGroup(groups[gi], linksByGroup[groups[gi].name] || [])
+            renderIcGroup(groups[gi], linksByGroup[groups[gi].name] || [], dashed)
         );
     }
 }
 
-function renderIcGroup(group, groupLinks) {
+/* icLinkOrderedPorts(links)：回傳被用到的 fanout port（去重），依 link 順序
+ * 兩兩相鄰排列（同一條 link 的兩個 port 上下相鄰），讓每條 link 的 VLAN 弧線
+ * 很短且彼此不巢狀。 */
+function icLinkOrderedPorts(links) {
+    var seen = {};
+    var ports = [];
+    for (var i = 0; i < links.length; i += 1) {
+        var two = [links[i].aFanout, links[i].bFanout];
+        for (var k = 0; k < two.length; k += 1) {
+            if (!seen.hasOwnProperty(two[k])) {
+                seen[two[k]] = true;
+                ports.push(two[k]);
+            }
+        }
+    }
+    return ports;
+}
+
+/* icDutIndex：DUT 名在該組 duts[] 的順序（找不到回 -1）。 */
+function icDutIndex(duts, name) {
+    for (var i = 0; i < duts.length; i += 1) {
+        if (duts[i].name === name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* icAddText：建立一個帶外框白邊（halo）的 SVG 文字，疊在線上仍可讀。 */
+function icAddText(parent, cls, x, y, anchor, fill, text) {
+    var t = icSvgEl("text", {
+        "class": cls, x: x, y: y, "text-anchor": anchor, fill: fill
+    });
+    t.textContent = text;
+    parent.appendChild(t);
+    return t;
+}
+
+/* renderIcGroup(group, groupLinks, dashed)：畫一個互聯群組。
+ * 左：該組 DUT 排成一排；右：fanout switch。groupLinks 為
+ * buildSessionDrawLinks 的輸出（空陣列＝只畫靜態的 DUT 與 fanout）。
+ * dashed 為真時連線用虛線（預覽，尚未入帳）。 */
+function renderIcGroup(group, groupLinks, dashed) {
     var wrap = document.createElement("div");
     wrap.className = "ic-group";
 
-    var title = document.createElement("h3");
-    title.textContent = group.name + " \u00b7 fanout " + group.fanout
+    var heading = document.createElement("h3");
+    heading.textContent = group.name + " \u00b7 fanout " + group.fanout
         + " \u00b7 rack " + group.rack;
-    wrap.appendChild(title);
+    wrap.appendChild(heading);
+
+    var duts = group.duts || [];
+    var ports = icLinkOrderedPorts(groupLinks);
+    var L = IC_LAYOUT;
+
+    /* fanout port 的 y 座標：依 link 順序由上而下，每兩個（一條 link）為一對，
+     * 對與對之間多留一點間距。 */
+    var portY = {};
+    for (var p = 0; p < ports.length; p += 1) {
+        portY[ports[p]] = L.fanTop + L.portTop
+            + p * L.portStep + Math.floor(p / 2) * L.pairGap;
+    }
+
+    /* 高度：同時容得下 DUT 一排與 fanout 方框內所有被用到的 port。 */
+    var dutsTotal = Math.max(duts.length - 1, 0) * L.rowStep + L.dutH;
+    var lastPortY = ports.length > 0
+        ? portY[ports[ports.length - 1]] : L.fanTop + L.portTop;
+    var fanH = Math.max(lastPortY - L.fanTop + 16, dutsTotal + 20,
+        L.minHeight - 2 * L.fanTop);
+    var height = fanH + 2 * L.fanTop;
+    var dutTop = (height - dutsTotal) / 2;
 
     var svg = icSvgEl("svg", {
         "class": "ic-group-svg",
-        viewBox: "0 0 " + IC_LAYOUT.width + " " + IC_LAYOUT.height,
+        viewBox: "0 0 " + L.width + " " + height,
         xmlns: IC_SVG_NS
     });
-
     var edgeGroup = icSvgEl("g", { "class": "ic-edges" });
     var nodeGroup = icSvgEl("g", { "class": "ic-nodes" });
+
+    /* fanout switch 方框（先畫，連線蓋在上面）。 */
+    var fan = icSvgEl("g", { "class": "ic-fanout" });
+    fan.appendChild(icSvgEl("rect", {
+        x: L.fanX, y: L.fanTop, width: L.fanW, height: fanH, rx: 8, ry: 8
+    }));
+    icAddText(fan, "ic-fanout-name", L.fanX + L.fanW / 2, L.fanTop + 18,
+        "middle", "#fff", group.fanout);
+    svg.appendChild(fan);
     svg.appendChild(edgeGroup);
     svg.appendChild(nodeGroup);
 
-    /* 連線先畫，節點後畫（節點蓋在線上）。 */
+    /* 每條 link 有兩個「端」（DUT il_port → fanout port）。先蒐集，再依 DUT 分
+     * 組，把同一台 DUT 的出線點沿方框右緣分散開（並依目標 port 的高度排序，
+     * 避免線在 DUT 邊上互相交叉）。 */
+    var linkEnds = [];
+    var endsByDut = {};
     for (var i = 0; i < groupLinks.length; i += 1) {
         var dl = groupLinks[i];
-        var cornerA = icCornerFor(dl.aLabel);
-        var cornerB = icCornerFor(dl.bLabel);
-        if (!cornerA || !cornerB) {
+        var ia = icDutIndex(duts, dl.aDut);
+        var ib = icDutIndex(duts, dl.bDut);
+        if (ia < 0 || ib < 0 || !portY.hasOwnProperty(dl.aFanout)
+                || !portY.hasOwnProperty(dl.bFanout)) {
             continue;
         }
-        var ca = icCenterOf(cornerA);
-        var cb = icCenterOf(cornerB);
-        edgeGroup.appendChild(icSvgEl("line", {
-            "class": "ic-edge active",
-            x1: ca.x, y1: ca.y, x2: cb.x, y2: cb.y
-        }));
-        /* 兩行標籤：第一行 VLAN、第二行兩端 "il_port @ fanout"（含 fanout
-         * port），以 <tspan> 分行避免單行過長而擁擠（語意審查觀察第 1 項）。 */
-        var labelXy = {
-            x: (ca.x + cb.x) / 2,
-            y: (ca.y + cb.y) / 2 - 4
-        };
-        var labelText = icLinkLabelText(dl);
-        var label = icSvgEl("text", {
-            "class": "ic-edge-label",
-            x: labelXy.x,
-            y: labelXy.y,
-            "text-anchor": "middle"
-        });
-        var topSpan = icSvgEl("tspan", { x: labelXy.x, dy: "0" });
-        topSpan.textContent = labelText.top;
-        var bottomSpan = icSvgEl("tspan", { x: labelXy.x, dy: "10" });
-        bottomSpan.textContent = labelText.bottom;
-        label.appendChild(topSpan);
-        label.appendChild(bottomSpan);
-        edgeGroup.appendChild(label);
+        linkEnds.push({ link: i, dl: dl, ia: ia, ib: ib });
+        var pair = [
+            { link: i, idx: ia, port: dl.aPort, fport: dl.aFanout },
+            { link: i, idx: ib, port: dl.bPort, fport: dl.bFanout }
+        ];
+        for (var e = 0; e < pair.length; e += 1) {
+            if (!endsByDut[pair[e].idx]) {
+                endsByDut[pair[e].idx] = [];
+            }
+            endsByDut[pair[e].idx].push(pair[e]);
+        }
+    }
+    var anchorOf = {};   /* "<link>:<fport>" -> DUT 端出線點 {x, y} */
+    var dutKey;
+    for (dutKey in endsByDut) {
+        if (endsByDut.hasOwnProperty(dutKey)) {
+            var list = endsByDut[dutKey];
+            list.sort(function (m, n) { return portY[m.fport] - portY[n.fport]; });
+            var top0 = dutTop + Number(dutKey) * L.rowStep;
+            for (var k = 0; k < list.length; k += 1) {
+                anchorOf[list[k].link + ":" + list[k].fport] = {
+                    x: L.dutX + L.dutW,
+                    y: top0 + L.dutH * (k + 1) / (list.length + 1)
+                };
+            }
+        }
     }
 
-    /* 節點（方形四角）。 */
-    var duts = group.duts || [];
+    /* 連線：每條 link 兩段（DUT il_port → fanout port），兩個 fanout port 在
+     * 方框內以短弧線相連並標 VLAN。顏色用 inline style（CSS 的 .ic-edge.active
+     * 會蓋過 stroke 屬性）。 */
+    for (var n = 0; n < linkEnds.length; n += 1) {
+        var le = linkEnds[n];
+        var color = IC_LINK_COLORS[le.link % IC_LINK_COLORS.length];
+        var cls = "ic-edge active" + (dashed ? " preview" : "");
+        var lineStyle = "stroke:" + color;
+        var g = icSvgEl("g", { "class": "ic-link" });
+        var tip = icLinkLabelText(le.dl);
+        var tipEl = icSvgEl("title");
+        tipEl.textContent = tip.top + ": " + tip.bottom;
+        g.appendChild(tipEl);
+
+        var ends = [
+            { port: le.dl.aPort, fport: le.dl.aFanout },
+            { port: le.dl.bPort, fport: le.dl.bFanout }
+        ];
+        for (var m = 0; m < ends.length; m += 1) {
+            var from = anchorOf[le.link + ":" + ends[m].fport];
+            var toY = portY[ends[m].fport];
+            g.appendChild(icSvgEl("line", {
+                "class": cls, style: lineStyle,
+                x1: from.x, y1: from.y, x2: L.fanX, y2: toY
+            }));
+            /* DUT 端 il_port 標籤：貼在出線點右側。 */
+            icAddText(g, "ic-edge-label", from.x + 5, from.y - 2,
+                "start", color, ends[m].port);
+        }
+
+        /* fanout 內的 VLAN 短弧線：連接同一條 link 的兩個 fanout port。 */
+        var ya = portY[le.dl.aFanout];
+        var yb = portY[le.dl.bFanout];
+        var apexX = L.fanX + L.arcBase;
+        var ctrl = (apexX - L.fanX) / 0.75;
+        g.appendChild(icSvgEl("path", {
+            "class": cls, style: lineStyle,
+            d: "M " + L.fanX + " " + ya + " C " + (L.fanX + ctrl) + " " + ya
+                + " " + (L.fanX + ctrl) + " " + yb + " " + L.fanX + " " + yb
+        }));
+        icAddText(g, "ic-edge-label", apexX + 6, (ya + yb) / 2 + 3,
+            "start", color, tip.top);
+        edgeGroup.appendChild(g);
+    }
+
+    /* fanout port 圓點與編號（畫在線之上）。 */
+    for (var q = 0; q < ports.length; q += 1) {
+        var py = portY[ports[q]];
+        nodeGroup.appendChild(icSvgEl("circle", {
+            "class": "ic-port", cx: L.fanX, cy: py, r: 3
+        }));
+        icAddText(nodeGroup, "ic-port-label", L.fanX - 6, py - 4,
+            "end", "#455a64", "p" + ports[q]);
+    }
+
+    /* DUT 方框（左欄，由上而下）。 */
     for (var j = 0; j < duts.length; j += 1) {
         var dut = duts[j];
-        var corner = icCornerFor(dut.label);
-        if (!corner) {
-            continue;
-        }
-        var g = icSvgEl("g", { "class": "ic-node" });
-        g.appendChild(icSvgEl("rect", {
-            x: corner.x, y: corner.y,
-            width: IC_LAYOUT.boxWidth, height: IC_LAYOUT.boxHeight,
-            rx: 8, ry: 8
+        var top = dutTop + j * L.rowStep;
+        var node = icSvgEl("g", { "class": "ic-node" });
+        node.appendChild(icSvgEl("rect", {
+            x: L.dutX, y: top, width: L.dutW, height: L.dutH, rx: 8, ry: 8
         }));
-        var nameText = icSvgEl("text", {
-            "class": "ic-node-name",
-            x: corner.x + IC_LAYOUT.boxWidth / 2,
-            y: corner.y + 19,
-            "text-anchor": "middle"
-        });
-        nameText.textContent = dut.name;
-        g.appendChild(nameText);
-        var labelText = icSvgEl("text", {
-            "class": "ic-node-label",
-            x: corner.x + IC_LAYOUT.boxWidth / 2,
-            y: corner.y + 34,
-            "text-anchor": "middle"
-        });
-        labelText.textContent = dut.label;
-        g.appendChild(labelText);
-        nodeGroup.appendChild(g);
+        icAddText(node, "ic-node-name", L.dutX + L.dutW / 2, top + 20,
+            "middle", "#fff", dut.name);
+        icAddText(node, "ic-node-label", L.dutX + L.dutW / 2, top + 35,
+            "middle", "#fff", dut.label);
+        nodeGroup.appendChild(node);
     }
 
     wrap.appendChild(svg);
@@ -599,6 +717,7 @@ function renderIcSessionList() {
 }
 
 function selectIcSession(sessionId) {
+    icState.preview = null;
     if (icState.selectedId === sessionId) {
         icState.selectedId = null;
     } else {
@@ -655,14 +774,18 @@ function renderIcDetail() {
     actions.className = "ic-detail-actions";
     actions.style.marginTop = "10px";
 
-    var applyBtn = document.createElement("button");
-    applyBtn.className = "primary write-action";
-    applyBtn.type = "button";
-    applyBtn.textContent = "Apply";
-    applyBtn.addEventListener("click", (function (id) {
-        return function () { applyIcSession(id); };
-    })(selected.session_id));
-    actions.appendChild(applyBtn);
+    /* Apply 走 /interconnect/sessions/{id}/apply，只有啟用設備下發時才存在；
+     * 未啟用時不顯示，避免點了得 404。 */
+    if (icIsDevicePush()) {
+        var applyBtn = document.createElement("button");
+        applyBtn.className = "primary write-action";
+        applyBtn.type = "button";
+        applyBtn.textContent = "Apply";
+        applyBtn.addEventListener("click", (function (id) {
+            return function () { applyIcSession(id); };
+        })(selected.session_id));
+        actions.appendChild(applyBtn);
+    }
 
     var releaseBtn = document.createElement("button");
     releaseBtn.className = "danger write-action";
@@ -916,6 +1039,11 @@ function icBuildRequestBody() {
 }
 
 function icUpdateCreateEnabled() {
+    /* 表單一有變動（或重新整理重建控件），先前的預覽就過時了：清掉並重畫。 */
+    if (icState.preview) {
+        icState.preview = null;
+        renderIcTopology();
+    }
     var ok = icBuildRequestBody() !== null && !icState.notConfigured;
     document.getElementById("ic-btn-allocate").disabled = !ok;
     document.getElementById("ic-btn-preview").disabled = !ok;
@@ -956,21 +1084,29 @@ function allocateIcSession() {
     if (!body) {
         return;
     }
-    /* 寫入動作：建互聯帳本並下發到設備（allocate-and-apply，帶 X-API-Token）。
-     * 回應把帳本內嵌於 resp.session.*，per-fanout 於 resp.device.fanouts。 */
-    icApiFetchAuthed("POST", "/interconnect/sessions/allocate-and-apply", body)
+    /* 啟用設備下發：建互聯帳本並下發到設備（allocate-and-apply，帶 X-API-Token），
+     * 回應把帳本內嵌於 resp.session.*，per-fanout 於 resp.device.fanouts。
+     * 未啟用：只動帳本（POST /interconnect/sessions），回應為平鋪 session，
+     * 不碰任何設備。 */
+    var pushOn = icIsDevicePush();
+    var url = pushOn
+        ? "/interconnect/sessions/allocate-and-apply"
+        : "/interconnect/sessions";
+    icApiFetchAuthed("POST", url, body)
         .then(
             function (resp) {
                 clearIcError();
-                var session = (resp && resp.session) || {};
+                var session = pushOn ? ((resp && resp.session) || {}) : (resp || {});
                 var device = (resp && resp.device) || {};
                 if (session.session_id) {
                     icState.selectedId = session.session_id;
-                    icState.lastPush = {
-                        session_id: session.session_id,
-                        title: "Allocated and applied",
-                        fanouts: device.fanouts || []
-                    };
+                    if (pushOn) {
+                        icState.lastPush = {
+                            session_id: session.session_id,
+                            title: "Allocated and applied",
+                            fanouts: device.fanouts || []
+                        };
+                    }
                 }
                 icRefreshAll();
             },
@@ -990,6 +1126,12 @@ function previewIcSession() {
         function (plan) {
             clearIcError();
             renderIcPreview(plan);
+            /* 預覽取代目前選取：拓樸改以虛線畫出此 profile 的接法。 */
+            var pv = plan && plan.preview;
+            icState.selectedId = null;
+            icState.preview = pv ? { group: pv.group, links: pv.links || [] } : null;
+            renderIcTopology();
+            renderIcSessionList();
         },
         function (err) {
             showIcError(err.type, icFriendlyMessage(err));
@@ -1022,10 +1164,21 @@ function renderIcPreview(plan) {
     el.appendChild(ul);
 }
 
+/* icIsDevicePush：server 是否啟用設備下發（取自 GET /capabilities）。
+ * capabilities 尚未載入或讀取失敗時回 false（走純帳本端點，不連設備）。 */
+function icIsDevicePush() {
+    return !!(icState.capabilities && icState.capabilities.device_push === true);
+}
+
 function releaseIcSession(sessionId) {
-    /* 寫入動作：下發移除並清互聯帳本（release-and-remove，帶 X-API-Token）。 */
-    icApiFetchAuthed("POST", "/interconnect/sessions/"
-            + encodeURIComponent(sessionId) + "/release-and-remove", {}).then(
+    /* 啟用設備下發：撤設備並清帳本（POST release-and-remove）；未啟用：只清帳本
+     * （DELETE /interconnect/sessions/{id}）。兩者皆帶 X-API-Token。 */
+    var sid = encodeURIComponent(sessionId);
+    var req = icIsDevicePush()
+        ? icApiFetchAuthed("POST", "/interconnect/sessions/" + sid
+            + "/release-and-remove", {})
+        : icApiFetchAuthed("DELETE", "/interconnect/sessions/" + sid);
+    req.then(
         function () {
             clearIcError();
             if (icState.selectedId === sessionId) {
@@ -1139,7 +1292,14 @@ function icRefreshAll() {
         }
     );
 
-    return Promise.all([sumP, sessP, availP]).then(function () {
+    /* 寫入能力（GET /capabilities）：失敗時退回 null（視同未啟用設備下發），
+     * 不算 readFailed，以免舊版 server 沒有此端點時鎖死 allocate。 */
+    var capP = icApiFetch("GET", "/capabilities").then(
+        function (data) { icState.capabilities = data || null; },
+        function () { icState.capabilities = null; }
+    );
+
+    return Promise.all([sumP, sessP, availP, capP]).then(function () {
         icState.loaded = true;
         if (icState.notConfigured) {
             /* 無互聯區段：中性提示、清狀態、不紅 banner。 */

@@ -371,13 +371,16 @@ def test_write_path_unexpected_500_lock_released(
     # 觸發 ReadError（與鎖無關的連線重用假象），每個請求用 ``Connection: close``
     # 並以獨立 client 送出，確保每次都是全新連線。
     base_url = faulty_write_live_server.base_url
+    # 純帳本寫入自 Design 1 起需 token：本測試自建 client（未套 fixture 預設
+    # header），故 POST 需顯式帶 X-API-Token（值同 conftest._DEFAULT_TEST_TOKEN）。
     close_headers = {"Connection": "close"}
+    write_headers = {"Connection": "close", "X-API-Token": "test-ledger-token"}
 
     with httpx.Client(base_url=base_url, timeout=10.0) as client:
         first = client.post(
             "/sessions",
             json={"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"},
-            headers=close_headers,
+            headers=write_headers,
         )
     assert first.status_code == 500
 
@@ -393,6 +396,6 @@ def test_write_path_unexpected_500_lock_released(
         second = client.post(
             "/sessions",
             json={"generator_port": "ixia-1/2", "dut_port": "dut-A2:Eth0"},
-            headers=close_headers,
+            headers=write_headers,
         )
     assert second.status_code == 500

@@ -253,6 +253,17 @@ class ApiTokenError(TopologyError):
     """
 
 
+class WriteLockedError(TopologyError):
+    """未設定 ``TOPO_MANAGER_API_TOKEN`` 卻請求帳本寫入端點時觸發（對應 403）。
+
+    純帳本寫入（``POST /sessions``／``DELETE /sessions/{id}``）在未設定
+    ``TOPO_MANAGER_API_TOKEN`` 時一律鎖住：沒有 token 可比對即視為「寫入未解鎖」
+    （唯讀模式）。語意上不同於 ``ApiTokenError``（有設 token 但 header 缺漏／
+    不符，401）與 ``DevicePushDisabledError``（設備下發端點未啟用，404）。
+    訊息不含任何 token 內容。
+    """
+
+
 class DevicePushRequestError(TopologyError):
     """設備下發端點的輸入不合法時觸發（對應 400）。
 

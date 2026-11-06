@@ -66,6 +66,10 @@ var state = {
     sessions: [],          /* raw GET /sessions .sessions list */
     groups: [],            /* raw GET /groups .groups list（供 group-filter 下拉） */
     available: null,       /* raw GET /resources/available payload */
+    /* GET /capabilities：{device_push, write_requires_token, writes_unlocked}。
+     * 決定 Allocate／Release 走設備下發端點或純帳本端點；讀取失敗時為 null，
+     * 視同未啟用設備下發（走純帳本端點，不連設備，是較安全的預設）。 */
+    capabilities: null,
     selectedId: null,      /* currently highlighted session_id, or null */
     autoRefresh: false,    /* whether auto-refresh is currently enabled */
     autoTimer: null,       /* setTimeout handle for the next auto-refresh tick */
@@ -753,14 +757,18 @@ function renderDetail() {
     actions.className = "detail-actions";
     actions.style.marginTop = "10px";
 
-    var applyBtn = document.createElement("button");
-    applyBtn.className = "primary write-action";
-    applyBtn.type = "button";
-    applyBtn.textContent = "Apply";
-    applyBtn.addEventListener("click", function () {
-        applySession(selected.session_id);
-    });
-    actions.appendChild(applyBtn);
+    /* Apply 走 /sessions/{id}/apply，只有啟用設備下發時才存在；未啟用時不顯示，
+     * 避免點了得 404。 */
+    if (isDevicePush()) {
+        var applyBtn = document.createElement("button");
+        applyBtn.className = "primary write-action";
+        applyBtn.type = "button";
+        applyBtn.textContent = "Apply";
+        applyBtn.addEventListener("click", function () {
+            applySession(selected.session_id);
+        });
+        actions.appendChild(applyBtn);
+    }
 
     var releaseBtn = document.createElement("button");
     releaseBtn.className = "danger write-action";
@@ -873,6 +881,20 @@ function renderGroupFilter() {
     }
     /* 保留先前選值（若該組仍在），否則退回 "All groups"。 */
     sel.value = stillExists ? prev : "";
+
+    /* 同步 Create Session 的群組輸入候選清單（datalist）：可選既有群組，也可
+     * 直接輸入新名稱（allocate 時由後端自動建立）。 */
+    var dl = document.getElementById("group-names");
+    if (dl) {
+        while (dl.firstChild) {
+            dl.removeChild(dl.firstChild);
+        }
+        for (var j = 0; j < groups.length; j += 1) {
+            var o = document.createElement("option");
+            o.value = groups[j].name;
+            dl.appendChild(o);
+        }
+    }
 }
 
 function renderSessionList() {
@@ -1046,19 +1068,39 @@ function allocateSession() {
         generator_port: genSel.value,
         dut_port: dutSel.value
     };
-    /* 寫入動作：建帳本並下發到設備（allocate-and-apply，帶 X-API-Token）。
-     * 回應把帳本內嵌於 resp.session.*（非頂層平鋪），per-fanout 於 resp.fanouts。 */
-    apiFetchAuthed("POST", "/sessions/allocate-and-apply", body).then(
+    /* 選填的群組名：非空才帶 group（不存在則由後端自動建立）；留白不指定。 */
+    var groupInput = document.getElementById("inp-group");
+    var groupName = groupInput ? groupInput.value.trim() : "";
+    if (groupName) {
+        /* 後端規則：群組名不得含 '/'（會破壞 /groups/{name} 路由）；先在前端擋下。 */
+        if (groupName.indexOf("/") !== -1) {
+            showError("ValidationError", "Group name must not contain '/'.");
+            return;
+        }
+        body.group = groupName;
+    }
+    var pushOn = isDevicePush();
+    /* 啟用設備下發：建帳本並下發到設備（allocate-and-apply，帶 X-API-Token），
+     * 回應把帳本內嵌於 resp.session.*，per-fanout 於 resp.fanouts。
+     * 未啟用：只動帳本（POST /sessions，同樣帶 X-API-Token），回應為平鋪 session，
+     * 不碰任何設備。 */
+    var url = pushOn ? "/sessions/allocate-and-apply" : "/sessions";
+    apiFetchAuthed("POST", url, body).then(
         function (resp) {
             clearError();
-            var session = (resp && resp.session) || {};
+            var session = pushOn ? ((resp && resp.session) || {}) : (resp || {});
             if (session.session_id) {
                 state.selectedId = session.session_id;
-                state.lastPush = {
-                    session_id: session.session_id,
-                    title: "Allocated and applied",
-                    fanouts: (resp && resp.fanouts) || []
-                };
+                if (pushOn) {
+                    state.lastPush = {
+                        session_id: session.session_id,
+                        title: "Allocated and applied",
+                        fanouts: (resp && resp.fanouts) || []
+                    };
+                }
+            }
+            if (groupInput) {
+                groupInput.value = "";
             }
             refreshAll();
         },
@@ -1069,10 +1111,20 @@ function allocateSession() {
     );
 }
 
+/* isDevicePush：server 是否啟用設備下發（取自 GET /capabilities）。
+ * capabilities 尚未載入或讀取失敗時回 false（走純帳本端點，不連設備）。 */
+function isDevicePush() {
+    return !!(state.capabilities && state.capabilities.device_push === true);
+}
+
 function releaseSession(sessionId) {
-    /* 寫入動作：下發移除並清帳本（release-and-remove，帶 X-API-Token）。 */
-    apiFetchAuthed("POST", "/sessions/" + encodeURIComponent(sessionId)
-            + "/release-and-remove", {}).then(
+    /* 啟用設備下發：撤設備並清帳本（POST release-and-remove）；未啟用：只清帳本
+     * （DELETE /sessions/{id}）。兩者皆帶 X-API-Token。 */
+    var req = isDevicePush()
+        ? apiFetchAuthed("POST", "/sessions/" + encodeURIComponent(sessionId)
+            + "/release-and-remove", {})
+        : apiFetchAuthed("DELETE", "/sessions/" + encodeURIComponent(sessionId));
+    req.then(
         function () {
             clearError();
             if (state.selectedId === sessionId) {
@@ -1150,6 +1202,10 @@ function friendlyMessage(err) {
              * 此處僅回友善文案。 */
             return "Invalid or missing token; writes are locked. Re-enter a "
                 + "valid X-API-Token to unlock.";
+        case "WriteLockedError":
+            /* 403：server 未設定 TOPO_MANAGER_API_TOKEN，寫入一律鎖住。 */
+            return "Writes are locked: the server has no TOPO_MANAGER_API_TOKEN "
+                + "configured (read-only mode).";
         case "DevicePushDisabledError":
             return "Device push is disabled on the server; write actions are "
                 + "unavailable.";
@@ -1259,7 +1315,14 @@ function refreshAll() {
         }
     );
 
-    return Promise.all([topoP, sessP, availP, groupsP]).then(function () {
+    /* 寫入能力（GET /capabilities）：失敗時退回 null（視同未啟用設備下發），
+     * 不算 readFailed，以免舊版 server 沒有此端點時鎖死 allocate。 */
+    var capP = apiFetch("GET", "/capabilities").then(
+        function (data) { state.capabilities = data || null; },
+        function () { state.capabilities = null; }
+    );
+
+    return Promise.all([topoP, sessP, availP, groupsP, capP]).then(function () {
         /* Preserve selection only if it still exists. */
         if (state.selectedId && !currentSelection()) {
             state.selectedId = null;

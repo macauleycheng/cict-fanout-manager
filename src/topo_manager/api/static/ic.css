@@ -111,7 +111,29 @@
     width: 100%;
     height: auto;
     display: block;
-    max-width: 360px;
+    max-width: 520px;
+}
+
+/* fanout switch：右側方框；被用到的 port 為方框左緣的圓點。 */
+.ic-fanout rect {
+    fill: #455a64;
+    stroke: #263238;
+    stroke-width: 1.5;
+}
+
+.ic-fanout .ic-fanout-name {
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.ic-port {
+    fill: #fff;
+    stroke: #263238;
+    stroke-width: 1.5;
+}
+
+.ic-port-label {
+    font-size: 9px;
 }
 
 .ic-node rect {
@@ -145,7 +167,16 @@
 
 .ic-edge-label {
     font-size: 9px;
-    fill: var(--active);
+    /* 白色外框（halo），文字疊在線上仍可讀；顏色由 JS 以 fill 屬性逐條指定。 */
+    paint-order: stroke;
+    stroke: #fff;
+    stroke-width: 3px;
+    stroke-linejoin: round;
+}
+
+/* 預覽（尚未入帳）：虛線。 */
+.ic-edge.preview {
+    stroke-dasharray: 5 4;
 }
 
 /* ---- 互聯清單 ---- */

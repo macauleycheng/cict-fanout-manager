@@ -56,14 +56,22 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch, topology: Path) -> None:
 def test_from_env_disabled_values(
     monkeypatch: pytest.MonkeyPatch, three_tier_path: Path, value
 ) -> None:
-    """未設、空字串、'0' 都是關閉，且不要求 token（即使 token 變數有設也被忽略）。"""
+    """未設、空字串、'0' 都是關閉設備下發（不需要 token 即可啟動）。
+
+    Design 1 起 ``api_token`` 不論是否啟用設備下發皆讀取（純帳本寫入端點以其
+    閘控）：未設 token 時仍為 None（唯讀），設了 token 時即使設備下發關閉也會
+    被讀入供帳本寫入閘門使用。
+    """
     _clean_env(monkeypatch, three_tier_path)
     if value is not None:
         monkeypatch.setenv("TOPO_MANAGER_ENABLE_DEVICE_PUSH", value)
     settings = Settings.from_env()
     assert settings.enable_device_push is False
-    monkeypatch.setenv("TOPO_MANAGER_API_TOKEN", "ignored")
-    assert Settings.from_env().api_token is None
+    # 未設 token → None（唯讀模式，寫入一律鎖住）。
+    assert settings.api_token is None
+    # 設備下發關閉時，token 仍會被讀取（供純帳本寫入端點閘控，Design 1）。
+    monkeypatch.setenv("TOPO_MANAGER_API_TOKEN", "ledger-token")
+    assert Settings.from_env().api_token == "ledger-token"
 
 
 def test_from_env_enabled_reads_token_and_credentials(
