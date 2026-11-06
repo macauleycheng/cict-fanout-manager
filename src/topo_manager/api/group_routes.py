@@ -38,9 +38,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Depends, Request, status
 
 from topo_manager.allocator import Allocator, Session
+from topo_manager.api.auth import require_ledger_write
 from topo_manager.api.deps import (
     Settings,
     build_allocator,
@@ -65,6 +66,7 @@ router = APIRouter()
     response_model=GroupResponse,
     status_code=status.HTTP_201_CREATED,
     summary="建立一個空群組。",
+    dependencies=[Depends(require_ledger_write)],
 )
 async def create_group(request: Request, body: CreateGroupRequest) -> GroupResponse:
     """建立一個空群組並回其摘要（201；已存在→409，FEAT-002）。
@@ -107,6 +109,7 @@ async def get_group(request: Request, name: str) -> GroupResponse:
     "/groups/{name}",
     response_model=GroupResponse,
     summary="刪除一個群組（回被刪除群組摘要）。",
+    dependencies=[Depends(require_ledger_write)],
 )
 async def delete_group(request: Request, name: str) -> GroupResponse:
     """刪除一個群組並回其摘要（查無→404，FEAT-002）。
@@ -122,6 +125,7 @@ async def delete_group(request: Request, name: str) -> GroupResponse:
     "/groups/{name}/members",
     response_model=GroupResponse,
     summary="把一個 session 加入群組（群組須已存在）。",
+    dependencies=[Depends(require_ledger_write)],
 )
 async def add_member(
     request: Request, name: str, body: AddMemberRequest
@@ -139,6 +143,7 @@ async def add_member(
     "/groups/{name}/members/{session_id}",
     response_model=GroupResponse,
     summary="把一個 session 自群組移除（回群組摘要）。",
+    dependencies=[Depends(require_ledger_write)],
 )
 async def remove_member(
     request: Request, name: str, session_id: str

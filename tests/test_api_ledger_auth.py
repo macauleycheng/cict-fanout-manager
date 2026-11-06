@@ -278,3 +278,56 @@ def test_ui_ic_topology_draws_duts_left_and_fanout_right(
     assert ".ic-fanout rect" in css
     assert ".ic-edge.preview" in css
     assert "stroke-dasharray" in css
+
+
+# ----------------------------------------------------------------------
+# 群組寫入端點同樣以 token 閘控；讀端點與 ATLAS 輸出維持開放
+# ----------------------------------------------------------------------
+_GROUP_WRITES = [
+    ("post", "/groups", {"name": "T1"}),
+    ("delete", "/groups/T1", None),
+    ("post", "/groups/T1/members", {"session_id": "s-0001"}),
+    ("delete", "/groups/T1/members/s-0001", None),
+]
+
+
+@pytest.mark.parametrize("method,path,body", _GROUP_WRITES)
+def test_group_writes_locked_without_server_token(
+    three_tier_path: Path, tmp_path: Path, method, path, body
+) -> None:
+    """server 未設 token：群組寫入一律 403 WriteLockedError（帳本不被碰）。"""
+    client = _client(three_tier_path, tmp_path, token=None)
+    response = getattr(client, method)(
+        path, headers={"X-API-Token": "x"}, **({"json": body} if body else {})
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "WriteLockedError"
+    assert client.get("/groups").json()["count"] == 0
+
+
+@pytest.mark.parametrize("method,path,body", _GROUP_WRITES)
+def test_group_writes_need_correct_token(
+    three_tier_path: Path, tmp_path: Path, method, path, body
+) -> None:
+    """server 有設 token：缺 header／錯 token → 401 ApiTokenError。"""
+    client = _client(three_tier_path, tmp_path, token=_TOKEN)
+    kwargs = {"json": body} if body else {}
+    assert getattr(client, method)(path, **kwargs).status_code == 401
+    wrong = getattr(client, method)(path, headers={"X-API-Token": "bad"}, **kwargs)
+    assert wrong.status_code == 401
+    assert wrong.json()["error"]["type"] == "ApiTokenError"
+    assert client.get("/groups").json()["count"] == 0
+
+
+def test_group_reads_and_atlas_stay_open(
+    three_tier_path: Path, tmp_path: Path
+) -> None:
+    """群組讀端點不需 token；查無群組的 ATLAS 回 404（而非 401／403）。"""
+    for token in (None, _TOKEN):
+        client = _client(three_tier_path, tmp_path, token=token)
+        assert client.get("/groups").status_code == 200
+        assert client.get("/groups/T1").status_code == 404
+        assert client.get("/groups/T1/atlas").status_code == 404
+
+# 「帶對 token 能成功建立群組」需真的寫帳本（signal 檔鎖要主執行緒），已由
+# test_api_groups.py 的 group_live_server 系列測試涵蓋（其 client 預設帶 token）。

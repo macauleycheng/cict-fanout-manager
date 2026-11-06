@@ -698,6 +698,9 @@ any algorithm or bypass the file lock.
 | `TOPO_MANAGER_IC_VLAN_MAX` | `3000` | Interconnect VLAN pool upper bound |
 | `TOPO_MANAGER_HOST` | `0.0.0.0` | `topo-manager-api` bind host |
 | `TOPO_MANAGER_PORT` | `8000` | `topo-manager-api` bind port |
+| `TOPO_MANAGER_GROUP_STATE` | `.topo-state/groups.json` | Group ledger path (separate from the traffic and interconnect ledgers; see [Groups and ATLAS output](#groups-and-atlas-output)) |
+| `TOPO_MANAGER_API_TOKEN` | (none) | Shared secret for **all write endpoints**. Unset means writes are locked (read-only server). See [Write access](#write-access-the-api-token) |
+| `TOPO_MANAGER_ENABLE_DEVICE_PUSH` | unset (disabled) | `1` additionally enables the opt-in [device push](#device-push-over-rest) endpoints |
 
 If `TOPO_MANAGER_TOPOLOGY` is missing, the topology is invalid, or a VLAN
 range is illegal, the app **fails fast at startup** (one stderr line, non-zero
@@ -765,7 +768,61 @@ Once running:
 - Swagger UI: `http://<host>:8000/docs`
 - OpenAPI schema: `http://<host>:8000/openapi.json`
 
+### Write access (the API token)
+
+> **Breaking change:** every endpoint that writes a ledger now requires the
+> `X-API-Token` header. Scripts that used to call `POST /sessions` or
+> `DELETE /sessions/{id}` without a header must be updated.
+
+Writes are gated by the shared secret in `TOPO_MANAGER_API_TOKEN`, **whether or
+not device push is enabled**:
+
+| Server state | Write request | Result |
+| --- | --- | --- |
+| `TOPO_MANAGER_API_TOKEN` unset or empty | any | **403** `WriteLockedError` (read-only server) |
+| token set | header missing or wrong | **401** `ApiTokenError` |
+| token set | header equals the token | allowed |
+
+Gated (ledger writes): `POST /sessions`, `DELETE /sessions/{id}`,
+`POST /interconnect/sessions`, `DELETE /interconnect/sessions/{id}`,
+`POST /groups`, `DELETE /groups/{name}`, `POST /groups/{name}/members`,
+`DELETE /groups/{name}/members/{session_id}`. The device-push endpoints keep
+their own, stricter gate (see [Device push over REST](#device-push-over-rest)).
+
+Always open (no token): every `GET`, including `GET /groups/{name}/atlas`, and
+`POST /interconnect/plan` (a preview that writes nothing).
+
+The check runs before the request is processed, and the token is compared in
+constant time. Like the device-push token it is a single shared secret with no
+users, scopes, or rate limit, and it travels in cleartext over plain HTTP; put a
+TLS-terminating proxy in front of the server if that matters.
+
+### `GET /capabilities`
+
+Reports what the server allows, so a client (the Web UI) can choose the right
+write endpoints without guessing:
+
+```bash
+curl -s localhost:8000/capabilities
+# {"device_push": false, "write_requires_token": true, "writes_unlocked": true}
+```
+
+- `device_push` — `TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`. When true the Web UI uses
+  the combined `allocate-and-apply` / `release-and-remove` endpoints; when false
+  it uses the ledger-only `POST`/`DELETE` endpoints and never touches a device.
+- `write_requires_token` — always `true`.
+- `writes_unlocked` — whether a token is configured on the server. `false` means
+  every write will be answered with 403.
+
+The response never contains the token.
+
 ### Endpoints and curl examples
+
+Write calls need the token header; set it once for the examples below:
+
+```bash
+TOKEN="$TOPO_MANAGER_API_TOKEN"
+```
 
 ```bash
 # 1) Get the full topology (for visualization/reconstruction)
@@ -776,6 +833,7 @@ curl -s localhost:8000/resources/available
 
 # 3) Allocate a session (201 + session summary, status=allocated)
 curl -s -X POST localhost:8000/sessions \
+    -H "X-API-Token: $TOKEN" \
     -H 'Content-Type: application/json' \
     -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"}'
 
@@ -783,7 +841,7 @@ curl -s -X POST localhost:8000/sessions \
 curl -s localhost:8000/sessions
 
 # 5) Release a session (200 + released session summary, status=released)
-curl -s -X DELETE localhost:8000/sessions/s-0001
+curl -s -X DELETE localhost:8000/sessions/s-0001 -H "X-API-Token: $TOKEN"
 ```
 
 Allocating the same `(generator_port, dut_port)` twice (the access port is
@@ -791,6 +849,7 @@ already held) returns **409** with a structured error:
 
 ```bash
 curl -s -X POST localhost:8000/sessions \
+    -H "X-API-Token: $TOKEN" \
     -H 'Content-Type: application/json' \
     -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"}'
 # => HTTP 409
@@ -806,6 +865,8 @@ mapping:
 - ledger I/O or lock-acquisition failure -> **503**
 - request-time topology drift -> **503** (see below)
 - bad request input (missing field / empty string / extra field) -> **400**
+- missing or wrong `X-API-Token` on a write -> **401**
+- write while no token is configured on the server -> **403**
 - unexpected error -> **500** (fixed message)
 
 > **Request-time topology drift (read endpoints return 503; read/write
@@ -846,6 +907,67 @@ serialized, each re-reading the latest ledger under the lock. The API layer does
 not bypass the file lock or substitute an in-memory cache for the allocator's
 decisions.
 
+### Groups and ATLAS output
+
+A **group** is a named label over several traffic sessions, for example `T1`. A
+session is still exactly one generator port paired with one DUT port; the group
+bundles several of them so a consumer such as ATLAS can read them as one test
+resource. A group is a pure label: it never touches a device or a VLAN.
+
+- A session belongs to **at most one** group.
+- A group name is any non-empty string without `/`.
+- Groups persist to their own ledger, `TOPO_MANAGER_GROUP_STATE`
+  (default `.topo-state/groups.json`). Never point it at the same file as the
+  traffic or interconnect ledger.
+- Releasing a session (`DELETE /sessions/{id}` or `release-and-remove`) also
+  removes it from its group. The CLI `release` does not.
+
+**Putting sessions in a group.** Add `group` to the allocate body; a group that
+does not exist yet is created on the fly:
+
+```bash
+TOKEN="$TOPO_MANAGER_API_TOKEN"
+curl -s -X POST localhost:8000/sessions -H "X-API-Token: $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0", "group": "T1"}'
+```
+
+The response carries `"group": "T1"`, and `GET /sessions` reports each
+session's `group` (or `null`).
+
+| Endpoint | Token | Meaning |
+| --- | --- | --- |
+| `POST /groups` `{"name": "T1"}` | yes | Create an empty group (201; 409 if it exists) |
+| `GET /groups` | no | List groups and their members |
+| `GET /groups/{name}` | no | One group (404 if unknown) |
+| `DELETE /groups/{name}` | yes | Delete a group; its sessions stay allocated |
+| `POST /groups/{name}/members` `{"session_id": "s-0001"}` | yes | Add a session id to an existing group (404 unknown group; 409 if the id is already in another group). The id is **not** checked against the traffic ledger, so a typo is accepted; the ATLAS output simply skips ids that are not active sessions |
+| `DELETE /groups/{name}/members/{session_id}` | yes | Remove a session from the group |
+| `GET /groups/{name}/atlas` | no | The group in ATLAS format (below) |
+
+**ATLAS format.** `GET /groups/{name}/atlas` returns JSON whose single top-level
+key is the group name, mapped to a list with one object per member session:
+
+```bash
+curl -s localhost:8000/groups/T1/atlas
+# {"T1": [{"DUTA1": {"PA": "1/0"}, "TG": {"1": "1/1"}}]}
+```
+
+- **DUT side** — the device name drops its hyphens and is upper-cased
+  (`dut-1` -> `DUT1`, `dut-A1` -> `DUTA1`). The value is `<unit>/<port>` taken
+  from the port name: a bare `Eth5` means unit 1, so `1/5`; `Eth 2/5` or
+  `Eth2/5` gives `2/5`.
+- **Label** — `PA`, `PB`, `PC`, ... follow the order of the DUT's `tg_ports` in
+  the topology YAML (first listed port is `PA`). It is only a drawing label.
+  At most 26 labels per DUT.
+- **TG side** — the generator port `ixia-<slot>/<port>` becomes
+  `{"<slot>": "<slot>/<port>"}`, so `ixia-1/2` gives `{"1": "1/2"}`.
+- Output follows the group's member order. A member session that has since left
+  the traffic ledger is skipped rather than failing the whole call.
+- An empty group returns `{"T1": []}`.
+- A port name that does not match these patterns is answered with **422**
+  `AtlasFormatError`.
+
 ### Interconnect endpoints
 
 The same server also exposes the [interconnect fanout](#interconnect-fanout)
@@ -860,6 +982,12 @@ which is separate from the traffic ledger.
 > like pushing VLAN config for traffic sessions, unless you enable the opt-in
 > [Device push over REST](#device-push-over-rest) endpoints. `DELETE` is the equivalent of `release --ledger-only`: it
 > removes the session from the ledger and leaves the device untouched.
+
+> **Token:** `POST /interconnect/sessions` and `DELETE /interconnect/sessions/{session_id}`
+> write the ledger, so they need the `X-API-Token` header (see
+> [Write access](#write-access-the-api-token)): no token configured on the server
+> answers 403, a missing or wrong header answers 401. Every `GET` and
+> `POST /interconnect/plan` stay open.
 
 | Method and path | CLI equivalent | Success | Purpose |
 | --- | --- | --- | --- |
@@ -885,14 +1013,16 @@ the rules are the same as the CLI's `--group`, `--duts`, `--profile` and `--pair
 - Giving both `duts` and `pairs`, or neither, is a 400 error.
 
 ```bash
+TOKEN="$TOPO_MANAGER_API_TOKEN"
+
 # Four DUTs as a ring
 curl -s -X POST localhost:8000/interconnect/sessions \
-    -H 'Content-Type: application/json' \
+    -H "X-API-Token: $TOKEN" -H 'Content-Type: application/json' \
     -d '{"group": "A-g1", "duts": ["dut-A1", "dut-A2", "dut-A3", "dut-A4"], "profile": "ring"}'
 
 # One explicit port pair (p3 is not in the fixed pairing table)
 curl -s -X POST localhost:8000/interconnect/sessions \
-    -H 'Content-Type: application/json' \
+    -H "X-API-Token: $TOKEN" -H 'Content-Type: application/json' \
     -d '{"group": "A-g1", "pairs": [{"a": "dut-A1:p3", "b": "dut-A2:p3"}]}'
 ```
 
@@ -924,6 +1054,8 @@ which the same ports can be requested again.
 #### Listing, planning and releasing
 
 ```bash
+TOKEN="$TOPO_MANAGER_API_TOKEN"
+
 # Summary, free resources and active sessions
 curl -s localhost:8000/interconnect/summary
 curl -s localhost:8000/interconnect/resources/available
@@ -938,8 +1070,9 @@ curl -s -X POST localhost:8000/interconnect/plan \
 curl -s 'localhost:8000/interconnect/sessions/ic-0001/plan?action=release'
 curl -s 'localhost:8000/interconnect/plan/park?fanout=ic-1-1&ports=1&ports=2'
 
-# Release from the ledger (the device is not touched)
-curl -s -X DELETE localhost:8000/interconnect/sessions/ic-0001
+# Release from the ledger (the device is not touched; needs the token)
+curl -s -X DELETE localhost:8000/interconnect/sessions/ic-0001 \
+    -H "X-API-Token: $TOKEN"
 ```
 
 A `plan` response lists the command batches per interconnect fanout, in the
@@ -972,6 +1105,8 @@ of the API, with no traceback.
 | --- | --- | --- |
 | 400 | `InterconnectRequestError` | Unknown group or DUT, DUTs from different groups, duplicate DUT or port, a 2-DUT `ring`, unknown profile or port, malformed pair, `duts`/`pairs`/`profile` combined wrongly, unknown fanout or port in `plan/park` |
 | 400 | `ValidationError` | Missing or empty `group`, wrong types, extra fields, bad `action` or `ports` query values |
+| 401 | `ApiTokenError` | `POST` / `DELETE /interconnect/sessions...` with a missing or wrong `X-API-Token` (checked first, so `DELETE` of an unknown `session_id` also answers 401 without a valid token) |
+| 403 | `WriteLockedError` | `POST` / `DELETE /interconnect/sessions...` while `TOPO_MANAGER_API_TOKEN` is not set on the server |
 | 404 | `InterconnectSessionNotFoundError` | `DELETE` or a session `plan` for a `session_id` that does not exist |
 | 404 | `InterconnectNotConfiguredError` | The topology has no `interconnect:` section |
 | 409 | `InterconnectConflictError` | A port is already held by another session (the message lists the owners) |
@@ -1028,7 +1163,7 @@ Two environment variables control this feature:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TOPO_MANAGER_ENABLE_DEVICE_PUSH` | unset (disabled) | `1` enables the seven endpoints below; unset, empty, or `0` keeps them disabled. Any other value (e.g. `true`) **fails fast at startup** rather than being silently treated as disabled. |
-| `TOPO_MANAGER_API_TOKEN` | (none) | The shared secret compared against the `X-API-Token` request header. **Required** when the feature is enabled — if it is unset or empty while `TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`, the app fails to start: one stderr line, non-zero exit code, no traceback. Ignored (not read) when the feature is disabled. |
+| `TOPO_MANAGER_API_TOKEN` | (none) | The shared secret compared against the `X-API-Token` request header. **Required** when the feature is enabled — if it is unset or empty while `TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`, the app fails to start: one stderr line, non-zero exit code, no traceback. The same token also gates the ledger-only write endpoints, so it is read whether or not the feature is enabled (see [Write access](#write-access-the-api-token)). |
 | `TOPO_MANAGER_CREDENTIALS` | unset | Optional path to the fanout connection-settings JSON (same file the CLI's `--credentials` reads via `load_fanout_config`); unset uses the CLI's own default lookup (`fanout-credentials.json` in the working directory, overridable with `TOPO_FANOUT_*` env vars). Ignored when the feature is disabled. |
 
 ```bash
@@ -1039,8 +1174,8 @@ export TOPO_MANAGER_CREDENTIALS=/etc/topo-manager/fanout-credentials.json
 topo-manager-api
 ```
 
-When enabled, `GET /openapi.json`'s `info.version` becomes `0.7.0` (it stays
-`0.5.0` when disabled) and the eleven paths below appear in the document (the
+When enabled, `GET /openapi.json`'s `info.version` becomes `0.9.0` (it is
+`0.7.0` when disabled) and the eleven paths below appear in the document (the
 seven base push paths plus the four combined allocate-and-apply /
 release-and-remove paths).
 
@@ -1056,8 +1191,10 @@ release-and-remove paths).
 | `POST /interconnect/park` | `interconnect park --apply` | Return interconnect ports to the parking baseline |
 | `POST /interconnect/sessions/{session_id}/release-device` | `interconnect release --apply` | Two-phase device release (park, clear VLANs, then remove from the ledger) |
 
-The existing `DELETE /interconnect/sessions/{session_id}` is unchanged: it
-stays ledger-only and needs no token. The flow for anything that writes to a
+The existing `DELETE /interconnect/sessions/{session_id}` is unchanged in what
+it does: it stays ledger-only and never touches a device. Like every ledger
+write it needs the API token (see [Write access](#write-access-the-api-token)).
+The flow for anything that writes to a
 device is always **create first, then push**: `POST /sessions` or
 `POST /interconnect/sessions` to allocate, then one of the `apply` endpoints
 above to actually configure the device.
@@ -1122,7 +1259,7 @@ TOKEN="$TOPO_MANAGER_API_TOKEN"
 
 # 1) Create a traffic session (ledger only, no device touched yet)
 curl -s -X POST localhost:8000/sessions \
-    -H 'Content-Type: application/json' \
+    -H "X-API-Token: $TOKEN" -H 'Content-Type: application/json' \
     -d '{"generator_port": "ixia-1/1", "dut_port": "dut-A1:Eth0"}'
 # => {"session_id": "s-0001", ...}
 
@@ -1143,7 +1280,7 @@ curl -s -X POST localhost:8000/fanouts/setup \
 
 # 6) Interconnect: create, then push
 curl -s -X POST localhost:8000/interconnect/sessions \
-    -H 'Content-Type: application/json' \
+    -H "X-API-Token: $TOKEN" -H 'Content-Type: application/json' \
     -d '{"group": "A-g1", "duts": ["dut-A1", "dut-A2"], "profile": "mesh"}'
 # => {"session_id": "ic-0001", ...}
 curl -s -X POST localhost:8000/interconnect/sessions/ic-0001/apply \
@@ -1173,6 +1310,7 @@ curl -s -X POST localhost:8000/sessions/s-0001/apply
 | --- | --- | --- |
 | 404 | `DevicePushDisabledError` | The feature is disabled (`TOPO_MANAGER_ENABLE_DEVICE_PUSH` is not `1`) — distinct from `InterconnectNotConfiguredError` below |
 | 401 | `ApiTokenError` | `X-API-Token` missing or not equal to `TOPO_MANAGER_API_TOKEN` |
+| 403 | `WriteLockedError` | Only on the ledger-only write endpoints: `TOPO_MANAGER_API_TOKEN` is not set on the server, so writes are locked. (The device-push endpoints cannot return it: they require the token at startup.) |
 | 400 | `DevicePushRequestError` | `POST /fanouts/setup` body is not valid JSON, fails the schema, is an empty `fanouts` list, or names a fanout not in the credentials file |
 | 400 | `ValidationError` / `InterconnectRequestError` | Bad query parameters on `park` (e.g. non-integer `ports`), or interconnect session-state errors (e.g. apply on a `releasing` session) — same as the existing interconnect endpoints |
 | 404 | `SessionNotFoundError` / `InterconnectSessionNotFoundError` | The `session_id` does not exist |
@@ -1289,17 +1427,24 @@ endpoints offer:
   selection.
 - **Filter sessions** — a text box filters the active-session list by id, VLAN,
   or port.
-- **Create a session** — pick a generator port and a DUT port and allocate. The
-  dropdowns list **only currently available ports** (those not already held by
-  an active session), so you cannot pick a port that is taken. With a token
-  entered, allocate also pushes the VLAN/tunnel config to the physical switch
-  in the same action (it calls `allocate-and-apply`); the Allocate button is
-  hidden until a token is entered.
+- **Create a session** — pick a generator port and a DUT port, optionally type a
+  **Group** (the field suggests existing groups; a new name creates the group),
+  and allocate. The dropdowns list **only currently available ports** (those
+  not already held by an active session), so you cannot pick a port that is
+  taken. The Allocate button stays hidden until a token is entered. What it
+  calls depends on the server (`GET /capabilities`): with device push enabled it
+  calls `allocate-and-apply` and also writes the VLAN/tunnel config to the
+  switch; without device push it calls the ledger-only `POST /sessions` and
+  never touches a device.
+- **Filter by group** — a dropdown next to the text filter shows only the
+  sessions of one group.
 - **Release a session** — release the selected session from its detail panel.
-  With a token entered, Release also tears the config down on the device (it
-  calls `release-and-remove`), not just the ledger.
-- **Apply a session** — with a token entered, the detail panel also offers an
-  Apply action that re-pushes an already-allocated session to the device.
+  With device push enabled Release also tears the config down on the device
+  (`release-and-remove`); without it, Release only clears the ledger
+  (`DELETE /sessions/{id}`).
+- **Apply a session** — only with device push enabled, the detail panel also
+  offers an Apply action that re-pushes an already-allocated session to the
+  device. Without device push there is no Apply button.
 - **Auto-refresh (optional)** — a checkbox re-polls the server every 10 seconds;
   a manual **Refresh** button is always available.
 - **Friendly errors** — API errors (e.g. a hard conflict on allocate) are shown
@@ -1311,20 +1456,25 @@ The Interconnect tab reads the **ledger-only** interconnect REST endpoints
 (`GET /interconnect/summary`, `GET /interconnect/resources/available`,
 `GET /interconnect/sessions`, and `POST /interconnect/plan` for a preview). It
 can see, build, and release interconnect sessions. Reads and the Preview stay
-token-free; when a token is entered, its Allocate / Release / Apply actions call
-the token-guarded combined endpoints and push to the device the same way the
-Traffic tab does.
+token-free; when a token is entered, its Allocate / Release actions appear. As on
+the Traffic tab, they call the combined `allocate-and-apply` / `release-and-remove`
+endpoints when device push is enabled, and the ledger-only
+`POST /interconnect/sessions` / `DELETE /interconnect/sessions/{id}` when it is
+not. Apply is only offered with device push.
 
 - **Interconnect topology** — interconnect has no generator→DUT tiering, so it is
-  drawn as **one small diagram per group**: a group's four DUTs (`d0`..`d3`) sit
-  at the four corners of a square, labeled with the DUT name and its `d0`..`d3`
-  slot. The nodes come from `GET /interconnect/summary`.
-- **Show a session's resources** — selecting (or filtering down to) an
-  interconnect session draws that session's links on its group's diagram. Each
-  drawn link is labeled with its **VLAN** and, for each end, the DUT il_port
-  paired with its fanout port (`il_port @ fanout_port`), so you can see which
-  DUT il_port connects to which, over which VLAN, through which fanout port. The
-  fanout port is taken from each link's `a_node`/`b_node`. Link data comes from
+  drawn as **one small diagram per group**. The group's DUTs (`d0`..`d3`) are
+  stacked in one column on the **left**, labeled with the DUT name and its
+  `d0`..`d3` slot; the group's **fanout switch** is a box on the **right**. The
+  nodes come from `GET /interconnect/summary`.
+- **Show a session's wiring** — selecting (or filtering down to) an interconnect
+  session draws how it is cabled through the fanout. Each link becomes two
+  lines, each from a DUT's `il_port` (for example `Eth8`) to a fanout port
+  (`p1`, `p5`, ...) on the box's left edge; the link's two fanout ports sit next
+  to each other and are joined by a short arc labeled with the **VLAN**. Every
+  link has its own colour, and hovering a link shows its full description. A DUT
+  the session does not use is drawn without lines. The fanout port is taken
+  from each link's `a_node`/`b_node`; link data comes from
   `GET /interconnect/sessions`.
 - **Filter sessions** — a text box filters the interconnect session list by id,
   group, profile, VLAN, DUT, or port.
@@ -1332,21 +1482,25 @@ Traffic tab does.
   **Profile** mode (pick a group, pick 2–4 DUTs in order, pick `mesh`/`line`/`ring`)
   or a **Pairs** mode (pick a group, add explicit port pairs). The options list
   **only currently buildable resources** (from `GET /interconnect/resources/available`
-  and the summary). A **Preview** button shows the plan without allocating.
+  and the summary). A **Preview** button shows the plan without allocating, and also draws that
+  profile's wiring on the diagram as **dashed** lines, so you can see how a
+  `mesh`, `line` or `ring` would be cabled before you commit. Changing the form
+  or selecting a session clears the preview.
 - **Release a session** — release the selected session from its detail panel.
-  With no token this is **ledger-only** (it clears the session from the ledger
-  but does not park the device); with a token entered it calls
-  `release-and-remove`, which also parks the ports on the device.
+  Without device push this is **ledger-only** (`DELETE /interconnect/sessions/{id}`
+  clears the session from the ledger but does not park the device); with device
+  push enabled it calls `release-and-remove`, which also parks the ports on the
+  device.
 - **Friendly errors** — interconnect API errors (400 invalid request, 409 port
   conflict or VLAN exhaustion, 404 session gone) are shown as a readable banner.
   On a topology with no interconnect section the tab degrades gracefully to a
   neutral "This topology has no interconnect section." note instead of an error.
 
-**Device push in the Web UI is token-gated.** With no token entered the Web UI
-is read-only on both tabs and never sends `X-API-Token` or triggers a device
-write — the same behavior it has always had. When a valid token is entered in
-the header, the Allocate / Release / Apply actions become visible and call the
-token-guarded REST endpoints, which do push to the fanout switches. See
+**Writes in the Web UI are token-gated.** With no token entered the Web UI is
+read-only on both tabs and never sends `X-API-Token`. When a valid token is
+entered in the header, the Allocate / Release actions become visible and call
+the token-guarded REST endpoints; they reach a fanout switch only if the server
+has device push enabled. See
 [Web UI with token-unlocked write operations](#web-ui-with-token-unlocked-write-operations)
 for the full token flow and its limitations.
 
@@ -1361,17 +1515,23 @@ Interconnect tab reads the ledger-only
 reads or the Preview send a token.
 
 Its writes are token-gated. With no token entered, no write action is shown and
-the UI behaves exactly as the earlier read-only UI did. With a valid token, the
-Allocate / Release / Apply actions call the token-guarded
-[device-push endpoints](#device-push-over-rest) — the combined
-`allocate-and-apply` and `release-and-remove` paths for Allocate and Release,
-and the standalone `apply` path for Apply — each with the `X-API-Token` header.
-A 401 reverts the UI to read-only and clears the token; per-fanout results are
-rendered only on a successful push.
+the UI behaves exactly as the earlier read-only UI did. With a valid token it
+asks `GET /capabilities` which endpoints to use:
 
-Because the write actions call the same device-push handlers as the REST API,
-the main-thread deployment constraint and the single-process serialization
-behavior described under
+- **Device push enabled** — Allocate / Release call the combined
+  `allocate-and-apply` / `release-and-remove` [device-push endpoints](#device-push-over-rest),
+  and Apply the standalone `apply` path.
+- **Device push disabled** — Allocate / Release call the ledger-only
+  `POST` / `DELETE` endpoints, and there is no Apply.
+
+Every write carries the `X-API-Token` header. A 401 reverts the UI to read-only
+and clears the token; a 403 (the server has no token configured) is shown as a
+"Writes are locked" banner. Per-fanout results are rendered only on a
+successful push.
+
+Because the write actions call the same handlers as the REST API, the
+main-thread deployment constraint and the single-process serialization behavior
+described under
 [Starting the server](#starting-the-server-two-equivalent-ways) apply unchanged
 — the UI does not add a separate write path or bypass the file lock.
 
@@ -1384,21 +1544,23 @@ sessions, exactly as a read-only client would.
 
 Paste the same value you set in `TOPO_MANAGER_API_TOKEN` on the server into the
 header's token field. This reveals the Allocate, Release, and Apply actions on
-both tabs:
+both tabs. What each one calls depends on whether the server has device push
+enabled:
 
-- **Allocate** creates the session and pushes it to the physical switch in one
-  step. On the Traffic tab it calls `POST /sessions/allocate-and-apply`; on the
-  Interconnect tab it calls `POST /interconnect/sessions/allocate-and-apply`.
-  The allocation is device-synced — the VLAN/tunnel config is written to the
-  fanouts as part of the same action.
-- **Release** tears the config down on the device and then removes the session
-  from the ledger. On the Traffic tab it calls
-  `POST /sessions/{id}/release-and-remove`; on the Interconnect tab it calls
-  `POST /interconnect/sessions/{id}/release-and-remove`. Unlike the read-only
-  ledger release, this one does touch the device.
-- **Apply** re-pushes an already-allocated session to the device without
-  reallocating, via the standalone `POST /sessions/{id}/apply` (or
-  `POST /interconnect/sessions/{id}/apply`) endpoint.
+- **Allocate** — with device push it creates the session and pushes it to the
+  physical switch in one step (`POST /sessions/allocate-and-apply`, or
+  `POST /interconnect/sessions/allocate-and-apply`), so the VLAN/tunnel config
+  is written to the fanouts as part of the same action. Without device push it
+  only creates the ledger entry (`POST /sessions` or
+  `POST /interconnect/sessions`).
+- **Release** — with device push it tears the config down on the device and
+  then removes the session from the ledger (`POST /sessions/{id}/release-and-remove`
+  or `POST /interconnect/sessions/{id}/release-and-remove`). Without device push
+  it only removes the ledger entry (`DELETE /sessions/{id}` or
+  `DELETE /interconnect/sessions/{id}`).
+- **Apply** — only with device push: re-pushes an already-allocated session to
+  the device without reallocating, via `POST /sessions/{id}/apply` (or
+  `POST /interconnect/sessions/{id}/apply`).
 
 On a successful write the detail panel shows a per-fanout result list (which
 fanout, which ports, and the read-back outcome). A device-push failure
@@ -1418,13 +1580,13 @@ How the token is handled, and its limitations:
   was changed or mistyped), the UI clears the field and returns to the
   read-only state.
 
-Server requirement: the write actions only work when the server has device push
-enabled. Start it with `TOPO_MANAGER_ENABLE_DEVICE_PUSH=1`,
-`TOPO_MANAGER_API_TOKEN` set to the shared secret, and the fanout credentials
-reachable (via `TOPO_MANAGER_CREDENTIALS` or the default lookup / `TOPO_FANOUT_*`
-env vars) — see [Device push over REST](#device-push-over-rest). Without device
-push enabled the token-guarded endpoints answer a structured 404 and the UI
-stays read-only.
+Server requirements: the write actions need `TOPO_MANAGER_API_TOKEN` set on the
+server. That alone gives you ledger-only writes, which never touch a device. To
+also write to the fanouts, additionally start the server with
+`TOPO_MANAGER_ENABLE_DEVICE_PUSH=1` and make the fanout credentials reachable
+(via `TOPO_MANAGER_CREDENTIALS` or the default lookup / `TOPO_FANOUT_*` env
+vars) — see [Device push over REST](#device-push-over-rest). With no
+`TOPO_MANAGER_API_TOKEN` every write answers 403 and the UI stays read-only.
 
 ---
 

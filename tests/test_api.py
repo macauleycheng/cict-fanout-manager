@@ -117,7 +117,7 @@ def test_openapi(api_client: Tuple[TestClient, Path]) -> None:
     assert "/sessions" in paths
     assert "/sessions/{session_id}" in paths
     assert body["info"]["title"] == "topo-manager API"
-    assert body["info"]["version"] == "0.6.0"
+    assert body["info"]["version"] == "0.7.0"
 
 
 # ----------------------------------------------------------------------
@@ -485,10 +485,10 @@ _PUSH_PATHS = [
 def test_openapi_unchanged_when_push_disabled(
     api_client: Tuple[TestClient, Path],
 ) -> None:
-    """未啟用：版本 0.6.0、路徑集合不含 7 個下發路徑、description 仍含「僅限 CLI」。"""
+    """未啟用：版本 0.7.0、路徑集合不含 7 個下發路徑、description 仍含「僅限 CLI」。"""
     client, _ = api_client
     body = client.get("/openapi.json").json()
-    assert body["info"]["version"] == "0.6.0"
+    assert body["info"]["version"] == "0.7.0"
     assert "僅限 CLI" in body["info"]["description"]
     assert "X-API-Token" not in body["info"]["description"]
     for path, _method in _PUSH_PATHS:
@@ -496,7 +496,7 @@ def test_openapi_unchanged_when_push_disabled(
 
 
 def test_openapi_when_push_enabled(three_tier_path: Path, tmp_path: Path) -> None:
-    """啟用：版本 0.8.0、含 7 個下發路徑且各自文件化 401／404／409／502／504。"""
+    """啟用：版本 0.9.0、含 7 個下發路徑且各自文件化 401／404／409／502／504。"""
     from topo_manager.api import create_app
     from topo_manager.api.deps import Settings
 
@@ -507,7 +507,7 @@ def test_openapi_when_push_enabled(three_tier_path: Path, tmp_path: Path) -> Non
         api_token="t",
     )
     body = TestClient(create_app(settings)).get("/openapi.json").json()
-    assert body["info"]["version"] == "0.8.0"
+    assert body["info"]["version"] == "0.9.0"
     assert "僅限 CLI" not in body["info"]["description"]
     assert "X-API-Token" in body["info"]["description"]
     for path, method in _PUSH_PATHS:

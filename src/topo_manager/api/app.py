@@ -35,6 +35,12 @@ settings / shared allocator / topology 存入 ``app.state`` 供 routes 取用。
            損毀→SessionStoreError，fail-fast）；無條件 include group_routes；
            _API_VERSION 由 "0.5.0" 升為 "0.6.0"、_API_VERSION_PUSH 由 "0.7.0"
            升為 "0.8.0"（OpenAPI 新增群組端點，屬 semver minor）。
+  - 0.10.0 帳本寫入 token 閘門：POST／DELETE /sessions、/interconnect/sessions
+           與群組寫入端點（POST /groups、DELETE /groups/{name}、成員增刪）一律
+           需 X-API-Token（auth.require_ledger_write；未設 token→403、缺漏或
+           不符→401，破壞性變更）；新增 GET /capabilities。_API_VERSION 由
+           "0.6.0" 升為 "0.7.0"、_API_VERSION_PUSH 由 "0.8.0" 升為 "0.9.0"
+           （OpenAPI 新增端點並改變寫入契約，屬 semver minor）。
 
 Copyright (c) 2026 topo-manager。
 """
@@ -64,7 +70,7 @@ from topo_manager.loader import load_topology
 
 # app metadata（設計 §5.6）。
 _API_TITLE = "topo-manager API"
-_API_VERSION = "0.6.0"
+_API_VERSION = "0.7.0"
 _API_DESCRIPTION = (
     "topo-manager 的 REST 介接層：查詢可用資源、要求 / 釋放 session、檢視完整 "
     "拓樸，並提供互聯 fanout 的帳本層操作（建立 / 釋放 / 列出 / 計畫查詢）。 "
@@ -76,7 +82,7 @@ _API_DESCRIPTION = (
 
 
 # 啟用設備下發時的版本與描述（未啟用沿用上方常數，逐字不變）。
-_API_VERSION_PUSH = "0.8.0"
+_API_VERSION_PUSH = "0.9.0"
 _CLI_ONLY_SENTENCE = (
     "互聯的設備下發（apply / park / 帶設備的 release / verify）僅限 "
     "CLI，REST 不提供、不連任何設備。"

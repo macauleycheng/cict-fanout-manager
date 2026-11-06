@@ -47,8 +47,14 @@ def group_api_client(two_tier_path: Path, tmp_path: Path):
         topology_path=str(two_tier_path),
         state_path=str(tmp_path / "state" / "allocations.json"),
         group_state_path=str(group_state),
+        api_token="test-ledger-token",
     )
-    return TestClient(create_app(settings)), group_state
+    # 群組寫入端點亦以 token 閘控：預設帶 X-API-Token，讓「請求驗證」類測試
+    # （body／path 含 '/'）能走到欄位驗證而非被 403 先擋。
+    client = TestClient(
+        create_app(settings), headers={"X-API-Token": "test-ledger-token"}
+    )
+    return client, group_state
 
 
 # ----------------------------------------------------------------------
